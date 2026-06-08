@@ -753,6 +753,7 @@ def _prepare_documents_sync(
     clean_content: bool,
     document_origin_type: str = DocumentOriginType.ORGANIC.value,
     filename: str = None,
+    link: str = None,
 ) -> List[Document]:
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
@@ -778,6 +779,7 @@ def _prepare_documents_sync(
                 "digest": generate_digest(doc.page_content),
                 "document_origin_type": document_origin_type,
                 **({"filename": filename} if filename else {}),
+                **({"link": link} if link else {}),
                 **(doc.metadata or {}),
             },
         )
@@ -793,6 +795,7 @@ async def store_data_in_vector_db(
     executor=None,
     document_origin_type: str = DocumentOriginType.ORGANIC.value,
     filename: str = None,
+    link: str = None,
 ) -> dict:
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
@@ -805,6 +808,7 @@ async def store_data_in_vector_db(
         clean_content,
         document_origin_type,
         filename,
+        link,
     )
 
     try:
@@ -959,7 +963,8 @@ async def embed_file(
     file: UploadFile = File(...),
     entity_id: str = Form(None),
     document_owner_type: Optional[DocumentOwnerType] = Form(DocumentOwnerType.AGENT),
-    document_origin_type: DocumentOriginType = Form(DocumentOriginType.ORGANIC)
+    document_origin_type: DocumentOriginType = Form(DocumentOriginType.ORGANIC),
+    link: Optional[str] = Form(None),
 ):
     response_status = True
     response_message = "File processed successfully."
@@ -997,6 +1002,7 @@ async def embed_file(
             executor=request.app.state.thread_pool,
             document_origin_type=document_origin_type.value,
             filename=file.filename,
+            link=link,
         )
 
         if not result:
