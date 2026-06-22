@@ -42,6 +42,9 @@ from app.config import (
     VECTOR_DB_TYPE,
     VectorDBType,
     HYBRID_SEARCH_ENABLED,
+    RERANK_ENABLED,
+    RERANK_CANDIDATES,
+    RERANK_TOP_N,
 )
 from app.constants import ERROR_MESSAGES
 from app.models import (
@@ -62,6 +65,7 @@ from app.services.summary_store import (
 )
 from app.services.vector_store.async_pg_vector import AsyncPgVector
 from app.services.hybrid_search import keyword_search, reciprocal_rank_fusion
+from app.services.reranker import rerank
 from app.utils.document_loader import (
     get_loader,
     clean_text,
@@ -380,7 +384,7 @@ def _to_langchain_filter(filters: dict) -> dict:
     return lc_filter
 
 
-async def _retrieve_documents(
+async def _hybrid_or_dense_search(
     request: Request,
     query: str,
     embedding,
@@ -467,6 +471,34 @@ async def _retrieve_documents(
         len(fused), len(dense_results), len(keyword_results),
     )
     return fused
+
+
+async def _retrieve_documents(
+    request: Request,
+    query: str,
+    embedding,
+    k: int,
+    filters: dict,
+):
+    """Full retrieval pipeline: hybrid/dense search + optional cross-encoder rerank.
+
+    When reranking is available (VI-438), a larger candidate pool is fetched from
+    hybrid search (RERANK_CANDIDATES) and reranked against the question down to
+    min(k, RERANK_TOP_N). Otherwise the hybrid/dense top-k is returned directly.
+    Returns a list of (Document, score) tuples, ordered best-first.
+    """
+    if not RERANK_ENABLED:
+        return await _hybrid_or_dense_search(request, query, embedding, k, filters)
+
+    fetch_k = max(RERANK_CANDIDATES, k)
+    top_n = min(k, RERANK_TOP_N)
+    logger.info(
+        "[retrieve] reranking enabled | fetching %d candidates, returning top %d",
+        fetch_k, top_n,
+    )
+
+    candidates = await _hybrid_or_dense_search(request, query, embedding, fetch_k, filters)
+    return await rerank(query, candidates, top_n=top_n)
 
 
 @router.post("/query")
