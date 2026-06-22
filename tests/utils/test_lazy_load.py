@@ -17,7 +17,11 @@ from collections.abc import Iterator
 import pytest
 from langchain_core.documents import Document
 
-from app.utils.document_loader import get_loader, SafePyPDFLoader
+from app.utils.document_loader import (
+    get_loader,
+    SafePyPDFLoader,
+    SlidePowerPointLoader,
+)
 
 # ---------------------------------------------------------------------------
 # Environment checks — these deps aren't guaranteed in every CI runner
@@ -381,6 +385,90 @@ def test_lazy_load_matches_load(
         assert (
             eager.page_content == lazy.page_content
         ), f"{type(loader).__name__} doc[{i}]: content mismatch between load() and lazy_load()"
+
+
+# ---------------------------------------------------------------------------
+# SlidePowerPointLoader-specific tests (slide-level chunking, VI-445)
+# ---------------------------------------------------------------------------
+
+
+def _make_multi_slide_pptx(path):
+    """Create a 3-slide PPTX: two with content, one blank."""
+    from pptx import Presentation
+
+    prs = Presentation()
+
+    s1 = prs.slides.add_slide(prs.slide_layouts[1])
+    s1.shapes.title.text = "Market Overview"
+    s1.placeholders[1].text = "Revenue grew 12% YoY across all regions."
+
+    s2 = prs.slides.add_slide(prs.slide_layouts[1])
+    s2.shapes.title.text = "Strategy"
+    s2.placeholders[1].text = "Focus on the enterprise segment."
+    s2.notes_slide.notes_text_frame.text = "Mention competitor pricing."
+
+    # Blank slide with no text — must be skipped.
+    prs.slides.add_slide(prs.slide_layouts[6])
+
+    prs.save(path)
+
+
+def test_pptx_uses_slide_level_loader(tmp_path):
+    """get_loader() routes .pptx to the slide-level loader."""
+    pptx_path = tmp_path / "deck.pptx"
+    _make_multi_slide_pptx(str(pptx_path))
+
+    loader, known_type, file_ext = get_loader(
+        "deck.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        str(pptx_path),
+    )
+
+    assert isinstance(loader, SlidePowerPointLoader)
+    assert known_type is True
+    assert file_ext == "pptx"
+
+
+def test_pptx_yields_one_document_per_slide_with_metadata(tmp_path):
+    """Each non-empty slide becomes its own Document carrying slide metadata."""
+    pptx_path = tmp_path / "deck.pptx"
+    _make_multi_slide_pptx(str(pptx_path))
+
+    loader = SlidePowerPointLoader(str(pptx_path))
+    docs = list(loader.lazy_load())
+
+    # Blank slide is skipped -> 2 documents.
+    assert len(docs) == 2
+
+    assert docs[0].metadata["slide_number"] == 1
+    assert docs[0].metadata["slide_title"] == "Market Overview"
+    assert "Revenue grew 12% YoY" in docs[0].page_content
+
+    assert docs[1].metadata["slide_number"] == 2
+    assert docs[1].metadata["slide_title"] == "Strategy"
+    assert "enterprise segment" in docs[1].page_content
+    # Presenter notes are included in slide content.
+    assert "competitor pricing" in docs[1].page_content
+
+
+def test_pptx_chunks_never_cross_slide_boundaries(tmp_path):
+    """After splitting, every chunk maps to exactly one slide's metadata."""
+    from app.routes.document_routes import _prepare_documents_sync
+
+    pptx_path = tmp_path / "deck.pptx"
+    _make_multi_slide_pptx(str(pptx_path))
+
+    loader = SlidePowerPointLoader(str(pptx_path))
+    data = list(loader.lazy_load())
+
+    chunks = _prepare_documents_sync(
+        data, file_id="f1", user_id="u1", clean_content=False
+    )
+
+    assert len(chunks) >= 2
+    for chunk in chunks:
+        assert chunk.metadata["slide_number"] in (1, 2)
+        assert "slide_title" in chunk.metadata
 
 
 # ---------------------------------------------------------------------------

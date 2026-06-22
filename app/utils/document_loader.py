@@ -116,10 +116,16 @@ def get_loader(filename: str, file_content_type: str, filepath: str):
         "application/xhtml+xml",
     ]:
         loader = UnstructuredXMLLoader(filepath)
-    elif file_ext in ["ppt", "pptx"] or file_content_type in [
-        "application/vnd.ms-powerpoint",
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ]:
+    elif (
+        file_ext == "pptx"
+        or file_content_type
+        == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ):
+        # Slide-level chunking: one Document per slide so the text splitter
+        # keeps slide context intact (see slide_number/slide_title metadata).
+        loader = SlidePowerPointLoader(filepath)
+    elif file_ext == "ppt" or file_content_type == "application/vnd.ms-powerpoint":
+        # Legacy binary .ppt is not supported by python-pptx; fall back.
         loader = UnstructuredPowerPointLoader(filepath)
     elif file_ext == "md" or file_content_type in [
         "text/markdown",
@@ -261,4 +267,64 @@ class SafePyPDFLoader:
 
     def load(self) -> List[Document]:
         """Load PDF documents with automatic fallback on image extraction errors."""
+        return list(self.lazy_load())
+
+
+class SlidePowerPointLoader:
+    """
+    Load a .pptx deck as one Document per slide, preserving slide context.
+
+    Unlike UnstructuredPowerPointLoader (which collapses the whole deck into a
+    single text stream), this yields a Document per slide so the downstream
+    text splitter never merges content across slide boundaries. Each Document
+    carries `slide_number` and `slide_title` metadata, which propagates to every
+    resulting chunk.
+    """
+
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self._temp_filepath = None  # For compatibility with cleanup function
+
+    @staticmethod
+    def _slide_title(slide) -> str:
+        title_shape = slide.shapes.title
+        if title_shape is not None and title_shape.has_text_frame:
+            return title_shape.text.strip()
+        return ""
+
+    def lazy_load(self) -> Iterator[Document]:
+        from pptx import Presentation
+
+        prs = Presentation(self.filepath)
+        for idx, slide in enumerate(prs.slides, start=1):
+            title = self._slide_title(slide)
+
+            texts = [
+                shape.text.strip()
+                for shape in slide.shapes
+                if shape.has_text_frame and shape.text.strip()
+            ]
+
+            if (
+                slide.has_notes_slide
+                and slide.notes_slide.notes_text_frame is not None
+            ):
+                note = slide.notes_slide.notes_text_frame.text.strip()
+                if note:
+                    texts.append(f"[Notes] {note}")
+
+            content = "\n".join(texts).strip()
+            if not content:
+                continue
+
+            yield Document(
+                page_content=content,
+                metadata={
+                    "source": self.filepath,
+                    "slide_number": idx,
+                    "slide_title": title,
+                },
+            )
+
+    def load(self) -> List[Document]:
         return list(self.lazy_load())
