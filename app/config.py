@@ -109,6 +109,26 @@ FTS_CONFIG = get_env_variable("RAG_FTS_CONFIG", "english")
 # of top ranks; 60 is the commonly used default.
 RRF_K = int(get_env_variable("RRF_K", "60"))
 
+# --- Reranking: Cohere Rerank 3.5 via AWS Bedrock (VI-438) ---
+# After hybrid retrieval, rerank the candidate pool against the question and keep
+# the best ones. Best-effort: on failure it falls back to the pre-rerank order.
+# AWS credentials/region are reused from the Bedrock setup.
+# NOTE: Cohere Rerank 3.5 is region-specific — us-east-1 does NOT host it; use a
+# supported region such as us-west-2.
+RERANK_ENABLED = get_env_variable("RERANK_ENABLED", "True").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+    "t",
+)
+RERANK_MODEL = get_env_variable("RERANK_MODEL", "cohere.rerank-v3-5:0")
+RERANK_AWS_REGION = get_env_variable("RERANK_AWS_REGION", "us-east-1")
+# Candidate pool fetched from hybrid search before reranking (30-50).
+RERANK_CANDIDATES = int(get_env_variable("RERANK_CANDIDATES", "40"))
+# Max chunks returned after reranking; effective count is min(requested k, this).
+RERANK_TOP_N = int(get_env_variable("RERANK_TOP_N", "10"))
+
 if POSTGRES_USE_UNIX_SOCKET:
     connection_suffix = f"{urllib.parse.quote_plus(POSTGRES_USER)}:{urllib.parse.quote_plus(POSTGRES_PASSWORD)}@/{urllib.parse.quote_plus(POSTGRES_DB)}?host={urllib.parse.quote_plus(DB_HOST)}"
 else:
