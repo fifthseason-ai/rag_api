@@ -41,6 +41,7 @@ from app.config import (
     EMBEDDING_MAX_QUEUE_SIZE,
     VECTOR_DB_TYPE,
     VectorDBType,
+    HYBRID_SEARCH_ENABLED,
 )
 from app.constants import ERROR_MESSAGES
 from app.models import (
@@ -60,6 +61,7 @@ from app.services.summary_store import (
     delete_summaries_by_file_ids,
 )
 from app.services.vector_store.async_pg_vector import AsyncPgVector
+from app.services.hybrid_search import keyword_search, reciprocal_rank_fusion
 from app.utils.document_loader import (
     get_loader,
     clean_text,
@@ -361,6 +363,112 @@ def get_cached_query_embedding(query: str):
     return vector_store.embedding_function.embed_query(query)
 
 
+def _to_langchain_filter(filters: dict) -> dict:
+    """Convert a plain {key: value} filter into LangChain PGVector syntax.
+
+    Scalar values become {"$eq": value}; list/tuple values become {"$in": [...]}.
+    None values are dropped.
+    """
+    lc_filter: dict = {}
+    for key, value in filters.items():
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            lc_filter[key] = {"$in": list(value)}
+        else:
+            lc_filter[key] = {"$eq": value}
+    return lc_filter
+
+
+async def _retrieve_documents(
+    request: Request,
+    query: str,
+    embedding,
+    k: int,
+    filters: dict,
+):
+    """Retrieve chunks for a query, using hybrid (dense + keyword) search when
+    enabled and falling back to dense-only otherwise or on keyword failure.
+
+    `filters` is a plain {key: value} dict (e.g. {"file_id": ..., "user_id": ...});
+    list values are supported (matched with IN/ANY semantics). Returns a list of
+    (Document, score) tuples, ordered best-first.
+    """
+    lc_filter = _to_langchain_filter(filters)
+
+    if not isinstance(vector_store, AsyncPgVector):
+        logger.info(
+            "[retrieve] mode=dense-only (sync vector store) | k=%d | filters=%s | query=%r",
+            k, filters, query,
+        )
+        results = vector_store.similarity_search_with_score_by_vector(
+            embedding, k=k, filter=lc_filter
+        )
+        logger.info("[retrieve] dense-only returned %d documents", len(results))
+        return results
+
+    dense_coro = vector_store.asimilarity_search_with_score_by_vector(
+        embedding,
+        k=k,
+        filter=lc_filter,
+        executor=request.app.state.thread_pool,
+    )
+
+    if not HYBRID_SEARCH_ENABLED:
+        logger.info(
+            "[retrieve] mode=dense-only (HYBRID_SEARCH_ENABLED=false) | k=%d | filters=%s | query=%r",
+            k, filters, query,
+        )
+        results = await dense_coro
+        logger.info("[retrieve] dense-only returned %d documents", len(results))
+        return results
+
+    logger.info(
+        "[retrieve] mode=hybrid (dense + keyword) | k=%d | filters=%s | query=%r",
+        k, filters, query,
+    )
+
+    # Run dense + keyword search concurrently. return_exceptions lets us salvage
+    # the dense results if the keyword path fails (e.g. the document_tsv column /
+    # GIN index from tempo migration 10081 has not been applied yet).
+    dense_results, keyword_results = await asyncio.gather(
+        dense_coro,
+        keyword_search(query, k=k, filters=filters),
+        return_exceptions=True,
+    )
+
+    if isinstance(dense_results, Exception):
+        raise dense_results
+    if isinstance(keyword_results, Exception):
+        logger.warning(
+            "[retrieve] keyword search failed; falling back to dense-only "
+            "(dense=%d documents): %s",
+            len(dense_results), keyword_results,
+        )
+        return dense_results
+
+    # Intermediate results, before fusion.
+    logger.info(
+        "[retrieve] intermediate: dense=%d documents, keyword=%d documents",
+        len(dense_results), len(keyword_results),
+    )
+    logger.debug(
+        "[retrieve] dense scores (distance, lower=better): %s",
+        [round(score, 4) for _doc, score in dense_results],
+    )
+    logger.debug(
+        "[retrieve] keyword scores (ts_rank_cd, higher=better): %s",
+        [round(score, 4) for _doc, score in keyword_results],
+    )
+
+    fused = reciprocal_rank_fusion([dense_results, keyword_results], k=k)
+    logger.info(
+        "[retrieve] fused (RRF) -> %d documents returned (from %d dense + %d keyword)",
+        len(fused), len(dense_results), len(keyword_results),
+    )
+    return fused
+
+
 @router.post("/query")
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
@@ -378,20 +486,13 @@ async def query_embeddings_by_file_id(
     try:
         embedding = get_cached_query_embedding(body.query)
 
-        if isinstance(vector_store, AsyncPgVector):
-            documents = await vector_store.asimilarity_search_with_score_by_vector(
-                embedding,
-                k=body.k,
-                filter={
-                    "file_id": {"$eq": body.file_id},
-                    "user_id": {"$eq": user_authorized}
-                },
-                executor=request.app.state.thread_pool,
-            )
-        else:
-            documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": {"$eq": body.file_id}}
-            )
+        documents = await _retrieve_documents(
+            request,
+            body.query,
+            embedding,
+            body.k,
+            {"file_id": body.file_id, "user_id": user_authorized},
+        )
 
         if not documents:
             return authorized_documents
@@ -455,19 +556,13 @@ async def query_embeddings_by_entity_id(
     try:
         embedding = get_cached_query_embedding(body.query)
 
-        if isinstance(vector_store, AsyncPgVector):
-            documents = await vector_store.asimilarity_search_with_score_by_vector(
-                embedding,
-                k=body.k,
-                filter={"user_id": {"$eq": entity_id}},
-                executor=request.app.state.thread_pool,
-            )
-        else:
-            documents = vector_store.similarity_search_with_score_by_vector(
-                embedding,
-                k=body.k,
-                filter={"user_id": {"$eq": entity_id}},
-            )
+        documents = await _retrieve_documents(
+            request,
+            body.query,
+            embedding,
+            body.k,
+            {"user_id": entity_id},
+        )
 
         logger.info(
             "[query_embeddings_by_entity_id] results [entity_id=%s][documents_found=%d]",
@@ -1206,18 +1301,14 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
         # Get the embedding of the query text
         embedding = get_cached_query_embedding(body.query)
 
-        # Perform similarity search with the query embedding and filter by the file_ids in metadata
-        if isinstance(vector_store, AsyncPgVector):
-            documents = await vector_store.asimilarity_search_with_score_by_vector(
-                embedding,
-                k=body.k,
-                filter={"file_id": {"$in": body.file_ids}},
-                executor=request.app.state.thread_pool,
-            )
-        else:
-            documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": {"$in": body.file_ids}}
-            )
+        # Perform hybrid (or dense-only) search filtered by the file_ids in metadata
+        documents = await _retrieve_documents(
+            request,
+            body.query,
+            embedding,
+            body.k,
+            {"file_id": body.file_ids},
+        )
 
         # Ensure documents list is not empty
         if not documents:

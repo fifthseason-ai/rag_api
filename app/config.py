@@ -90,6 +90,25 @@ EMBEDDING_MAX_QUEUE_SIZE = int(get_env_variable("EMBEDDING_MAX_QUEUE_SIZE", "3")
 env_value = get_env_variable("PDF_EXTRACT_IMAGES", "False").lower()
 PDF_EXTRACT_IMAGES = True if env_value == "true" else False
 
+# --- Hybrid retrieval (VI-436) ---
+# Enable BM25/keyword full-text search alongside the dense vector search and
+# fuse the two result sets. When disabled, retrieval behaves exactly as before
+# (dense-only). Failures in the keyword path fall back to dense-only at runtime.
+HYBRID_SEARCH_ENABLED = get_env_variable("HYBRID_SEARCH_ENABLED", "True").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+    "t",
+)
+# Postgres text-search configuration used to build the tsquery at query time.
+# MUST match the configuration used to build the document_tsv generated column
+# in the DB migration (tempo migration 10081 uses 'english').
+FTS_CONFIG = get_env_variable("RAG_FTS_CONFIG", "english")
+# Reciprocal Rank Fusion constant (k). Larger values flatten the contribution
+# of top ranks; 60 is the commonly used default.
+RRF_K = int(get_env_variable("RRF_K", "60"))
+
 if POSTGRES_USE_UNIX_SOCKET:
     connection_suffix = f"{urllib.parse.quote_plus(POSTGRES_USER)}:{urllib.parse.quote_plus(POSTGRES_PASSWORD)}@/{urllib.parse.quote_plus(POSTGRES_DB)}?host={urllib.parse.quote_plus(DB_HOST)}"
 else:
