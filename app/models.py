@@ -41,6 +41,7 @@ class CleanupMethod(str, Enum):
 class QueryByEntityBody(BaseModel):
     query: str
     k: int = 4
+    args: Optional[dict] = None
 
 
 class QueryMultipleBody(BaseModel):
