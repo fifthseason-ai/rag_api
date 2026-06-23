@@ -473,21 +473,37 @@ async def _hybrid_or_dense_search(
     return fused
 
 
+def _cohere_rerank_enabled(args: Optional[dict]) -> bool:
+    """Per-request rerank gate (VI-535).
+
+    Reranking requires the deployment capability (RERANK_ENABLED). When callers pass
+    a `cohere` flag in args (knowledge queries), it overrides on a per-request basis;
+    when absent (e.g. file_id queries), the deployment default applies.
+    """
+    if not RERANK_ENABLED:
+        return False
+    if args is not None and "cohere" in args:
+        return bool(args["cohere"])
+    return True
+
+
 async def _retrieve_documents(
     request: Request,
     query: str,
     embedding,
     k: int,
     filters: dict,
+    args: Optional[dict] = None,
 ):
     """Full retrieval pipeline: hybrid/dense search + optional cross-encoder rerank.
 
-    When reranking is available (VI-438), a larger candidate pool is fetched from
-    hybrid search (RERANK_CANDIDATES) and reranked against the question down to
-    min(k, RERANK_TOP_N). Otherwise the hybrid/dense top-k is returned directly.
+    When reranking is available (VI-438) and enabled for the request (VI-535), a
+    larger candidate pool is fetched from hybrid search (RERANK_CANDIDATES) and
+    reranked against the question down to min(k, RERANK_TOP_N). Otherwise the
+    hybrid/dense top-k is returned directly.
     Returns a list of (Document, score) tuples, ordered best-first.
     """
-    if not RERANK_ENABLED:
+    if not _cohere_rerank_enabled(args):
         return await _hybrid_or_dense_search(request, query, embedding, k, filters)
 
     fetch_k = max(RERANK_CANDIDATES, k)
@@ -582,8 +598,8 @@ async def query_embeddings_by_entity_id(
     request: Request,
 ):
     logger.info(
-        "[query_embeddings_by_entity_id] request [entity_id=%s][query=%r][k=%d]",
-        entity_id, body.query, body.k,
+        "[query_embeddings_by_entity_id] request [entity_id=%s][query=%r][k=%d][args=%s]",
+        entity_id, body.query, body.k, body.args
     )
     try:
         embedding = get_cached_query_embedding(body.query)
@@ -594,6 +610,7 @@ async def query_embeddings_by_entity_id(
             embedding,
             body.k,
             {"user_id": entity_id},
+            body.args,
         )
 
         logger.info(
