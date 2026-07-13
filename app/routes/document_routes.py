@@ -23,7 +23,6 @@ from fastapi import (
 )
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from functools import lru_cache
 import asyncio
 
 if TYPE_CHECKING:
@@ -44,7 +43,7 @@ from app.config import (
     HYBRID_SEARCH_ENABLED,
     RERANK_ENABLED,
     RERANK_CANDIDATES,
-    RERANK_TOP_N,
+    RERANK_TOP_N, SUM_UP_KNOWLEDGE_FILES,
 )
 from app.constants import ERROR_MESSAGES
 from app.models import (
@@ -361,8 +360,8 @@ async def delete_documents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Cache the embedding function with LRU cache
-@lru_cache(maxsize=128)
+# The embedding function is wrapped with the Redis cache in app.config, so
+# embed_query transparently caches results.
 def get_cached_query_embedding(query: str):
     return vector_store.embedding_function.embed_query(query)
 
@@ -1076,6 +1075,10 @@ async def _generate_summary_background(
 ) -> None:
     """Generate and persist a file summary in the background (non-blocking)."""
     try:
+        if SUM_UP_KNOWLEDGE_FILES is False:
+            logger.info(f"Summary turned off [user_id=%s][file_id=%s]", user_id, file_id)
+            return
+
         loop = asyncio.get_running_loop()
         summary = await loop.run_in_executor(
             executor,

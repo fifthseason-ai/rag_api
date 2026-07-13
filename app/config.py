@@ -368,6 +368,50 @@ embeddings = init_embeddings(EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL)
 
 logger.info(f"Initialized embeddings of type: {type(embeddings)}")
 
+## Embedding cache
+# Caches embedding vectors in Redis so repeated text (query embedding in the
+# endpoints and document embedding during ingestion) skips the embedding-provider
+# round trip. Local and production differ only in connection settings:
+# REDIS_HOST points at the local Redis container by default and at the AWS
+# ElastiCache endpoint in production. The cache wraps the Embeddings instance, so
+# it applies everywhere embeddings are produced. Keys are namespaced by the
+# embeddings model so switching models never returns stale vectors.
+from app.services.cache import RedisCache, CachingEmbeddings
+
+REDIS_HOST = get_env_variable("REDIS_HOST", "localhost")
+REDIS_PORT = int(get_env_variable("REDIS_PORT", "6379"))
+# Time-to-live in seconds for cached embeddings; 0 disables expiry.
+REDIS_TTL = int(get_env_variable("REDIS_TTL", "0"))
+REDIS_KEY_PREFIX = get_env_variable("REDIS_KEY_PREFIX", "rag:emb:")
+REDIS_SSL = get_env_variable("REDIS_SSL", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+    "t",
+)
+REDIS_PASSWORD = get_env_variable("REDIS_PASSWORD", None)
+
+embedding_cache = RedisCache(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    ttl=REDIS_TTL,
+    key_prefix=REDIS_KEY_PREFIX,
+    ssl=REDIS_SSL,
+    password=REDIS_PASSWORD,
+)
+embeddings = CachingEmbeddings(
+    embeddings, embedding_cache, namespace=EMBEDDINGS_MODEL
+)
+
+SUM_UP_KNOWLEDGE_FILES = get_env_variable("SUM_UP_KNOWLEDGE_FILES", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+    "t",
+)
+
 # Vector store
 if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
     vector_store = get_vector_store(
