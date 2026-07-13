@@ -55,6 +55,30 @@
         {
           "name": "CHUNK_SIZE",
           "value": "1500"
+        },
+        {
+          "name": "REDIS_HOST",
+          "value": "fifthseason-elasticache-redis-cluster.7vyk77.ng.0001.use1.cache.amazonaws.com"
+        },
+        {
+          "name": "REDIS_PORT",
+          "value": "6379"
+        },
+        {
+          "name": "REDIS_TTL",
+          "value": "86400"
+        },
+        {
+          "name": "REDIS_KEY_PREFIX",
+          "value": "rag:emb:"
+        },
+        {
+          "name": "REDIS_SSL",
+          "value": "false"
+        },
+        {
+          "name": "SUM_UP_KNOWLEDGE_FILES",
+          "value": "false"
         }
       ],
       "mountPoints": [],
