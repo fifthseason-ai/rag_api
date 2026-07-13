@@ -13,6 +13,9 @@ pgvector==0.2.5
 uvicorn==0.28.0
 pypdf==6.7.4
 unstructured==0.18.32
+# Pin nltk: the CVE-2026-33236 patch regressed `nltk.downloader -d <dir>`
+# ("Security Violation: Unauthorized path"), breaking the Docker build.
+nltk==3.9.1
 markdown==3.8.2
 networkx==3.2.1
 pandas==2.2.1
