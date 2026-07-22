@@ -70,3 +70,4 @@ class DeleteDocumentsBody(BaseModel):
     entity_id: Optional[str] = None
     file_ids: List[str] = []
     document_origin_type: Optional[DocumentOriginType] = None
+    subscription_id: Optional[str] = None
