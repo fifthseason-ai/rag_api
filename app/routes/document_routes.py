@@ -293,24 +293,27 @@ async def delete_documents(
     document_ids = body.file_ids
     user_id = body.entity_id
     document_origin_type = body.document_origin_type
+    subscription_id = body.subscription_id
 
     try:
         origin_type_value = document_origin_type.value if document_origin_type else None
         logger.info(
-            "[delete_documents] request [user_id=%s][file_ids=%s][document_origin_type=%s]",
-            user_id, document_ids, origin_type_value,
+            "[delete_documents] request [user_id=%s][file_ids=%s][document_origin_type=%s][subscription_id=%s]",
+            user_id, document_ids, origin_type_value, subscription_id,
         )
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
                 document_ids,
                 user_id=user_id,
                 document_origin_type=origin_type_value,
+                subscription_id=subscription_id,
                 executor=request.app.state.thread_pool,
             )
             await vector_store.delete(
                 ids=document_ids,
                 user_id=user_id,
                 document_origin_type=origin_type_value,
+                subscription_id=subscription_id,
                 executor=request.app.state.thread_pool,
             )
         else:
@@ -897,6 +900,7 @@ def _prepare_documents_sync(
     document_origin_type: str = DocumentOriginType.ORGANIC.value,
     filename: str = None,
     link: str = None,
+    subscription_id: str = None,
 ) -> List[Document]:
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
@@ -923,6 +927,7 @@ def _prepare_documents_sync(
                 "document_origin_type": document_origin_type,
                 **({"filename": filename} if filename else {}),
                 **({"link": link} if link else {}),
+                **({"subscription_id": subscription_id} if subscription_id else {}),
                 **(doc.metadata or {}),
             },
         )
@@ -939,6 +944,7 @@ async def store_data_in_vector_db(
     document_origin_type: str = DocumentOriginType.ORGANIC.value,
     filename: str = None,
     link: str = None,
+    subscription_id: str = None,
 ) -> dict:
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
@@ -952,6 +958,7 @@ async def store_data_in_vector_db(
         document_origin_type,
         filename,
         link,
+        subscription_id,
     )
 
     try:
@@ -1112,6 +1119,7 @@ async def embed_file(
     document_owner_type: Optional[DocumentOwnerType] = Form(DocumentOwnerType.AGENT),
     document_origin_type: DocumentOriginType = Form(DocumentOriginType.ORGANIC),
     link: Optional[str] = Form(None),
+    subscription_id: Optional[str] = Form(None)
 ):
     response_status = True
     response_message = "File processed successfully."
@@ -1119,8 +1127,8 @@ async def embed_file(
 
     user_id = get_user_id(request, entity_id)
     logger.info(
-        "[embed_file] request [file_id=%s][filename=%s][user_id=%s][owner_type=%s][origin_type=%s]",
-        file_id, file.filename, user_id, document_owner_type, document_origin_type,
+        "[embed_file] request [file_id=%s][filename=%s][user_id=%s][owner_type=%s][origin_type=%s][subscription_id=%s]",
+        file_id, file.filename, user_id, document_owner_type, document_origin_type, subscription_id,
     )
     validated_file_path = _make_unique_temp_path(user_id, file.filename)
 
@@ -1150,6 +1158,7 @@ async def embed_file(
             document_origin_type=document_origin_type.value,
             filename=file.filename,
             link=link,
+            subscription_id=subscription_id,
         )
 
         if not result:

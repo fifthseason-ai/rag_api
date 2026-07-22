@@ -125,7 +125,7 @@ class ExtendedPgVector(PGVector):
             return [result[0] for result in results if result[0] is not None]
 
     def get_filtered_ids(
-        self, ids: list[str], user_id: Optional[str] = None, document_origin_type: Optional[str] = None
+        self, ids: list[str], user_id: Optional[str] = None, document_origin_type: Optional[str] = None, subscription_id: Optional[str] = None
     ) -> list[str]:
         with Session(self._bind) as session:
             query = session.query(self.EmbeddingStore.custom_id)
@@ -138,6 +138,10 @@ class ExtendedPgVector(PGVector):
             if document_origin_type is not None:
                 query = query.filter(
                     self.EmbeddingStore.cmetadata["document_origin_type"].astext == document_origin_type
+                )
+            if subscription_id is not None:
+                query = query.filter(
+                    self.EmbeddingStore.cmetadata["subscription_id"].astext == subscription_id
                 )
             results = query.all()
             return [result[0] for result in results if result[0] is not None]
@@ -182,6 +186,7 @@ class ExtendedPgVector(PGVector):
         collection_only: bool = False,
         user_id: Optional[str] = None,
         document_origin_type: Optional[str] = None,
+        subscription_id: Optional[str] = None,
     ) -> None:
         with Session(self._bind) as session:
             self.logger.debug(
@@ -206,6 +211,10 @@ class ExtendedPgVector(PGVector):
             if document_origin_type is not None:
                 stmt = stmt.where(
                     self.EmbeddingStore.cmetadata["document_origin_type"].astext == document_origin_type
+                )
+            if subscription_id is not None:
+                stmt = stmt.where(
+                    self.EmbeddingStore.cmetadata["subscription_id"].astext == subscription_id
                 )
             session.execute(stmt)
             session.commit()
