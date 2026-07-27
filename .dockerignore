@@ -4,3 +4,4 @@ uploads/
 myenv/
 venv/
 deploy/
+.env

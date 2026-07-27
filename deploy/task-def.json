@@ -1,32 +1,28 @@
 {
-  "taskDefinitionArn": "arn:aws:ecs:us-east-1:861208159576:task-definition/fifhtseason-rag-api-task:4",
+  "taskDefinitionArn": "arn:aws:ecs:us-east-1:861208159576:task-definition/fifhtseason-rag-api-task:17",
   "containerDefinitions": [
     {
       "name": "fifhtseason-rag-api",
-      "image": "861208159576.dkr.ecr.us-east-1.amazonaws.com/fifthseason/rag-api@sha256:ec672c98a6eeb3c68856c403dab9be0d4832e2fef5b2c0fb0b611c570fc9e6a5",
+      "image": "861208159576.dkr.ecr.us-east-1.amazonaws.com/fifthseason/rag-api@sha256:54c74a39ead95d25db5298d91129db9ae5aee804d94ed7eb1cfc13335e92c4f0",
       "cpu": 0,
       "portMappings": [
         {
-          "name": "rag-api-8000-tcp",
           "containerPort": 8000,
           "hostPort": 8000,
           "protocol": "tcp",
+          "name": "rag-api-8000-tcp",
           "appProtocol": "http"
         }
       ],
       "essential": true,
       "environment": [
         {
-          "name": "EMBEDDINGS_PROVIDER",
-          "value": "vertexai"
-        },
-        {
           "name": "POSTGRES_USER",
           "value": "postgres"
         },
         {
-          "name": "PDF_EXTRACT_IMAGES",
-          "value": "false"
+          "name": "REDIS_HOST",
+          "value": "fifthseason-elasticache-redis-cluster.7vyk77.ng.0001.use1.cache.amazonaws.com"
         },
         {
           "name": "DB_PORT",
@@ -34,50 +30,62 @@
         },
         {
           "name": "EMBEDDINGS_MODEL",
-          "value": "gemini-embedding-2-preview"
-        },
-        {
-          "name": "WORKERS",
-          "value": "4"
-        },
-        {
-          "name": "CHUNK_OVERLAP",
-          "value": "100"
-        },
-        {
-          "name": "POSTGRES_DB",
-          "value": "vivaldi"
-        },
-        {
-          "name": "DB_HOST",
-          "value": "prod-vivaldi-pg.cw1ai8ko2srr.us-east-1.rds.amazonaws.com"
-        },
-        {
-          "name": "CHUNK_SIZE",
-          "value": "1500"
-        },
-        {
-          "name": "REDIS_HOST",
-          "value": "fifthseason-elasticache-redis-cluster.7vyk77.ng.0001.use1.cache.amazonaws.com"
-        },
-        {
-          "name": "REDIS_PORT",
-          "value": "6379"
-        },
-        {
-          "name": "REDIS_TTL",
-          "value": "86400"
+          "value": "amazon.titan-embed-text-v1"
         },
         {
           "name": "REDIS_KEY_PREFIX",
           "value": "rag:emb:"
         },
         {
-          "name": "REDIS_SSL",
+          "name": "WORKERS",
+          "value": "4"
+        },
+        {
+          "name": "POSTGRES_DB",
+          "value": "vivaldi"
+        },
+        {
+          "name": "CHUNK_SIZE",
+          "value": "1500"
+        },
+        {
+          "name": "DB_HOST",
+          "value": "prod-vivaldi-pg.cw1ai8ko2srr.us-east-1.rds.amazonaws.com"
+        },
+        {
+          "name": "EMBEDDINGS_PROVIDER",
+          "value": "bedrock"
+        },
+        {
+          "name": "PDF_EXTRACT_IMAGES",
           "value": "false"
         },
         {
           "name": "SUM_UP_KNOWLEDGE_FILES",
+          "value": "false"
+        },
+        {
+          "name": "REDIS_PORT",
+          "value": "6379"
+        },
+        {
+          "name": "CHUNK_OVERLAP",
+          "value": "100"
+        },
+        {
+          "name": "REDIS_SSL",
+          "value": "false"
+        },
+        {
+          "name": "REDIS_TTL",
+          "value": "86400"
+        },
+        {
+          "name": "RAG_PORT",
+          "value": "8000"
+        },
+        {
+          "name": "DEBUG_RAG_API",
           "value": "false"
         }
       ],
@@ -85,16 +93,20 @@
       "volumesFrom": [],
       "secrets": [
         {
+          "name": "AWS_ACCESS_KEY_ID",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:861208159576:secret:PROD-AI-CORE-API-Secrets-1QSV55:AWS_ACCESS_KEY_ID::"
+        },
+        {
+          "name": "AWS_SECRET_ACCESS_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:861208159576:secret:PROD-AI-CORE-API-Secrets-1QSV55:AWS_SECRET_ACCESS_KEY::"
+        },
+        {
           "name": "POSTGRES_PASSWORD",
           "valueFrom": "arn:aws:secretsmanager:us-east-1:861208159576:secret:PROD-Secrets-Z2VLk5:DB_PASSWORD::"
         },
         {
           "name": "RAG_OPENAI_API_KEY",
           "valueFrom": "arn:aws:secretsmanager:us-east-1:861208159576:secret:PROD-AI-CORE-API-Secrets-1QSV55:RAG_OPENAI_API_KEY::"
-        },
-        {
-          "name": "RAG_GOOGLE_API_KEY",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:861208159576:secret:PROD-AI-CORE-API-Secrets-1QSV55:GOOGLE_KEY::"
         }
       ],
       "logConfiguration": {
@@ -104,7 +116,8 @@
           "awslogs-create-group": "true",
           "awslogs-region": "us-east-1",
           "awslogs-stream-prefix": "ecs"
-        }
+        },
+        "secretOptions": []
       },
       "systemControls": []
     }
@@ -113,13 +126,10 @@
   "taskRoleArn": "arn:aws:iam::861208159576:role/ECSExecutionRole",
   "executionRoleArn": "arn:aws:iam::861208159576:role/ECSExecutionRole",
   "networkMode": "awsvpc",
-  "revision": 4,
+  "revision": 17,
   "volumes": [],
   "status": "ACTIVE",
   "requiresAttributes": [
-    {
-      "name": "com.amazonaws.ecs.capability.logging-driver.awslogs"
-    },
     {
       "name": "ecs.capability.execution-role-awslogs"
     },
@@ -127,13 +137,10 @@
       "name": "com.amazonaws.ecs.capability.ecr-auth"
     },
     {
-      "name": "com.amazonaws.ecs.capability.docker-remote-api.1.19"
-    },
-    {
-      "name": "ecs.capability.secrets.asm.environment-variables"
-    },
-    {
       "name": "com.amazonaws.ecs.capability.docker-remote-api.1.21"
+    },
+    {
+      "name": "ecs.capability.increased-task-cpu-limit"
     },
     {
       "name": "com.amazonaws.ecs.capability.task-iam-role"
@@ -149,6 +156,15 @@
     },
     {
       "name": "com.amazonaws.ecs.capability.docker-remote-api.1.29"
+    },
+    {
+      "name": "com.amazonaws.ecs.capability.logging-driver.awslogs"
+    },
+    {
+      "name": "com.amazonaws.ecs.capability.docker-remote-api.1.19"
+    },
+    {
+      "name": "ecs.capability.secrets.asm.environment-variables"
     }
   ],
   "placementConstraints": [],
@@ -157,16 +173,16 @@
     "MANAGED_INSTANCES",
     "FARGATE"
   ],
-  "requiresCompatibilities": [
-    "FARGATE"
-  ],
-  "cpu": "4096",
-  "memory": "8192",
   "runtimePlatform": {
     "cpuArchitecture": "X86_64",
     "operatingSystemFamily": "LINUX"
   },
-  "registeredAt": "2026-04-11T01:21:51.967Z",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "8192",
+  "memory": "16384",
+  "registeredAt": "2026-07-22T20:11:02.530Z",
   "registeredBy": "arn:aws:iam::861208159576:user/luis",
   "enableFaultInjection": false,
   "tags": []
