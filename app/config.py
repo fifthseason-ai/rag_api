@@ -247,6 +247,7 @@ GOOGLE_API_KEY = get_env_variable("GOOGLE_API_KEY", "")
 GOOGLE_KEY = get_env_variable("GOOGLE_KEY", GOOGLE_API_KEY)
 RAG_GOOGLE_API_KEY = get_env_variable("RAG_GOOGLE_API_KEY", GOOGLE_KEY)
 AWS_SESSION_TOKEN = get_env_variable("AWS_SESSION_TOKEN", "")
+AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "us-east-1")
 GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIALS", "")
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
@@ -360,7 +361,6 @@ elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.BEDROCK:
     EMBEDDINGS_MODEL = get_env_variable(
         "EMBEDDINGS_MODEL", "amazon.titan-embed-text-v1"
     )
-    AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "us-east-1")
 else:
     raise ValueError(f"Unsupported embeddings provider: {EMBEDDINGS_PROVIDER}")
 
@@ -442,20 +442,32 @@ retriever = vector_store.as_retriever()
 
 ## LLM
 
-LLM_PROVIDER = get_env_variable("LLM_PROVIDER", "openai")
-LLM_MODEL = get_env_variable("LLM_MODEL", "gpt-4o-mini")
+LLM_PROVIDER = get_env_variable("LLM_PROVIDER", "bedrock")
+LLM_MODEL = get_env_variable(
+    "LLM_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
 LLM_TEMPERATURE = float(get_env_variable("LLM_TEMPERATURE", "0"))
 
 
 def init_llm(provider, model, temperature):
-    if provider == "openai":
-        from langchain_openai import ChatOpenAI
+    if provider == "bedrock":
+        from langchain_aws import ChatBedrockConverse
 
-        return ChatOpenAI(
+        session_kwargs = {
+            "aws_access_key_id": AWS_ACCESS_KEY_ID,
+            "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
+            "region_name": AWS_DEFAULT_REGION,
+        }
+
+        if AWS_SESSION_TOKEN:
+            session_kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+
+        session = boto3.Session(**session_kwargs)
+        return ChatBedrockConverse(
+            client=session.client("bedrock-runtime"),
             model=model,
             temperature=temperature,
-            api_key=RAG_OPENAI_API_KEY,
-            base_url=RAG_OPENAI_BASEURL,
+            region_name=AWS_DEFAULT_REGION,
         )
     elif provider == "ollama":
         from langchain_ollama import ChatOllama
