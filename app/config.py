@@ -5,6 +5,7 @@ import boto3
 import logging
 import urllib.parse
 from enum import Enum
+from typing import Optional
 from datetime import datetime
 from dotenv import find_dotenv, load_dotenv
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -252,6 +253,34 @@ GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIAL
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 
+## Authentication / entitlement configuration (D-KSPT-1)
+# The signing secret is read live per-request in app.middleware; these module-level
+# values drive the startup guard. Fail closed: without JWT_SECRET the service must
+# refuse to start unless the explicit local-dev opt-in is set.
+JWT_SECRET = os.getenv("JWT_SECRET")
+RAG_AUTH_DISABLED = get_env_variable("RAG_AUTH_DISABLED", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+    "t",
+)
+
+
+def require_auth_config() -> None:
+    """Refuse to start when authentication cannot be enforced (D-KSPT-1).
+
+    Called from the app lifespan. If ``JWT_SECRET`` is unset and the explicit
+    local-dev opt-in ``RAG_AUTH_DISABLED`` is not enabled, raise so the process
+    never comes up in an auth-less ("open") state.
+    """
+    if not os.getenv("JWT_SECRET") and not RAG_AUTH_DISABLED:
+        raise RuntimeError(
+            "JWT_SECRET is not set and RAG_AUTH_DISABLED is not enabled; refusing "
+            "to start because protected routes could not be authenticated. Set "
+            "JWT_SECRET (production) or RAG_AUTH_DISABLED=true (local dev only)."
+        )
+
 ## Embeddings
 
 
@@ -331,9 +360,30 @@ def init_embeddings(provider, model):
         raise ValueError(f"Unsupported embeddings provider: {provider}")
 
 
-EMBEDDINGS_PROVIDER = EmbeddingsProvider(
-    get_env_variable("EMBEDDINGS_PROVIDER", EmbeddingsProvider.OPENAI.value).lower()
-)
+def resolve_embeddings_provider(value: Optional[str]) -> EmbeddingsProvider:
+    """Resolve the configured embeddings provider, failing closed (D-KSPT-2).
+
+    There is NO default. A missing or unknown ``EMBEDDINGS_PROVIDER`` raises so
+    that documents are never embedded (or queried) through an unintended and
+    possibly ungoverned provider. Production explicitly sets ``bedrock`` (Amazon
+    Titan). OpenAI remains supported once explicitly selected, but is never the
+    silent fallback.
+    """
+    accepted = ", ".join(p.value for p in EmbeddingsProvider)
+    if value is None or str(value).strip() == "":
+        raise ValueError(
+            "EMBEDDINGS_PROVIDER is required and has no default. Set it explicitly "
+            f"to one of: {accepted}. Production uses 'bedrock' (Amazon Titan)."
+        )
+    try:
+        return EmbeddingsProvider(str(value).strip().lower())
+    except ValueError:
+        raise ValueError(
+            f"Unknown EMBEDDINGS_PROVIDER {value!r}. Accepted values: {accepted}."
+        )
+
+
+EMBEDDINGS_PROVIDER = resolve_embeddings_provider(os.getenv("EMBEDDINGS_PROVIDER"))
 
 if EMBEDDINGS_PROVIDER == EmbeddingsProvider.OPENAI:
     EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-3-small")

@@ -1,13 +1,21 @@
 # tests/conftest.py
 import os
 
-from app.services.vector_store.async_pg_vector import AsyncPgVector
-
 # Set environment variables early so config picks up test settings.
 os.environ["TESTING"] = "1"
 # Set DB_HOST (and DSN) to dummy values to avoid real connection attempts.
 os.environ["DB_HOST"] = "localhost"  # or any dummy value
 os.environ["DSN"] = "dummy://"
+# EMBEDDINGS_PROVIDER has no default anymore (D-KSPT-2, fail-closed). Tests must
+# select one explicitly before app.config is imported; embeddings are mocked so
+# the concrete provider is irrelevant to the assertions.
+os.environ.setdefault("EMBEDDINGS_PROVIDER", "openai")
+# The OpenAI embeddings client validates a key at construction time. Supply a
+# dummy so app.config imports under the openai provider; embeddings are mocked in
+# every test, so this key is never used to make a request.
+os.environ.setdefault("OPENAI_API_KEY", "sk-test-not-used")
+
+from app.services.vector_store.async_pg_vector import AsyncPgVector
 
 # -- Patch the vector store classes to bypass DB connection --
 

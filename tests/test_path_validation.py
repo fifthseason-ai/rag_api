@@ -237,6 +237,11 @@ def auth_headers():
     os.environ["JWT_SECRET"] = jwt_secret
     payload = {
         "id": "testuser",
+        # KSPT entitlement claims (D-KSPT-1). Path traversal is rejected before the
+        # entity check fires, so the entity set only needs the legitimate id.
+        "tid": "tenantA",
+        "ent": ["testuser", "testid1"],
+        "act": ["read", "write", "delete"],
         "exp": datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(hours=1),
     }

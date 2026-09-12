@@ -79,9 +79,21 @@ The following environment variables are required to run the application:
 - `DB_PORT`: (Optional) The port number of the PostgreSQL database server.
 - `RAG_HOST`: (Optional) The hostname or IP address where the API server will run. Defaults to "0.0.0.0"
 - `RAG_PORT`: (Optional) The port number where the API server will run. Defaults to port 8000.
-- `JWT_SECRET`: (Optional) The secret key used for verifying JWT tokens for requests.
+- `JWT_SECRET`: (Required in any non-local deployment) The secret key used for verifying JWT tokens for requests.
   - The secret is only used for verification. This basic approach assumes a signed JWT from elsewhere.
-  - Omit to run API without requiring authentication
+  - **Fail-closed:** if `JWT_SECRET` is unset the service refuses to start and rejects every protected request (never "auth disabled"). To run locally without a secret you must set `RAG_AUTH_DISABLED=true` explicitly (logged loudly on every request; local development only, never production).
+- `RAG_AUTH_DISABLED`: (Optional, local-dev only) Set to `true` to run the API without authentication when `JWT_SECRET` is unset. Default is fail-closed.
+
+#### Identity & entitlement claims
+
+Protected routes require a signed HS256 bearer token whose claims are the **only** source of authority (caller-supplied path/body ids are treated as filters only):
+
+- `id`: user id (used as the `user_id` for user-owned documents).
+- `tid` (**required**): the caller's tenant id. Missing ⇒ 403.
+- `ent` (**required, non-empty**): the entity ids (knowledge ids, the user id, or the agent/assistant id) the caller has already been authorized for. A document whose `user_id` is not in `ent` is never returned, embedded or deleted. Missing/empty ⇒ 403.
+- `act` (**required, non-empty**): the authorized actions — any of `read`, `write`, `delete`. The route's action must be present. Missing/empty ⇒ 403.
+
+A token with a bad/absent signature yields 401; a valid signature missing `tid`/`ent`/`act` yields 403 (no fallback to `id`). On every embed path the `tid` is stored into chunk metadata as `tenant_id` for later tenant-scoped filtering.
 
 - `COLLECTION_NAME`: (Optional) The name of the collection in the vector store. Default value is "testcollection".
 - `CHUNK_SIZE`: (Optional) The size of the chunks for text processing. Default value is "1500".
@@ -93,7 +105,7 @@ The following environment variables are required to run the application:
 - `DEBUG_RAG_API`: (Optional) Set to "True" to show more verbose logging output in the server console, and to enable postgresql database routes
 - `DEBUG_PGVECTOR_QUERIES`: (Optional) Set to "True" to enable detailed PostgreSQL query logging for pgvector operations. Useful for debugging performance issues with vector database queries.
 - `CONSOLE_JSON`: (Optional) Set to "True" to log as json for Cloud Logging aggregations
-- `EMBEDDINGS_PROVIDER`: (Optional) either "openai", "bedrock", "azure", "huggingface", "huggingfacetei", "google_genai", "vertexai", or "ollama", where "huggingface" uses sentence_transformers; defaults to "openai"
+- `EMBEDDINGS_PROVIDER`: (**Required — no default**) one of "openai", "bedrock", "azure", "huggingface", "huggingfacetei", "google_genai", "vertexai", or "ollama", where "huggingface" uses sentence_transformers. There is **no default**: a missing or unknown value fails closed (the service raises at startup with the accepted list) so documents are never embedded through an unintended provider. Production sets "bedrock" (Amazon Titan).
 - `EMBEDDINGS_MODEL`: (Optional) Set a valid embeddings model to use from the configured provider.
     - **Defaults**
     - openai: "text-embedding-3-small"
