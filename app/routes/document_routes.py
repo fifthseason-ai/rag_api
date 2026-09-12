@@ -1497,9 +1497,10 @@ async def extract_text_from_file(
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
         )
 
-    # Entitlement (D-KSPT-1): /text is an upload endpoint (write class). The
-    # resolved entity must be within the token entitlement.
-    _require_entity(request, "write", user_id)
+    # Entitlement (D-KSPT-1): /text only extracts and returns text from the
+    # uploaded bytes; it writes no vectors, so it is a READ operation (Core mints
+    # act=['read'] for it). The resolved entity must be within the entitlement.
+    _require_entity(request, "read", user_id)
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)

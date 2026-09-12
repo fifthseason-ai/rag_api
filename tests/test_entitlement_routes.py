@@ -153,6 +153,34 @@ def test_embed_read_token_denied():
     assert r.status_code == 403
 
 
+# --- /text is a READ op (extracts text, writes no vectors) — WP2BR F1 --------
+
+
+def test_text_accepts_read_token():
+    h = hdr(ent=["userA"], act=["read"])
+    r = client.post(
+        "/text", data={"file_id": "f1", "entity_id": "userA"}, files=_file(), headers=h
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["text"].strip() == "hello world"
+
+
+def test_text_rejects_write_only_token():
+    h = hdr(ent=["userA"], act=["write"])
+    r = client.post(
+        "/text", data={"file_id": "f1", "entity_id": "userA"}, files=_file(), headers=h
+    )
+    assert r.status_code == 403
+
+
+def test_text_cross_entity_denied():
+    h = hdr(ent=["userA"], act=["read"])
+    r = client.post(
+        "/text", data={"file_id": "f1", "entity_id": "userB"}, files=_file(), headers=h
+    )
+    assert r.status_code == 403
+
+
 # --- DELETE /documents (delete) --------------------------------------------
 
 
