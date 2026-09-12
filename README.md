@@ -79,10 +79,9 @@ The following environment variables are required to run the application:
 - `DB_PORT`: (Optional) The port number of the PostgreSQL database server.
 - `RAG_HOST`: (Optional) The hostname or IP address where the API server will run. Defaults to "0.0.0.0"
 - `RAG_PORT`: (Optional) The port number where the API server will run. Defaults to port 8000.
-- `JWT_SECRET`: (Required in any non-local deployment) The secret key used for verifying JWT tokens for requests.
+- `JWT_SECRET`: (Required) The secret key used for verifying JWT tokens for requests.
   - The secret is only used for verification. This basic approach assumes a signed JWT from elsewhere.
-  - **Fail-closed:** if `JWT_SECRET` is unset the service refuses to start and rejects every protected request (never "auth disabled"). To run locally without a secret you must set `RAG_AUTH_DISABLED=true` explicitly (logged loudly on every request; local development only, never production).
-- `RAG_AUTH_DISABLED`: (Optional, local-dev only) Set to `true` to run the API without authentication when `JWT_SECRET` is unset. Default is fail-closed.
+  - **Fail-closed (unconditional):** if `JWT_SECRET` is unset the service refuses to start and rejects every protected request with 500. There is no opt-out. To run locally, set a `JWT_SECRET` (any value) and mint tokens signed with it.
 
 #### Identity & entitlement claims
 

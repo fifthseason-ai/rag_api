@@ -11,22 +11,6 @@ from app.config import logger
 PUBLIC_PATHS = {"/docs", "/openapi.json", "/health"}
 
 
-def _auth_disabled() -> bool:
-    """Explicit, local-development-only opt-out of authentication.
-
-    Default is fail-closed. This must be set deliberately (and is logged loudly on
-    every request it lets through); it exists only so a developer running without a
-    signing secret can exercise the service locally. It is never a production mode.
-    """
-    return os.getenv("RAG_AUTH_DISABLED", "false").strip().lower() in (
-        "true",
-        "1",
-        "yes",
-        "y",
-        "t",
-    )
-
-
 async def security_middleware(request: Request, call_next):
     async def next_middleware_call():
         return await call_next(request)
@@ -36,16 +20,9 @@ async def security_middleware(request: Request, call_next):
 
     jwt_secret = os.getenv("JWT_SECRET")
     if not jwt_secret:
-        # Fail closed (D-KSPT-1): without a signing secret we cannot verify the
-        # caller's identity, so no protected route may be served. The only escape
-        # is the explicit local-dev opt-in, which is logged loudly.
-        if _auth_disabled():
-            logger.warning(
-                "RAG_AUTH_DISABLED=true: serving %s WITHOUT authentication "
-                "(local-dev only, NEVER production)",
-                request.url.path,
-            )
-            return await next_middleware_call()
+        # Fail closed unconditionally (D-KSPT-1): without a signing secret we cannot
+        # verify the caller's identity, so no protected route may be served. There
+        # is NO opt-out — "missing JWT configuration must fail closed".
         logger.error(
             "JWT_SECRET not configured; refusing protected request to %s",
             request.url.path,

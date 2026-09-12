@@ -37,9 +37,8 @@ def _full_payload(**overrides):
 
 @pytest.fixture(autouse=True)
 def _auth_env(monkeypatch):
-    # Default: a secret is configured and auth is NOT disabled.
+    # Default: a secret is configured.
     monkeypatch.setenv("JWT_SECRET", SECRET)
-    monkeypatch.delenv("RAG_AUTH_DISABLED", raising=False)
     yield
 
 
@@ -115,14 +114,15 @@ async def test_missing_secret_fails_closed_500(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_missing_secret_with_explicit_optin_passes(monkeypatch):
+async def test_missing_secret_has_no_bypass(monkeypatch):
+    # There is NO opt-out: even RAG_AUTH_DISABLED=true must still fail closed when
+    # JWT_SECRET is unset (the flag was removed; setting it changes nothing).
     monkeypatch.delenv("JWT_SECRET", raising=False)
     monkeypatch.setenv("RAG_AUTH_DISABLED", "true")
-    request = DummyRequest("/protected", {})
+    request = DummyRequest("/protected", {"Authorization": f"Bearer {_token(_full_payload())}"})
     response = await security_middleware(request, dummy_call_next)
-    assert response.status_code == 200
-    # Explicit local-dev bypass attaches no entitlement.
-    assert getattr(request.state, "entitlement", None) is None
+    assert response.status_code == 500
+    assert not hasattr(request.state, "entitlement")
 
 
 # --- Fail-closed: missing entitlement claims (D-KSPT-1) --------------------

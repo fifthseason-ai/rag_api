@@ -282,3 +282,42 @@ def test_embed_stores_tenant_id_in_metadata(monkeypatch):
     assert r.status_code == 200, r.text
     assert captured["tenant_id"] == "tenantXYZ"
     assert captured["user_id"] == "userA"
+
+
+# --- pgvector debug record routes (reviewer F1) -----------------------------
+
+
+def test_pgvector_records_gating_and_filter():
+    from fastapi import HTTPException
+    from app.routes import pgvector_routes as pv
+
+    ent = {"entity_ids": {"userA"}, "tenant_id": "tenantA", "actions": {"read"}}
+
+    class Req:
+        def __init__(self, entitlement):
+            self.state = type("S", (), {})()
+            if entitlement is not None:
+                self.state.entitlement = entitlement
+
+    # No entitlement -> 403; missing read action -> 403; read present -> ok.
+    with pytest.raises(HTTPException) as e1:
+        pv.require_read_entitlement(Req(None))
+    assert e1.value.status_code == 403
+    with pytest.raises(HTTPException) as e2:
+        pv.require_read_entitlement(
+            Req({"entity_ids": {"userA"}, "tenant_id": "tenantA", "actions": {"write"}})
+        )
+    assert e2.value.status_code == 403
+    assert pv.require_read_entitlement(Req(ent)) is ent
+
+    # Keep own entity+tenant; drop cross-entity, cross-tenant, and no-user rows;
+    # tolerate cmetadata as dict or JSON string.
+    rows = [
+        {"custom_id": "1", "cmetadata": {"user_id": "userA", "tenant_id": "tenantA"}},
+        {"custom_id": "2", "cmetadata": {"user_id": "userB", "tenant_id": "tenantA"}},
+        {"custom_id": "3", "cmetadata": {"user_id": "userA", "tenant_id": "tenantB"}},
+        {"custom_id": "4", "cmetadata": '{"user_id": "userA"}'},  # JSON str, no tenant
+        {"custom_id": "5", "cmetadata": {}},  # no user_id
+    ]
+    kept = {r["custom_id"] for r in pv.filter_rows_by_entitlement(rows, ent)}
+    assert kept == {"1", "4"}

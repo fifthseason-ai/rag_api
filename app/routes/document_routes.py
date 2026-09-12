@@ -98,32 +98,14 @@ def get_user_id(request: Request, entity_id: str = None) -> str:
 # the route's action is authorized. We never fall back to caller ids or widen.
 
 
-def _auth_bypassed(request: Request) -> bool:
-    """True only in the explicit local-dev, no-secret mode (RAG_AUTH_DISABLED).
-
-    In that mode the middleware lets requests through without attaching an
-    entitlement. Everywhere else the middleware guarantees an entitlement, so a
-    missing one is treated as forbidden (never open).
-    """
-    return (
-        getattr(request.state, "entitlement", None) is None
-        and not os.getenv("JWT_SECRET")
-        and os.getenv("RAG_AUTH_DISABLED", "false").strip().lower()
-        in ("true", "1", "yes", "y", "t")
-    )
-
-
-def _require_action(request: Request, action: str) -> Optional[dict]:
+def _require_action(request: Request, action: str) -> dict:
     """Return the entitlement after asserting the route's action is authorized.
 
-    Returns ``None`` only in the explicit auth-disabled local-dev mode, which
-    callers treat as "no filtering". Raises 403 otherwise when the action is not
-    granted or no entitlement is present.
+    The middleware fails closed, so a protected route always has an entitlement;
+    a missing one (or an action not granted) is forbidden. Never falls open.
     """
     ent = getattr(request.state, "entitlement", None)
     if ent is None:
-        if _auth_bypassed(request):
-            return None
         raise HTTPException(status_code=403, detail="Missing entitlement")
     if action not in ent["actions"]:
         raise HTTPException(
@@ -132,12 +114,10 @@ def _require_action(request: Request, action: str) -> Optional[dict]:
     return ent
 
 
-def _require_entity(request: Request, action: str, entity_id: Optional[str]) -> Optional[dict]:
+def _require_entity(request: Request, action: str, entity_id: Optional[str]) -> dict:
     """Assert the action is authorized AND the given entity id is within the token
-    entitlement. Returns the entitlement (or ``None`` in auth-disabled dev mode)."""
+    entitlement. Returns the entitlement."""
     ent = _require_action(request, action)
-    if ent is None:
-        return None
     if entity_id is None or str(entity_id) not in ent["entity_ids"]:
         raise HTTPException(
             status_code=403, detail="Not authorized for the requested entity"
@@ -303,36 +283,21 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
     ent = _require_action(request, "read")
     try:
         if isinstance(vector_store, AsyncPgVector):
-            existing_ids = await vector_store.get_filtered_ids(
-                ids, executor=request.app.state.thread_pool
-            )
             documents = await vector_store.get_documents_by_ids(
                 ids, executor=request.app.state.thread_pool
             )
         else:
-            existing_ids = vector_store.get_filtered_ids(ids)
             documents = vector_store.get_documents_by_ids(ids)
 
         # Entitlement filter (D-KSPT-1): a document is only visible if its
         # owning entity (user_id) is within the token entitlement. Ids outside
         # the entitlement are treated as not found and never disclosed.
-        if ent is not None:
-            documents = [
-                d
-                for d in documents
-                if d.metadata.get("user_id") in ent["entity_ids"]
-            ]
-            authorized_ids = {d.metadata.get("file_id") for d in documents}
-            if not all(id in authorized_ids for id in ids):
-                raise HTTPException(
-                    status_code=404, detail="One or more IDs not found"
-                )
-        else:
-            # Explicit local-dev auth-disabled mode only.
-            if not all(id in existing_ids for id in ids):
-                raise HTTPException(
-                    status_code=404, detail="One or more IDs not found"
-                )
+        documents = [
+            d for d in documents if d.metadata.get("user_id") in ent["entity_ids"]
+        ]
+        authorized_ids = {d.metadata.get("file_id") for d in documents}
+        if not all(id in authorized_ids for id in ids):
+            raise HTTPException(status_code=404, detail="One or more IDs not found")
 
         # Ensure documents list is not empty
         if not documents:
@@ -373,7 +338,7 @@ async def delete_documents(
     # entitlement and the token must grant the delete action. We never delete by
     # file id alone (which would cross entities).
     ent = _require_action(request, "delete")
-    if ent is not None and (user_id is None or str(user_id) not in ent["entity_ids"]):
+    if user_id is None or str(user_id) not in ent["entity_ids"]:
         raise HTTPException(
             status_code=403, detail="Not authorized for the requested entity"
         )
@@ -612,15 +577,11 @@ async def query_embeddings_by_file_id(
     # constrained to the authorized entity set, and results are defensively
     # re-filtered so a document owned by an unauthorized entity is never returned.
     ent = _require_action(request, "read")
-    if ent is not None:
-        if body.entity_id is not None and str(body.entity_id) not in ent["entity_ids"]:
-            raise HTTPException(
-                status_code=403, detail="Not authorized for the requested entity"
-            )
-        user_filter = [body.entity_id] if body.entity_id else list(ent["entity_ids"])
-    else:
-        # Explicit local-dev auth-disabled mode only.
-        user_filter = body.entity_id if body.entity_id else "public"
+    if body.entity_id is not None and str(body.entity_id) not in ent["entity_ids"]:
+        raise HTTPException(
+            status_code=403, detail="Not authorized for the requested entity"
+        )
+    user_filter = [body.entity_id] if body.entity_id else list(ent["entity_ids"])
 
     authorized_documents = []
 
@@ -638,21 +599,18 @@ async def query_embeddings_by_file_id(
         if not documents:
             return authorized_documents
 
-        if ent is not None:
-            authorized_documents = [
-                (doc, score)
-                for (doc, score) in documents
-                if doc.metadata.get("user_id") in ent["entity_ids"]
-            ]
-            if len(authorized_documents) != len(documents):
-                logger.warning(
-                    "[query] filtered %d unauthorized document(s) out of %d for file_id=%s",
-                    len(documents) - len(authorized_documents),
-                    len(documents),
-                    body.file_id,
-                )
-        else:
-            authorized_documents = documents
+        authorized_documents = [
+            (doc, score)
+            for (doc, score) in documents
+            if doc.metadata.get("user_id") in ent["entity_ids"]
+        ]
+        if len(authorized_documents) != len(documents):
+            logger.warning(
+                "[query] filtered %d unauthorized document(s) out of %d for file_id=%s",
+                len(documents) - len(authorized_documents),
+                len(documents),
+                body.file_id,
+            )
 
         return authorized_documents
 
@@ -1111,7 +1069,7 @@ async def embed_local_file(
     # Entitlement (D-KSPT-1): embedding writes under the resolved entity; that
     # entity must be within the token entitlement and write must be granted.
     ent = _require_entity(request, "write", user_id)
-    tenant_id = ent["tenant_id"] if ent else None
+    tenant_id = ent["tenant_id"]
 
     loader = None
     try:
@@ -1239,7 +1197,7 @@ async def embed_file(
     # Entitlement (D-KSPT-1): embedding writes under the resolved entity; that
     # entity must be within the token entitlement and write must be granted.
     ent = _require_entity(request, "write", user_id)
-    tenant_id = ent["tenant_id"] if ent else None
+    tenant_id = ent["tenant_id"]
 
     try:
         os.makedirs(os.path.dirname(validated_file_path), exist_ok=True)
@@ -1343,34 +1301,21 @@ async def load_document_context(request: Request, id: str):
     ids = [id]
     try:
         if isinstance(vector_store, AsyncPgVector):
-            existing_ids = await vector_store.get_filtered_ids(
-                ids, executor=request.app.state.thread_pool
-            )
             documents = await vector_store.get_documents_by_ids(
                 ids, executor=request.app.state.thread_pool
             )
         else:
-            existing_ids = vector_store.get_filtered_ids(ids)
             documents = vector_store.get_documents_by_ids(ids)
 
         # Entitlement filter (D-KSPT-1): only the owning entity's document is
         # visible. An id outside the entitlement is not found and not disclosed.
-        if ent is not None:
-            documents = [
-                d
-                for d in documents
-                if d.metadata.get("user_id") in ent["entity_ids"]
-            ]
-            if not documents:
-                raise HTTPException(
-                    status_code=404, detail="The specified file_id was not found"
-                )
-        else:
-            # Explicit local-dev auth-disabled mode only.
-            if not all(id in existing_ids for id in ids):
-                raise HTTPException(
-                    status_code=404, detail="The specified file_id was not found"
-                )
+        documents = [
+            d for d in documents if d.metadata.get("user_id") in ent["entity_ids"]
+        ]
+        if not documents:
+            raise HTTPException(
+                status_code=404, detail="The specified file_id was not found"
+            )
 
         # Ensure documents list is not empty
         if not documents:
@@ -1422,7 +1367,7 @@ async def embed_file_upload(
     # Entitlement (D-KSPT-1): write under the resolved entity, which must be
     # within the token entitlement and have write granted.
     ent = _require_entity(request, "write", user_id)
-    tenant_id = ent["tenant_id"] if ent else None
+    tenant_id = ent["tenant_id"]
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
@@ -1489,9 +1434,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
         # Get the embedding of the query text
         embedding = get_cached_query_embedding(body.query)
 
-        filters = {"file_id": body.file_ids}
-        if ent is not None:
-            filters["user_id"] = list(ent["entity_ids"])
+        filters = {"file_id": body.file_ids, "user_id": list(ent["entity_ids"])}
 
         # Perform hybrid (or dense-only) search filtered by the file_ids in metadata
         documents = await _retrieve_documents(
@@ -1502,12 +1445,11 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             filters,
         )
 
-        if ent is not None:
-            documents = [
-                (doc, score)
-                for (doc, score) in documents
-                if doc.metadata.get("user_id") in ent["entity_ids"]
-            ]
+        documents = [
+            (doc, score)
+            for (doc, score) in documents
+            if doc.metadata.get("user_id") in ent["entity_ids"]
+        ]
 
         # Ensure documents list is not empty
         if not documents:
@@ -1628,11 +1570,11 @@ async def summarize_entity_files(
     # destination knowledge id must be within the token entitlement, and write
     # must be granted.
     ent = _require_entity(request, "write", user_id)
-    if ent is not None and str(knowledge_id) not in ent["entity_ids"]:
+    if str(knowledge_id) not in ent["entity_ids"]:
         raise HTTPException(
             status_code=403, detail="Not authorized for the requested knowledge id"
         )
-    tenant_id = ent["tenant_id"] if ent else None
+    tenant_id = ent["tenant_id"]
     logger.info(
         "[summarize_entity_files] request [entity_id=%s][user_id=%s][file_id=%s][knowledge_id=%s]",
         entity_id, user_id, file_id, knowledge_id,

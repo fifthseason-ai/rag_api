@@ -70,8 +70,6 @@ def test_no_default_provider_kept():
 
 def test_require_auth_config_raises_without_secret(monkeypatch):
     monkeypatch.delenv("JWT_SECRET", raising=False)
-    # RAG_AUTH_DISABLED is resolved at import time; patch the module flag directly.
-    monkeypatch.setattr("app.config.RAG_AUTH_DISABLED", False)
     with pytest.raises(RuntimeError) as exc:
         require_auth_config()
     assert "JWT_SECRET" in str(exc.value)
@@ -79,11 +77,14 @@ def test_require_auth_config_raises_without_secret(monkeypatch):
 
 def test_require_auth_config_ok_with_secret(monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "s")
-    monkeypatch.setattr("app.config.RAG_AUTH_DISABLED", False)
     require_auth_config()  # must not raise
 
 
-def test_require_auth_config_ok_with_explicit_optin(monkeypatch):
+def test_require_auth_config_has_no_bypass(monkeypatch):
+    # The opt-in was removed: RAG_AUTH_DISABLED must NOT re-enable an auth-less
+    # startup. Missing JWT_SECRET fails closed unconditionally.
     monkeypatch.delenv("JWT_SECRET", raising=False)
-    monkeypatch.setattr("app.config.RAG_AUTH_DISABLED", True)
-    require_auth_config()  # explicit local-dev opt-in, must not raise
+    monkeypatch.setenv("RAG_AUTH_DISABLED", "true")
+    assert not hasattr(__import__("app.config", fromlist=["x"]), "RAG_AUTH_DISABLED")
+    with pytest.raises(RuntimeError):
+        require_auth_config()
