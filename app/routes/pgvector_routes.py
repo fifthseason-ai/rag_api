@@ -1,8 +1,43 @@
 # app/routes/pgvector_routes.py
-from fastapi import APIRouter, HTTPException
+import json
+from fastapi import APIRouter, HTTPException, Request
 from app.services.database import PSQLDatabase
 
 router = APIRouter()
+
+
+# --- Entitlement gating for debug record dumps (D-KSPT-1, reviewer F1) -------
+# These routes are mounted only in debug_mode, but must still never disclose
+# vectors across entities/tenants. Authority is the signed token entitlement.
+
+
+def require_read_entitlement(request: Request) -> dict:
+    ent = getattr(request.state, "entitlement", None)
+    if ent is None or "read" not in ent["actions"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return ent
+
+
+def filter_rows_by_entitlement(rows: list, ent: dict) -> list:
+    """Keep only rows whose cmetadata user_id is in ent and (if stored)
+    tenant_id == tid. Rows without an entitled user_id are dropped (never
+    disclosed)."""
+    out = []
+    for row in rows:
+        meta = row.get("cmetadata")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (ValueError, TypeError):
+                meta = {}
+        meta = meta or {}
+        if meta.get("user_id") not in ent["entity_ids"]:
+            continue
+        tid = meta.get("tenant_id")
+        if tid is not None and str(tid) != ent["tenant_id"]:
+            continue
+        out.append(row)
+    return out
 
 
 async def check_index_exists(table_name: str, column_name: str) -> bool:
@@ -66,7 +101,8 @@ async def get_table_columns(table_name: str, schema: str = "public"):
 
 
 @router.get("/records/all")
-async def get_all_records(table_name: str):
+async def get_all_records(request: Request, table_name: str):
+    ent = require_read_entitlement(request)
     # Validate that the table name is one of the expected ones to prevent SQL injection
     if table_name not in ["langchain_pg_collection", "langchain_pg_embedding"]:
         raise HTTPException(status_code=400, detail="Invalid table name")
@@ -79,11 +115,13 @@ async def get_all_records(table_name: str):
     # Convert records to JSON serializable format, assuming records can be directly serialized
     records_json = [dict(record) for record in records]
 
-    return records_json
+    # Never disclose vectors across entities/tenants (D-KSPT-1).
+    return filter_rows_by_entitlement(records_json, ent)
 
 
 @router.get("/records")
-async def get_records_filtered_by_custom_id(custom_id: str, table_name: str = "langchain_pg_embedding"):
+async def get_records_filtered_by_custom_id(request: Request, custom_id: str, table_name: str = "langchain_pg_embedding"):
+    ent = require_read_entitlement(request)
     # Validate that the table name is one of the expected ones to prevent SQL injection
     if table_name not in ["langchain_pg_collection", "langchain_pg_embedding"]:
         raise HTTPException(status_code=400, detail="Invalid table name")
@@ -97,4 +135,5 @@ async def get_records_filtered_by_custom_id(custom_id: str, table_name: str = "l
     # Convert records to JSON serializable format, assuming the Record class has a dict method.
     records_json = [dict(record) for record in records]
 
-    return records_json
+    # Never disclose vectors across entities/tenants (D-KSPT-1).
+    return filter_rows_by_entitlement(records_json, ent)

@@ -18,6 +18,11 @@ def auth_headers():
     os.environ["JWT_SECRET"] = jwt_secret
     payload = {
         "id": "testuser",
+        # KSPT entitlement claims (D-KSPT-1). Core mints these; rag_api enforces
+        # them. The test entity set covers the ids these tests operate on.
+        "tid": "tenantA",
+        "ent": ["testuser", "testid1", "testid2", "test_text_123"],
+        "act": ["read", "write", "delete"],
         "exp": datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(hours=1),
     }
@@ -31,8 +36,11 @@ def override_vector_store(monkeypatch):
     from app.services.vector_store.async_pg_vector import AsyncPgVector
     from app.routes import document_routes
 
-    # Clear the LRU cache and patch the cached function to return dummy embeddings
-    document_routes.get_cached_query_embedding.cache_clear()
+    # Clear the LRU cache and patch the cached function to return dummy embeddings.
+    # (The function is no longer lru-cached — it uses the Redis-backed embedding
+    # cache — so guard the legacy cache_clear call.)
+    if hasattr(document_routes.get_cached_query_embedding, "cache_clear"):
+        document_routes.get_cached_query_embedding.cache_clear()
 
     def dummy_get_cached_query_embedding(query):
         return [0.1, 0.2, 0.3]
@@ -53,17 +61,29 @@ def override_vector_store(monkeypatch):
 
     monkeypatch.setattr(AsyncPgVector, "get_all_ids", dummy_get_all_ids)
 
-    # Override get_filtered_ids as an async function.
-    async def dummy_get_filtered_ids(self, ids, executor=None):
+    # Override get_filtered_ids as an async function. Accept the scoping kwargs the
+    # delete/list routes now pass (user_id / document_origin_type / subscription_id).
+    async def dummy_get_filtered_ids(
+        self,
+        ids,
+        user_id=None,
+        document_origin_type=None,
+        subscription_id=None,
+        executor=None,
+    ):
         dummy_ids = ["testid1", "testid2"]
         return [id for id in dummy_ids if id in ids]
 
     monkeypatch.setattr(AsyncPgVector, "get_filtered_ids", dummy_get_filtered_ids)
 
-    # Override get_documents_by_ids as an async function.
+    # Override get_documents_by_ids as an async function. Include user_id so the
+    # entitlement filter (D-KSPT-1) treats these as owned by the test entity.
     async def dummy_get_documents_by_ids(self, ids, executor=None):
         return [
-            Document(page_content="Test content", metadata={"file_id": id})
+            Document(
+                page_content="Test content",
+                metadata={"file_id": id, "user_id": "testuser"},
+            )
             for id in ids
         ]
 
@@ -122,8 +142,16 @@ def override_vector_store(monkeypatch):
     monkeypatch.setattr(AsyncPgVector, "add_documents", dummy_add_documents)
     monkeypatch.setattr(AsyncPgVector, "aadd_documents", dummy_aadd_documents)
 
-    # Override delete function.
-    async def dummy_delete(self, ids=None, collection_only=False, executor=None):
+    # Override delete function. Accept the scoping kwargs the delete route passes.
+    async def dummy_delete(
+        self,
+        ids=None,
+        collection_only=False,
+        user_id=None,
+        document_origin_type=None,
+        subscription_id=None,
+        executor=None,
+    ):
         return None
 
     monkeypatch.setattr(AsyncPgVector, "delete", dummy_delete)
@@ -149,8 +177,13 @@ def test_get_documents_by_ids(auth_headers):
 
 
 def test_delete_documents(auth_headers):
+    # DELETE is scoped to an authorized entity (D-KSPT-1): the body carries the
+    # entity_id (a filter that must be within the token entitlement).
     response = client.request(
-        "DELETE", "/documents", json=["testid1"], headers=auth_headers
+        "DELETE",
+        "/documents",
+        json={"entity_id": "testuser", "file_ids": ["testid1"]},
+        headers=auth_headers,
     )
     assert response.status_code == 200
     json_data = response.json()

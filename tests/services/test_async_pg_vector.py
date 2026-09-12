@@ -36,7 +36,14 @@ async def test_get_filtered_ids_passes_ids(store):
         ExtendedPgVector, "get_filtered_ids", return_value=["id1"]
     ) as mock:
         result = await store.get_filtered_ids(["id1", "id2"])
-    mock.assert_called_once_with(["id1", "id2"])
+    # AsyncPgVector forwards the owner-scoping kwargs (user_id/document_origin_type/
+    # subscription_id) to the sync super() method; assert the real current signature.
+    mock.assert_called_once_with(
+        ["id1", "id2"],
+        user_id=None,
+        document_origin_type=None,
+        subscription_id=None,
+    )
     assert result == ["id1"]
 
 
@@ -55,7 +62,14 @@ async def test_get_documents_by_ids_passes_ids(store):
 async def test_delete_passes_args(store):
     with patch.object(ExtendedPgVector, "_delete_multiple") as mock:
         await store.delete(ids=["id1"], collection_only=True)
-    mock.assert_called_once_with(["id1"], True)
+    # AsyncPgVector forwards the owner-scoping kwargs to the sync super() method.
+    mock.assert_called_once_with(
+        ["id1"],
+        True,
+        user_id=None,
+        document_origin_type=None,
+        subscription_id=None,
+    )
 
 
 @pytest.mark.asyncio
