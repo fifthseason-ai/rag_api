@@ -1,4 +1,8 @@
 import os
+import sys
+import subprocess
+import textwrap
+
 import pytest
 
 from app.config import (
@@ -54,7 +58,6 @@ def test_embeddings_provider_valid_resolves():
     assert type(resolve_embeddings_provider("bedrock")).__name__ == "EmbeddingsProvider"
     assert resolve_embeddings_provider("bedrock").value == "bedrock"
     assert resolve_embeddings_provider("bedrock").name == "BEDROCK"
-    assert resolve_embeddings_provider("openai").value == "openai"
     # Case/whitespace tolerant.
     assert resolve_embeddings_provider(" Bedrock ").value == "bedrock"
 
@@ -63,6 +66,104 @@ def test_no_default_provider_kept():
     # There must be no silent default: openai is not returned for a missing value.
     with pytest.raises(ValueError):
         resolve_embeddings_provider(None)
+
+
+# --- Approved-provider allow-list (D-KSPT-2; ported from RATB-01 5d9fe48) ----
+
+
+def test_bedrock_approved_by_default():
+    # bedrock is the default approved provider.
+    assert resolve_embeddings_provider("bedrock", approved=["bedrock"]).value == "bedrock"
+
+
+def test_explicit_openai_with_default_allowlist_raises():
+    # A syntactically-valid but UNAPPROVED provider fails closed. Default allow-list
+    # is bedrock-only; openai must be rejected even though it is a real provider.
+    with pytest.raises(ValueError) as exc:
+        resolve_embeddings_provider("openai", approved=["bedrock"])
+    assert "not in the approved" in str(exc.value)
+    assert "openai" in str(exc.value)
+
+
+def test_openai_accepted_when_explicitly_approved():
+    # Widening the allow-list makes openai usable — proving the mechanism, not a
+    # recommendation.
+    assert (
+        resolve_embeddings_provider("openai", approved=["bedrock", "openai"]).value
+        == "openai"
+    )
+
+
+# --- Fail-closed startup at import (subprocess, fresh env) ------------------
+# The in-process interpreter already imported a valid app.config via conftest, so
+# module-level fail-closed behavior is exercised in a fresh subprocess with a fully
+# controlled environment. The bootstrap patches pgvector __post_init__ so the
+# "import succeeds" cases do not attempt a real DB connection.
+
+_BOOTSTRAP = textwrap.dedent(
+    """
+    from langchain_community.vectorstores.pgvector import PGVector
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+    PGVector.__post_init__ = lambda self: None
+    AsyncPgVector.__post_init__ = lambda self: None
+    import app.config  # noqa: F401
+    """
+)
+
+
+def _import_config(env_overrides):
+    """Import app.config in a subprocess with a controlled env."""
+    env = dict(os.environ)
+    for key in (
+        "JWT_SECRET",
+        "EMBEDDINGS_PROVIDER",
+        "RAG_APPROVED_EMBEDDINGS_PROVIDERS",
+        "OPENAI_API_KEY",
+        "RAG_OPENAI_API_KEY",
+    ):
+        env.pop(key, None)
+    # Offline dummy AWS creds so a bedrock import never needs the network.
+    env["AWS_ACCESS_KEY_ID"] = "testing"
+    env["AWS_SECRET_ACCESS_KEY"] = "testing"
+    env["AWS_DEFAULT_REGION"] = "us-east-1"
+    env.update(env_overrides)
+    return subprocess.run(
+        [sys.executable, "-c", _BOOTSTRAP],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_config_missing_embeddings_provider_fails_closed():
+    result = _import_config({})
+    assert result.returncode != 0, result.stderr
+    assert "EMBEDDINGS_PROVIDER is required" in result.stderr
+
+
+def test_config_unapproved_openai_provider_fails_closed():
+    # openai is a valid provider but NOT in the default approved set (bedrock).
+    result = _import_config({"EMBEDDINGS_PROVIDER": "openai", "OPENAI_API_KEY": "k"})
+    assert result.returncode != 0, result.stderr
+    assert "not in the approved" in result.stderr
+    assert "openai" in result.stderr
+
+
+def test_config_approved_bedrock_provider_imports():
+    result = _import_config({"EMBEDDINGS_PROVIDER": "bedrock"})
+    assert result.returncode == 0, result.stderr
+
+
+def test_config_openai_allowed_when_explicitly_approved():
+    result = _import_config(
+        {
+            "EMBEDDINGS_PROVIDER": "openai",
+            "RAG_APPROVED_EMBEDDINGS_PROVIDERS": "bedrock,openai",
+            "OPENAI_API_KEY": "test_key",
+        }
+    )
+    assert result.returncode == 0, result.stderr
 
 
 # --- JWT auth startup guard (D-KSPT-1) -------------------------------------

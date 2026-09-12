@@ -352,14 +352,38 @@ def init_embeddings(provider, model):
         raise ValueError(f"Unsupported embeddings provider: {provider}")
 
 
-def resolve_embeddings_provider(value: Optional[str]) -> EmbeddingsProvider:
+# Operator-approved embeddings providers (D-KSPT-2; ported from RATB-01 5d9fe48).
+# rag_api cannot distinguish client / second-tenant documents from others, and
+# Richard's ruling is that OpenAI embeddings are NOT authorized for client or
+# second-tenant documents — Bedrock Titan is the explicitly approved provider.
+# So a syntactically-valid provider is not enough: it must also appear in this
+# allow-list. Default is `bedrock` only; an operator may widen it explicitly via
+# RAG_APPROVED_EMBEDDINGS_PROVIDERS (comma-separated). OpenAI is therefore never
+# used unless an operator approves it deliberately — never a silent fallback.
+def _approved_embeddings_providers() -> list:
+    return [
+        p.strip().lower()
+        for p in get_env_variable(
+            "RAG_APPROVED_EMBEDDINGS_PROVIDERS", "bedrock"
+        ).split(",")
+        if p.strip()
+    ]
+
+
+RAG_APPROVED_EMBEDDINGS_PROVIDERS = _approved_embeddings_providers()
+
+
+def resolve_embeddings_provider(
+    value: Optional[str], approved: Optional[list] = None
+) -> EmbeddingsProvider:
     """Resolve the configured embeddings provider, failing closed (D-KSPT-2).
 
     There is NO default. A missing or unknown ``EMBEDDINGS_PROVIDER`` raises so
-    that documents are never embedded (or queried) through an unintended and
-    possibly ungoverned provider. Production explicitly sets ``bedrock`` (Amazon
-    Titan). OpenAI remains supported once explicitly selected, but is never the
-    silent fallback.
+    that documents are never embedded (or queried) through an unintended provider.
+    Additionally the provider must be in the operator-approved allow-list
+    (``approved``; defaults to ``RAG_APPROVED_EMBEDDINGS_PROVIDERS``, i.e.
+    ``bedrock`` unless widened) — a valid-but-unapproved provider (e.g. an
+    explicitly-set ``openai``) also fails closed. Production uses ``bedrock``.
     """
     accepted = ", ".join(p.value for p in EmbeddingsProvider)
     if value is None or str(value).strip() == "":
@@ -367,12 +391,23 @@ def resolve_embeddings_provider(value: Optional[str]) -> EmbeddingsProvider:
             "EMBEDDINGS_PROVIDER is required and has no default. Set it explicitly "
             f"to one of: {accepted}. Production uses 'bedrock' (Amazon Titan)."
         )
+    provider_raw = str(value).strip().lower()
     try:
-        return EmbeddingsProvider(str(value).strip().lower())
+        provider = EmbeddingsProvider(provider_raw)
     except ValueError:
         raise ValueError(
             f"Unknown EMBEDDINGS_PROVIDER {value!r}. Accepted values: {accepted}."
         )
+    approved_set = approved if approved is not None else RAG_APPROVED_EMBEDDINGS_PROVIDERS
+    if provider_raw not in approved_set:
+        raise ValueError(
+            f"EMBEDDINGS_PROVIDER '{provider_raw}' is not in the approved set "
+            f"{approved_set}. Approve it explicitly via "
+            f"RAG_APPROVED_EMBEDDINGS_PROVIDERS; rag_api refuses to start with an "
+            f"unapproved embeddings provider. OpenAI embeddings are not authorized "
+            f"for client or second-tenant documents."
+        )
+    return provider
 
 
 EMBEDDINGS_PROVIDER = resolve_embeddings_provider(os.getenv("EMBEDDINGS_PROVIDER"))

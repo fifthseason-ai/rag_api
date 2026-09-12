@@ -10,6 +10,10 @@ os.environ["DSN"] = "dummy://"
 # select one explicitly before app.config is imported; embeddings are mocked so
 # the concrete provider is irrelevant to the assertions.
 os.environ.setdefault("EMBEDDINGS_PROVIDER", "openai")
+# openai is not in the default approved set (bedrock). Approve it for the in-process
+# test session so app.config imports under the mocked openai provider; the
+# allow-list enforcement itself is covered by the subprocess tests in test_config.py.
+os.environ.setdefault("RAG_APPROVED_EMBEDDINGS_PROVIDERS", "openai,bedrock")
 # The OpenAI embeddings client validates a key at construction time. Supply a
 # dummy so app.config imports under the openai provider; embeddings are mocked in
 # every test, so this key is never used to make a request.
