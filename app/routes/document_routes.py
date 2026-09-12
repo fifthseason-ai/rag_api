@@ -83,12 +83,27 @@ def calculate_num_batches(total: int, batch_size: int) -> int:
     return (total + batch_size - 1) // batch_size
 
 
+def require_identity(request: Request) -> str:
+    """Return the verified user id from server-validated JWT state (RATB-01).
+
+    The security middleware sets ``request.state.user`` only after verifying the
+    JWT signature and a non-empty string ``id`` claim. Any handler reaching this
+    without that state is unauthenticated and must be refused (fail closed).
+    There is no ``"public"`` fallback and caller-supplied ids never substitute
+    for the verified identity.
+    """
+    user = getattr(request.state, "user", None)
+    user_id = user.get("id") if isinstance(user, dict) else None
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user_id
+
+
 def get_user_id(request: Request, entity_id: str = None) -> str:
-    """Extract user ID from request or entity_id."""
-    if not hasattr(request.state, "user"):
-        return entity_id if entity_id else "public"
-    else:
-        return entity_id if entity_id else request.state.user.get("id")
+    """Resolve the owner id: the caller-supplied entity_id when given, otherwise
+    the verified identity. Never falls back to an unauthenticated 'public' owner.
+    """
+    return entity_id if entity_id else require_identity(request)
 
 
 async def save_upload_file_async(file: UploadFile, temp_file_path: str) -> None:
@@ -291,7 +306,11 @@ async def delete_documents(
     request: Request,
 ):
     document_ids = body.file_ids
-    user_id = body.entity_id
+    # RATB-01: never leave the owner filter unset. Absent entity_id falls back to
+    # the verified identity (not None → no owner filter, which would delete by
+    # file_id across all owners). See get_filtered_ids/_delete_multiple: user_id
+    # is None => the owner predicate is dropped entirely.
+    user_id = body.entity_id if body.entity_id else require_identity(request)
     document_origin_type = body.document_origin_type
     subscription_id = body.subscription_id
 
@@ -524,12 +543,9 @@ async def query_embeddings_by_file_id(
     body: QueryRequestBody,
     request: Request,
 ):
-    if not hasattr(request.state, "user"):
-        user_authorized = body.entity_id if body.entity_id else "public"
-    else:
-        user_authorized = (
-            body.entity_id if body.entity_id else request.state.user.get("id")
-        )
+    # RATB-01: owner is the caller-supplied entity_id when given, else the
+    # verified identity. No unauthenticated "public" owner.
+    user_authorized = body.entity_id if body.entity_id else require_identity(request)
 
     authorized_documents = []
 
@@ -555,8 +571,8 @@ async def query_embeddings_by_file_id(
             authorized_documents = documents
         else:
             # If using entity_id and access denied, try again with user's actual ID
-            if body.entity_id and hasattr(request.state, "user"):
-                user_authorized = request.state.user.get("id")
+            if body.entity_id:
+                user_authorized = require_identity(request)
                 if doc_user_id == user_authorized:
                     authorized_documents = documents
                 else:
@@ -1012,10 +1028,9 @@ async def embed_local_file(
             detail=ERROR_MESSAGES.FILE_NOT_FOUND,
         )
 
-    if not hasattr(request.state, "user"):
-        user_id = entity_id if entity_id else "public"
-    else:
-        user_id = entity_id if entity_id else request.state.user.get("id")
+    # RATB-01: owner is the caller-supplied entity_id when given, else the
+    # verified identity. No unauthenticated "public" owner.
+    user_id = entity_id if entity_id else require_identity(request)
 
     loader = None
     try:

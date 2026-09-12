@@ -226,6 +226,17 @@ logging.getLogger("uvicorn.access").disabled = True
 
 ## Credentials
 
+# --- JWT verification secret (RATB-01) ---
+# rag_api enforces entitlement from a signed, server-verified identity. Without
+# the shared JWT secret it cannot verify any token, so it must NOT start. This
+# replaces the historical fail-open behavior (middleware passing every request
+# through unauthenticated when JWT_SECRET was unset). Fail closed at startup.
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+if not JWT_SECRET:
+    raise ValueError(
+        "JWT_SECRET is required; rag_api refuses to start without JWT verification"
+    )
+
 OPENAI_API_KEY = get_env_variable("OPENAI_API_KEY", "")
 RAG_OPENAI_API_KEY = get_env_variable("RAG_OPENAI_API_KEY", OPENAI_API_KEY)
 RAG_OPENAI_BASEURL = get_env_variable("RAG_OPENAI_BASEURL", None)
@@ -331,9 +342,33 @@ def init_embeddings(provider, model):
         raise ValueError(f"Unsupported embeddings provider: {provider}")
 
 
-EMBEDDINGS_PROVIDER = EmbeddingsProvider(
-    get_env_variable("EMBEDDINGS_PROVIDER", EmbeddingsProvider.OPENAI.value).lower()
-)
+# --- Embeddings provider (RATB-01: no default, explicit approval required) ---
+# There is NO implicit default: an unset/empty provider fails closed rather than
+# silently falling back to OpenAI. The provider must also appear in the
+# operator-approved allow-list (default: bedrock only). OpenAI is therefore only
+# ever used when an operator approves it explicitly via
+# RAG_APPROVED_EMBEDDINGS_PROVIDERS — it is never a fallback.
+_embeddings_provider_raw = os.getenv("EMBEDDINGS_PROVIDER", "").strip().lower()
+if not _embeddings_provider_raw:
+    raise ValueError(
+        "EMBEDDINGS_PROVIDER is required; rag_api refuses to start without an "
+        "explicitly configured embeddings provider (no default, no OpenAI fallback)"
+    )
+
+RAG_APPROVED_EMBEDDINGS_PROVIDERS = [
+    p.strip().lower()
+    for p in get_env_variable("RAG_APPROVED_EMBEDDINGS_PROVIDERS", "bedrock").split(",")
+    if p.strip()
+]
+if _embeddings_provider_raw not in RAG_APPROVED_EMBEDDINGS_PROVIDERS:
+    raise ValueError(
+        f"EMBEDDINGS_PROVIDER '{_embeddings_provider_raw}' is not in the approved "
+        f"set {RAG_APPROVED_EMBEDDINGS_PROVIDERS}. Approve it explicitly via "
+        f"RAG_APPROVED_EMBEDDINGS_PROVIDERS; rag_api refuses to start with an "
+        f"unapproved embeddings provider."
+    )
+
+EMBEDDINGS_PROVIDER = EmbeddingsProvider(_embeddings_provider_raw)
 
 if EMBEDDINGS_PROVIDER == EmbeddingsProvider.OPENAI:
     EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-3-small")

@@ -1,6 +1,17 @@
 # tests/conftest.py
 import os
 
+# RATB-01: app.config now fails closed at import when JWT_SECRET or an approved
+# EMBEDDINGS_PROVIDER is missing. Set a controlled, offline test configuration
+# BEFORE any app module (and therefore app.config) is imported. Bedrock is the
+# approved provider; its client is constructed offline from dummy AWS creds, so
+# no network or real credentials are needed for the suite.
+os.environ.setdefault("JWT_SECRET", "test-jwt-secret")
+os.environ.setdefault("EMBEDDINGS_PROVIDER", "bedrock")
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+
 from app.services.vector_store.async_pg_vector import AsyncPgVector
 
 # Set environment variables early so config picks up test settings.

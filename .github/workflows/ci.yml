@@ -34,7 +34,14 @@ jobs:
 
       - name: Run tests and generate report
         env:
-          OPENAI_API_KEY: test_key
+          # RATB-01: the app fails closed without JWT_SECRET and an approved
+          # embeddings provider. Bedrock's client is built offline from dummy
+          # AWS creds, so no network or real credentials are needed for tests.
+          JWT_SECRET: test_key
+          EMBEDDINGS_PROVIDER: bedrock
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_DEFAULT_REGION: us-east-1
         run: |
           pytest --maxfail=1 --disable-warnings --junitxml=test-results.xml
 

@@ -31,8 +31,12 @@ def override_vector_store(monkeypatch):
     from app.services.vector_store.async_pg_vector import AsyncPgVector
     from app.routes import document_routes
 
-    # Clear the LRU cache and patch the cached function to return dummy embeddings
-    document_routes.get_cached_query_embedding.cache_clear()
+    # Clear the LRU cache and patch the cached function to return dummy embeddings.
+    # get_cached_query_embedding is no longer an lru_cache wrapper (embedding
+    # caching moved to the Redis layer in app.config), so guard the call rather
+    # than assume a .cache_clear attribute exists (pre-existing test staleness).
+    if hasattr(document_routes.get_cached_query_embedding, "cache_clear"):
+        document_routes.get_cached_query_embedding.cache_clear()
 
     def dummy_get_cached_query_embedding(query):
         return [0.1, 0.2, 0.3]
@@ -53,8 +57,13 @@ def override_vector_store(monkeypatch):
 
     monkeypatch.setattr(AsyncPgVector, "get_all_ids", dummy_get_all_ids)
 
-    # Override get_filtered_ids as an async function.
-    async def dummy_get_filtered_ids(self, ids, executor=None):
+    # Override get_filtered_ids as an async function. Accept the owner-scoping
+    # kwargs the DELETE handler forwards (user_id/document_origin_type/
+    # subscription_id) so the dummy matches the current call signature.
+    async def dummy_get_filtered_ids(
+        self, ids, user_id=None, document_origin_type=None,
+        subscription_id=None, executor=None,
+    ):
         dummy_ids = ["testid1", "testid2"]
         return [id for id in dummy_ids if id in ids]
 
@@ -122,8 +131,12 @@ def override_vector_store(monkeypatch):
     monkeypatch.setattr(AsyncPgVector, "add_documents", dummy_add_documents)
     monkeypatch.setattr(AsyncPgVector, "aadd_documents", dummy_aadd_documents)
 
-    # Override delete function.
-    async def dummy_delete(self, ids=None, collection_only=False, executor=None):
+    # Override delete function. Accept the owner-scoping kwargs the DELETE
+    # handler forwards so the dummy matches the current call signature.
+    async def dummy_delete(
+        self, ids=None, collection_only=False, user_id=None,
+        document_origin_type=None, subscription_id=None, executor=None,
+    ):
         return None
 
     monkeypatch.setattr(AsyncPgVector, "delete", dummy_delete)
@@ -149,8 +162,11 @@ def test_get_documents_by_ids(auth_headers):
 
 
 def test_delete_documents(auth_headers):
+    # DeleteDocumentsBody expects an object (file_ids/entity_id/...), not a bare
+    # list. The prior list body predates that model and 422'd (masked while the
+    # whole file errored on a stale cache_clear fixture call).
     response = client.request(
-        "DELETE", "/documents", json=["testid1"], headers=auth_headers
+        "DELETE", "/documents", json={"file_ids": ["testid1"]}, headers=auth_headers
     )
     assert response.status_code == 200
     json_data = response.json()
@@ -279,3 +295,31 @@ def test_extract_text_from_file(tmp_path, auth_headers):
     assert json_data["file_id"] == "test_text_123"
     assert json_data["filename"] == "test_text_extraction.txt"
     assert json_data["known_type"] is True  # text files are known types
+
+
+# --- RATB-01: unauthenticated requests are refused at the middleware ---
+
+
+@pytest.mark.parametrize(
+    "method,path,kwargs",
+    [
+        ("POST", "/query", {"json": {"query": "q", "file_id": "testid1", "k": 4}}),
+        ("POST", "/query/some-entity", {"json": {"query": "q", "k": 4}}),
+        ("GET", "/documents", {"params": {"ids": ["testid1"]}}),
+        ("DELETE", "/documents", {"json": {"file_ids": ["testid1"]}}),
+        ("POST", "/embed", {"data": {"file_id": "testid1"}}),
+        ("GET", "/ids", {}),
+        ("POST", "/query_multiple", {"json": {"query": "q", "file_ids": ["testid1"], "k": 4}}),
+    ],
+)
+def test_endpoints_require_authentication(method, path, kwargs):
+    """Without an Authorization header the middleware rejects with 401 before the
+    handler runs (JWT_SECRET is configured in the test env)."""
+    response = client.request(method, path, **kwargs)
+    assert response.status_code == 401, f"{method} {path} -> {response.status_code}"
+
+
+def test_health_open_without_token():
+    """The ECS health check path stays reachable without a token."""
+    response = client.get("/health")
+    assert response.status_code == 200

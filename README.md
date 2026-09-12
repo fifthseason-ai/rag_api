@@ -79,9 +79,9 @@ The following environment variables are required to run the application:
 - `DB_PORT`: (Optional) The port number of the PostgreSQL database server.
 - `RAG_HOST`: (Optional) The hostname or IP address where the API server will run. Defaults to "0.0.0.0"
 - `RAG_PORT`: (Optional) The port number where the API server will run. Defaults to port 8000.
-- `JWT_SECRET`: (Optional) The secret key used for verifying JWT tokens for requests.
+- `JWT_SECRET`: **(Required)** The secret key used for verifying JWT tokens for requests. Must match the secret the caller (LibreChat / Core) signs the RAG token with.
   - The secret is only used for verification. This basic approach assumes a signed JWT from elsewhere.
-  - Omit to run API without requiring authentication
+  - The service **refuses to start** without it (fail closed), and any request received while it is unset is rejected with `503 JWT verification unavailable`. There is no unauthenticated pass-through mode.
 
 - `COLLECTION_NAME`: (Optional) The name of the collection in the vector store. Default value is "testcollection".
 - `CHUNK_SIZE`: (Optional) The size of the chunks for text processing. Default value is "1500".
@@ -93,7 +93,8 @@ The following environment variables are required to run the application:
 - `DEBUG_RAG_API`: (Optional) Set to "True" to show more verbose logging output in the server console, and to enable postgresql database routes
 - `DEBUG_PGVECTOR_QUERIES`: (Optional) Set to "True" to enable detailed PostgreSQL query logging for pgvector operations. Useful for debugging performance issues with vector database queries.
 - `CONSOLE_JSON`: (Optional) Set to "True" to log as json for Cloud Logging aggregations
-- `EMBEDDINGS_PROVIDER`: (Optional) either "openai", "bedrock", "azure", "huggingface", "huggingfacetei", "google_genai", "vertexai", or "ollama", where "huggingface" uses sentence_transformers; defaults to "openai"
+- `EMBEDDINGS_PROVIDER`: **(Required)** one of "openai", "bedrock", "azure", "huggingface", "huggingfacetei", "google_genai", "vertexai", or "ollama", where "huggingface" uses sentence_transformers. There is **no default** — an unset/empty value makes the service **refuse to start** (fail closed; it never silently falls back to OpenAI). The provider must also be present in `RAG_APPROVED_EMBEDDINGS_PROVIDERS`.
+- `RAG_APPROVED_EMBEDDINGS_PROVIDERS`: (Optional) comma-separated allow-list of embeddings providers the service will accept. Defaults to `bedrock`. A provider outside this set makes the service refuse to start. To use OpenAI you must approve it explicitly (e.g. `RAG_APPROVED_EMBEDDINGS_PROVIDERS=bedrock,openai`); OpenAI is never a fallback.
 - `EMBEDDINGS_MODEL`: (Optional) Set a valid embeddings model to use from the configured provider.
     - **Defaults**
     - openai: "text-embedding-3-small"
