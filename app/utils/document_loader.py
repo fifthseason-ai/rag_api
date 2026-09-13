@@ -145,7 +145,15 @@ def get_loader(filename: str, file_content_type: str, filepath: str):
         "application/vnd.ms-excel",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ]:
-        loader = UnstructuredExcelLoader(filepath)
+        # mode="elements" so each element carries sheet-level citation metadata
+        # (`page_name` = sheet name, `page_number` = sheet index). The default
+        # ("single") mode collapses the whole workbook into one Document with no
+        # sheet metadata, which loses the exact sheet citations the RAG pipeline
+        # must surface (KI-02 WP-C). NOTE: UnstructuredExcelLoader requires the
+        # optional `msoffcrypto` package; it is NOT in requirements.txt, so every
+        # .xlsx currently raises ModuleNotFoundError at load time regardless of
+        # mode — see WP-C report / Demian follow-up.
+        loader = UnstructuredExcelLoader(filepath, mode="elements")
     elif file_ext == "json" or file_content_type == "application/json":
         loader = TextLoader(filepath, autodetect_encoding=True)
     elif file_ext in known_source_ext or (
@@ -292,6 +300,88 @@ class SlidePowerPointLoader:
             return title_shape.text.strip()
         return ""
 
+    @staticmethod
+    def _table_text(table) -> str:
+        """Row-major text of a PPTX table: cells joined by ' | ', rows by newline.
+
+        Evidence often sits in a table cell (KI-02 WP-C goal). Empty rows are
+        dropped so a spacer row does not add blank lines.
+        """
+        rows = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            if any(cells):
+                rows.append(" | ".join(cells))
+        return "\n".join(rows)
+
+    @staticmethod
+    def _chart_text(chart) -> str:
+        """Best-effort chart labels: title, category labels and series names.
+
+        Evidence can sit in a chart label (KI-02 WP-C goal). Chart XML is
+        variable, so every access is guarded — a chart we cannot read must be
+        skipped, never crash the whole deck.
+        """
+        parts: List[str] = []
+        try:
+            if chart.has_title and chart.chart_title.text_frame.text.strip():
+                parts.append(chart.chart_title.text_frame.text.strip())
+        except Exception:  # noqa: BLE001 - chart metadata is untrusted/variable
+            pass
+        try:
+            for plot in chart.plots:
+                try:
+                    cats = [str(c).strip() for c in plot.categories if str(c).strip()]
+                    if cats:
+                        parts.append(" ".join(cats))
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for series in chart.series:
+                try:
+                    name = (series.name or "").strip()
+                    if name:
+                        parts.append(name)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        return "\n".join(parts)
+
+    @classmethod
+    def _collect_shape_texts(cls, shapes) -> List[str]:
+        """Walk a slide's shape tree and collect text from every text-bearing
+        shape: plain text frames, tables, charts, and (recursively) grouped
+        shapes. Without this, evidence inside a group, table or chart label is
+        silently dropped (KI-02 WP-C)."""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        out: List[str] = []
+        for shape in shapes:
+            try:
+                if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
+                    out.extend(cls._collect_shape_texts(shape.shapes))
+                    continue
+                if getattr(shape, "has_table", False):
+                    text = cls._table_text(shape.table)
+                    if text:
+                        out.append(text)
+                    continue
+                if getattr(shape, "has_chart", False):
+                    text = cls._chart_text(shape.chart)
+                    if text:
+                        out.append(text)
+                    continue
+                if getattr(shape, "has_text_frame", False) and shape.text.strip():
+                    out.append(shape.text.strip())
+            except Exception as e:  # noqa: BLE001 - never let one shape abort a deck
+                logger.warning(
+                    "Skipped a shape while extracting PPTX text: %s", e
+                )
+        return out
+
     def lazy_load(self) -> Iterator[Document]:
         from pptx import Presentation
 
@@ -299,11 +389,7 @@ class SlidePowerPointLoader:
         for idx, slide in enumerate(prs.slides, start=1):
             title = self._slide_title(slide)
 
-            texts = [
-                shape.text.strip()
-                for shape in slide.shapes
-                if shape.has_text_frame and shape.text.strip()
-            ]
+            texts = self._collect_shape_texts(slide.shapes)
 
             if (
                 slide.has_notes_slide

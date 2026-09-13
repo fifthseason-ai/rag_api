@@ -982,6 +982,35 @@ def _prepare_documents_sync(
     ]
 
 
+def _assert_extractable_content(data: Iterable[Document], filename: Optional[str]) -> None:
+    """Empty-extraction guard (KI-02 WP-C).
+
+    Extraction that yields no Document, or only whitespace, must never be stored
+    as a successful embed: a corrupt/scanned/empty file would otherwise return
+    HTTP 200 with zero vector rows, indistinguishable from a real ingest. Raising
+    here — before any `add_documents` call — guarantees no vector rows are written
+    for an empty extraction. Called by every embed route.
+
+    `data` must be a materialized sequence (all embed paths pass
+    `list(loader.lazy_load())`), so this scan does not consume a one-shot
+    iterator.
+    """
+    has_text = any(
+        getattr(doc, "page_content", None) and doc.page_content.strip()
+        for doc in data
+    )
+    if not has_text:
+        name = filename or "uploaded file"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"No extractable text found in '{name}'. The file may be empty, "
+                f"image-only/scanned, corrupted, or password-protected. Nothing "
+                f"was stored."
+            ),
+        )
+
+
 async def store_data_in_vector_db(
     data: Iterable[Document],
     file_id: str,
@@ -1080,6 +1109,9 @@ async def embed_local_file(
         data = await loop.run_in_executor(
             request.app.state.thread_pool, lambda: list(loader.lazy_load())
         )
+
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        _assert_extractable_content(data, document.filename)
 
         result = await store_data_in_vector_db(
             data,
@@ -1208,6 +1240,9 @@ async def embed_file(
             validated_file_path,
             request.app.state.thread_pool,
         )
+
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        _assert_extractable_content(data, file.filename)
 
         result = await store_data_in_vector_db(
             data=data,
@@ -1378,6 +1413,9 @@ async def embed_file_upload(
             validated_temp_file_path,
             request.app.state.thread_pool,
         )
+
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        _assert_extractable_content(data, uploaded_file.filename)
 
         result = await store_data_in_vector_db(
             data,
