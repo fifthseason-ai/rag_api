@@ -982,6 +982,45 @@ def _prepare_documents_sync(
     ]
 
 
+def _assert_extractable_content(data: Iterable[Document], filename: Optional[str]) -> None:
+    """Empty-extraction guard (KI-02 WP-C).
+
+    Extraction that yields no Document, or only whitespace, must never be stored
+    as a successful embed: a corrupt/scanned/empty file would otherwise return
+    HTTP 200 with zero vector rows, indistinguishable from a real ingest. Raising
+    here — before any `add_documents` call — guarantees no vector rows are written
+    for an empty extraction. Called by every embed route.
+
+    `data` must be a materialized sequence (all embed paths pass
+    `list(loader.lazy_load())`), so this scan does not consume a one-shot
+    iterator.
+
+    Non-emptiness is measured on `clean_text(...)` — the SAME normalization the
+    pipeline persists (`_prepare_documents_sync` runs `clean_text` on the PDF
+    path, and `clean_text` strips NUL and invalid UTF-8). `str.strip()` alone
+    leaves NUL bytes and lone surrogates intact, so a page that is only NUL /
+    invalid-UTF8 would pass a raw-strip guard and then be cleaned to '' and
+    embedded as an empty chunk — "empty extraction counting as success", the one
+    invariant this guard exists to enforce. Cleaning here keeps the guard's
+    definition of "non-empty" identical to what is actually stored.
+    """
+    has_text = any(
+        getattr(doc, "page_content", None)
+        and clean_text(doc.page_content).strip()
+        for doc in data
+    )
+    if not has_text:
+        name = filename or "uploaded file"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"No extractable text found in '{name}'. The file may be empty, "
+                f"image-only/scanned, corrupted, or password-protected. Nothing "
+                f"was stored."
+            ),
+        )
+
+
 async def store_data_in_vector_db(
     data: Iterable[Document],
     file_id: str,
@@ -1080,6 +1119,9 @@ async def embed_local_file(
         data = await loop.run_in_executor(
             request.app.state.thread_pool, lambda: list(loader.lazy_load())
         )
+
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        _assert_extractable_content(data, document.filename)
 
         result = await store_data_in_vector_db(
             data,
@@ -1208,6 +1250,9 @@ async def embed_file(
             validated_file_path,
             request.app.state.thread_pool,
         )
+
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        _assert_extractable_content(data, file.filename)
 
         result = await store_data_in_vector_db(
             data=data,
@@ -1378,6 +1423,9 @@ async def embed_file_upload(
             validated_temp_file_path,
             request.app.state.thread_pool,
         )
+
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        _assert_extractable_content(data, uploaded_file.filename)
 
         result = await store_data_in_vector_db(
             data,
