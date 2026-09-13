@@ -62,8 +62,18 @@ class DocumentOwnerType(Enum):
 
 
 class DocumentOriginType(Enum):
+    # Parity with Core packages/data-provider/src/tempo.ts DocumentOriginType.
+    # Core declares { ORGANIC, SHAREPOINT, ONEDRIVE, GDRIVE, GMAIL } and tags
+    # embeds/deletes per provider; rag_api must accept those origins so per-origin
+    # vector cleanup works. BOX is the forward-add for the KI-02 inc-B Box adapter
+    # (Core switches Box to BOX only after this rag_api change is DEPLOYED).
+    # Additive only; string values equal member names, matching Core exactly.
     ORGANIC = "ORGANIC"
     SHAREPOINT = "SHAREPOINT"
+    ONEDRIVE = "ONEDRIVE"
+    GDRIVE = "GDRIVE"
+    GMAIL = "GMAIL"
+    BOX = "BOX"
 
 
 class DeleteDocumentsBody(BaseModel):
