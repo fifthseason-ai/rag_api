@@ -994,9 +994,19 @@ def _assert_extractable_content(data: Iterable[Document], filename: Optional[str
     `data` must be a materialized sequence (all embed paths pass
     `list(loader.lazy_load())`), so this scan does not consume a one-shot
     iterator.
+
+    Non-emptiness is measured on `clean_text(...)` — the SAME normalization the
+    pipeline persists (`_prepare_documents_sync` runs `clean_text` on the PDF
+    path, and `clean_text` strips NUL and invalid UTF-8). `str.strip()` alone
+    leaves NUL bytes and lone surrogates intact, so a page that is only NUL /
+    invalid-UTF8 would pass a raw-strip guard and then be cleaned to '' and
+    embedded as an empty chunk — "empty extraction counting as success", the one
+    invariant this guard exists to enforce. Cleaning here keeps the guard's
+    definition of "non-empty" identical to what is actually stored.
     """
     has_text = any(
-        getattr(doc, "page_content", None) and doc.page_content.strip()
+        getattr(doc, "page_content", None)
+        and clean_text(doc.page_content).strip()
         for doc in data
     )
     if not has_text:

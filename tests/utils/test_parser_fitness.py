@@ -24,6 +24,7 @@ Coverage notes recorded in WPC-REPORT.md:
     empty text and are caught by the empty-extraction guard — is asserted.
 """
 
+import base64
 import io
 import os
 import zipfile
@@ -114,6 +115,58 @@ def make_empty_pptx(path):
     prs = Presentation()
     prs.slides.add_slide(prs.slide_layouts[6])
     prs.slides.add_slide(prs.slide_layouts[6])
+    prs.save(path)
+
+
+# A minimal valid 1x1 PNG. python-pptx reads the IHDR to size the picture; it
+# does NOT need Pillow to embed an image, so no runtime dep is added.
+_PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk"
+    "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+def _add_image_only_slide(prs):
+    """Append a BLANK-layout slide whose only shape is a picture (no text)."""
+    from pptx.util import Inches
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank: no placeholders
+    slide.shapes.add_picture(
+        io.BytesIO(_PNG_1X1), Inches(1), Inches(1), Inches(2), Inches(2)
+    )
+    return slide
+
+
+def make_image_only_pptx(path):
+    """A single slide bearing only a picture (no extractable text)."""
+    from pptx import Presentation
+
+    prs = Presentation()
+    _add_image_only_slide(prs)
+    prs.save(path)
+
+
+def make_mixed_image_text_pptx(path):
+    """Slide 1 = picture only (image-only); slide 2 = real text. Both slides must
+    remain citable — the image-only slide must not silently disappear."""
+    from pptx import Presentation
+
+    prs = Presentation()
+    _add_image_only_slide(prs)
+    s2 = prs.slides.add_slide(prs.slide_layouts[1])
+    s2.shapes.title.text = "Revenue"
+    s2.placeholders[1].text = "EMEA grew 12%."
+    prs.save(path)
+
+
+def make_all_image_pptx(path):
+    """Every slide is image-only — extraction yields only empty-but-identifiable
+    Documents, which must still trip the per-deck empty-extraction guard."""
+    from pptx import Presentation
+
+    prs = Presentation()
+    _add_image_only_slide(prs)
+    _add_image_only_slide(prs)
     prs.save(path)
 
 
@@ -352,6 +405,47 @@ def test_pptx_grouped_shapes_are_walked_recursively():
     assert "nested-cell" in collected  # table inside the group was walked
 
 
+def test_pptx_image_only_slide_stays_identifiable(tmp_path):
+    """MAJOR-1 (WP-C-F, RED→GREEN): an image-only slide (a picture, no text) must
+    NOT be silently dropped. It is emitted as an empty-but-identifiable Document
+    carrying the correct slide_number and image_only=True — parity with PDF scan
+    pages. Before the fix the slide vanished (0 Documents emitted)."""
+    path = tmp_path / "imgonly.pptx"
+    make_image_only_pptx(str(path))
+    docs = list(SlidePowerPointLoader(str(path)).lazy_load())
+    assert len(docs) == 1
+    assert docs[0].page_content == ""
+    assert docs[0].metadata["slide_number"] == 1
+    assert docs[0].metadata.get("image_only") is True
+
+
+def test_pptx_mixed_image_text_deck_cites_both_slides(tmp_path):
+    """MAJOR-1 (RED→GREEN): a mixed deck (image-only slide 1 + text slide 2) must
+    cite BOTH slides. Before the fix slide 1 disappeared, only slide_number [2]
+    was emitted, and the embed still succeeded — an undisclosed silent drop."""
+    path = tmp_path / "mixed.pptx"
+    make_mixed_image_text_pptx(str(path))
+    docs = list(SlidePowerPointLoader(str(path)).lazy_load())
+    assert [d.metadata["slide_number"] for d in docs] == [1, 2]
+    # Slide 1: image-only, empty-but-identifiable, marked.
+    assert docs[0].page_content == ""
+    assert docs[0].metadata.get("image_only") is True
+    # Slide 2: real text, NOT marked image_only.
+    assert "EMEA grew 12%." in docs[1].page_content
+    assert docs[1].metadata.get("image_only") is not True
+
+
+def test_pptx_truly_blank_slide_is_still_dropped(tmp_path):
+    """Boundary regression for MAJOR-1: a slide with NO shapes at all (a truly
+    blank spacer) must STILL be dropped and must not renumber the deck, so the
+    image-only change never turns blank spacers into phantom empty citations."""
+    path = tmp_path / "deck.pptx"
+    make_multi_slide_pptx(str(path))  # slide 2 = blank layout-6 slide (no shapes)
+    docs = list(SlidePowerPointLoader(str(path)).lazy_load())
+    assert [d.metadata["slide_number"] for d in docs] == [1, 3]
+    assert all(d.metadata.get("image_only") is not True for d in docs)
+
+
 # ===========================================================================
 # PDF — native text vs scanned/image-only page, and exact page citations
 # ===========================================================================
@@ -410,16 +504,16 @@ def test_pdf_page_markers_match_page_metadata(tmp_path):
 
     docs = SafePyPDFLoader(str(path), extract_images=False).load()
     # PyPDFLoader is 0-indexed on `page`; process_documents renders that value
-    # into "# PAGE n" markers. Characterized quirk: process_documents guards with
-    # `if current_page and ...`, so the 0-indexed FIRST page (page == 0, falsy)
-    # gets NO marker; pages >= 1 get a marker that matches their `page` metadata.
+    # into "# PAGE n" markers. MINOR-3 fix (WP-C-F): the marker guard now uses
+    # `current_page is not None` (was a falsy `current_page` check that dropped
+    # the 0-indexed FIRST page's marker), so page 0 gets a "# PAGE 0" marker that
+    # matches its metadata, while non-paged formats (page == None) still get none.
     marked = process_documents(docs)
     pages = {d.metadata["page"] for d in docs}
     assert 0 in pages and 1 in pages
-    # Page 1 marker present and matches metadata.
+    # Both page markers present and matching metadata (page 0 no longer dropped).
+    assert "# PAGE 0" in marked
     assert "# PAGE 1" in marked
-    # Page 0 quirk: no "# PAGE 0" marker, but its content is still present.
-    assert "# PAGE 0" not in marked
     assert "Text on page 0" in marked
     assert "Text on page 1" in marked
 
@@ -535,13 +629,49 @@ import datetime  # noqa: E402
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
 import jwt  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from main import app  # noqa: E402
 from app.routes import document_routes  # noqa: E402
+from app.routes.document_routes import _assert_extractable_content  # noqa: E402
 from app.services.vector_store.async_pg_vector import AsyncPgVector  # noqa: E402
 
 _GUARD_SECRET = "testsecret"
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-2 (WP-C-F): the empty-extraction guard must measure non-emptiness on the
+# SAME normalization the pipeline persists (`clean_text`, which strips NUL and
+# invalid UTF-8). `str.strip()` alone leaves NUL / lone surrogates intact, so a
+# page that is only NUL / invalid-UTF8 would pass the guard and then be cleaned
+# to '' and embedded as an empty chunk — "empty extraction = success", the exact
+# invariant this increment exists to enforce. These probes are the reviewer's.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("probe", ["\x00\x00\x00", "\udc80\udc80", " \x00 "])
+def test_guard_rejects_content_that_cleans_to_empty(probe):
+    """RED→GREEN: NUL-only / invalid-UTF8-only / cleans-to-whitespace content
+    must raise 422. clean_text('\\x00\\x00\\x00') == '' and
+    clean_text('\\udc80\\udc80') == ''. Before the fix the guard used raw
+    str.strip() (NUL and surrogates survive strip) and these PASSED the guard."""
+    with pytest.raises(HTTPException) as exc:
+        _assert_extractable_content([Document(page_content=probe)], "junk.pdf")
+    assert exc.value.status_code == 422
+
+
+def test_guard_allows_content_that_survives_clean_text():
+    """Control: text that survives clean_text still passes the guard (no false
+    positive) — real content and a mixed doc list with one non-empty member."""
+    _assert_extractable_content([Document(page_content="Real revenue 4.2M")], "ok.pdf")
+    _assert_extractable_content(
+        [
+            Document(page_content="\x00\x00\x00"),
+            Document(page_content="Genuine text here"),
+        ],
+        "ok.pdf",
+    )
 
 
 def _guard_hdr(ent, act, tid="tenantA", uid="testuser"):
@@ -622,6 +752,56 @@ def test_embed_all_scanned_pdf_rejected_no_rows(guard_client, tmp_path):
     path = tmp_path / "scan.pdf"
     make_all_scan_pdf(str(path))
     r = _embed(guard_client, "scan.pdf", path.read_bytes(), "application/pdf")
+    assert r.status_code == 422, r.text
+    assert guard_client.inserted_batches == []
+
+
+def test_embed_all_image_pptx_rejected_no_rows(guard_client, tmp_path):
+    """MAJOR-1 x guard (WP-C-F): a deck where EVERY slide is image-only now emits
+    empty-but-identifiable Documents (not zero); the empty-extraction guard must
+    STILL reject it 422 with no rows, so the image-only Documents never become a
+    phantom empty success. Keeps the per-deck empty guard honest."""
+    path = tmp_path / "allimg.pptx"
+    make_all_image_pptx(str(path))
+    r = _embed(
+        guard_client,
+        "allimg.pptx",
+        path.read_bytes(),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+    assert r.status_code == 422, r.text
+    assert guard_client.inserted_batches == []
+
+
+def test_embed_nul_only_content_rejected_no_rows(guard_client, monkeypatch):
+    """MAJOR-2 route proof (RED→GREEN): content that cleans to empty (NUL /
+    invalid-UTF8) must be rejected 422 with NO vector rows. The LOADER is
+    SIMULATED here (a real file whose extracted text layer is exclusively NUL is
+    impractical to author); the guard, the clean_content=pdf path, and the
+    no-write behavior are all real. Before the fix this returned 200 with an
+    empty-chunk batch recorded (empty success)."""
+
+    class _NulLoader:
+        def __init__(self, *args, **kwargs):
+            self._temp_filepath = None
+
+        def load(self):
+            return [
+                Document(
+                    page_content="\x00\x00\x00",
+                    metadata={"source": "x", "page": 0},
+                )
+            ]
+
+        def lazy_load(self):
+            return iter(self.load())
+
+    monkeypatch.setattr(
+        document_routes,
+        "get_loader",
+        lambda filename, content_type, filepath: (_NulLoader(), True, "pdf"),
+    )
+    r = _embed(guard_client, "junk.pdf", b"%PDF-1.4 not really a pdf", "application/pdf")
     assert r.status_code == 422, r.text
     assert guard_client.inserted_batches == []
 

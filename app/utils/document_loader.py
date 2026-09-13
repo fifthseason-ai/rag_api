@@ -216,7 +216,10 @@ def process_documents(documents: List[Document]) -> str:
 
     for doc in documents:
         current_page = doc.metadata.get("page")
-        if current_page and current_page != last_page:
+        # `is not None` (not a falsy check) so the 0-indexed FIRST page (page == 0)
+        # gets its "# PAGE 0" marker; formats without page metadata (page == None,
+        # e.g. pptx/docx/xlsx) still get no marker (KI-02 WP-C-F, MINOR-3).
+        if current_page is not None and current_page != last_page:
             processed_text += f"\n# PAGE {doc.metadata['page']}\n\n"
             last_page = current_page
 
@@ -382,6 +385,28 @@ class SlidePowerPointLoader:
                 )
         return out
 
+    @classmethod
+    def _has_picture(cls, shapes) -> bool:
+        """True if the shape tree contains at least one picture (recursing into
+        groups). Distinguishes an image-only slide (a picture but no extractable
+        text — kept identifiable) from a truly blank slide (no shapes — dropped).
+        KI-02 WP-C-F, MAJOR-1."""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        picture_types = {MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE}
+        for shape in shapes:
+            try:
+                stype = getattr(shape, "shape_type", None)
+                if stype in picture_types:
+                    return True
+                if stype == MSO_SHAPE_TYPE.GROUP and cls._has_picture(shape.shapes):
+                    return True
+            except Exception as e:  # noqa: BLE001 - never let one shape abort a deck
+                logger.warning(
+                    "Skipped a shape while detecting PPTX pictures: %s", e
+                )
+        return False
+
     def lazy_load(self) -> Iterator[Document]:
         from pptx import Presentation
 
@@ -401,6 +426,25 @@ class SlidePowerPointLoader:
 
             content = "\n".join(texts).strip()
             if not content:
+                # An image-only slide (a picture but no extractable text) must
+                # stay identifiable rather than vanish — parity with PDF scan
+                # pages, which emit an empty-but-locatable Document. The text is
+                # EMPTY (not a placeholder string) on purpose: an all-image deck
+                # then yields only empty content and is still rejected by the
+                # per-file empty-extraction guard (422), while a mixed deck still
+                # cites this slide's slide_number. A TRULY blank slide (no shapes
+                # at all) is still dropped, so blank spacer slides never renumber
+                # the deck. KI-02 WP-C-F, MAJOR-1.
+                if self._has_picture(slide.shapes):
+                    yield Document(
+                        page_content="",
+                        metadata={
+                            "source": self.filepath,
+                            "slide_number": idx,
+                            "slide_title": title,
+                            "image_only": True,
+                        },
+                    )
                 continue
 
             yield Document(
