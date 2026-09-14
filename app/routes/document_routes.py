@@ -982,8 +982,121 @@ def _prepare_documents_sync(
     ]
 
 
-def _assert_extractable_content(data: Iterable[Document], filename: Optional[str]) -> None:
-    """Empty-extraction guard (KI-02 WP-C).
+# Per-unit locator metadata keys, in detection precedence. Each loader emits at
+# most ONE of these families (PDF -> `page`, PPTX -> `slide_number`, XLSX
+# elements -> `page_name`), so the precedence only guards a defensive
+# mixed-metadata edge; a format with no per-unit locator (DOCX/MD/TXT/CSV) folds
+# into a single `none` unit.
+_UNIT_LOCATOR_KEYS = (
+    ("page", "page"),           # PDF: 0-indexed page (SafePyPDFLoader / pypdf)
+    ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
+    ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
+)
+
+
+def _extraction_receipt(data: Iterable[Document]) -> dict:
+    """Build the additive extraction receipt for the /embed response (KI-02 WP-G1).
+
+    Reports, per page/slide/sheet UNIT, whether real text was extracted — derived
+    ONLY from loader signals that already exist (empty `page_content` on a scanned
+    PDF page / image-only slide, the PPTX `image_only` marker, the per-slide/page/
+    sheet locator metadata), NEVER success-by-default. A unit counts as EXTRACTED
+    only when its content survives `clean_text(...).strip()` — the exact same
+    normalization the empty guard uses and the pipeline persists — so
+    `units_extracted` equals the units that actually contribute stored chunks
+    (empty/image-only units carry empty content and split to zero chunks). A
+    document with some extracted and some empty units is therefore reported
+    `partial`, and `partial` can never be reported as a plain success.
+
+    Shape:
+      status:         'complete' (every unit extracted) | 'partial' (>=1 extracted
+                      AND >=1 empty/image-only unit) | 'empty' (0 extracted units;
+                      this is the 422 path)
+      locator_kind:   'page' | 'slide' | 'sheet' | 'none'
+      units_total / units_extracted / units_empty / units_image_only
+      empty_locators: sorted locators (page ints / slide ints / sheet names) of
+                      every unit that yielded NO extractable text (locator-bearing
+                      units only)
+      reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
+                      locator-bearing unit
+
+    Honesty note: PDF has no image-only signal at the loader (a scanned page and a
+    truly blank page are both empty `page_content`), so PDF empty pages are
+    reported `empty`, never `image_only`; only PPTX marks `image_only`.
+    """
+    docs = list(data)
+
+    locator_kind = "none"
+    meta_key: Optional[str] = None
+    for kind, key in _UNIT_LOCATOR_KEYS:
+        if any((getattr(d, "metadata", None) or {}).get(key) is not None for d in docs):
+            locator_kind, meta_key = kind, key
+            break
+
+    # Group Documents into units. With no locator family every Document folds into
+    # ONE logical unit (honest: the loader exposes no sub-locator to cite).
+    units: dict = {}
+    order: list = []
+    for d in docs:
+        meta = getattr(d, "metadata", None) or {}
+        loc = meta.get(meta_key) if meta_key is not None else None
+        if loc not in units:
+            units[loc] = {"content": False, "image_only": False}
+            order.append(loc)
+        pc = getattr(d, "page_content", None)
+        if pc and clean_text(pc).strip():
+            units[loc]["content"] = True
+        if meta.get("image_only") is True:
+            units[loc]["image_only"] = True
+
+    units_total = len(units)
+    extracted = [loc for loc in order if units[loc]["content"]]
+    image_only = [
+        loc for loc in order
+        if not units[loc]["content"] and units[loc]["image_only"]
+    ]
+    empty = [
+        loc for loc in order
+        if not units[loc]["content"] and not units[loc]["image_only"]
+    ]
+
+    units_extracted = len(extracted)
+    if units_extracted == 0:
+        status_str = "empty"
+    elif units_extracted == units_total:
+        status_str = "complete"
+    else:
+        status_str = "partial"
+
+    def _sort_key(loc):
+        return (0, loc) if isinstance(loc, (int, float)) else (1, str(loc))
+
+    non_extracted = sorted(image_only + empty, key=_sort_key)
+    reason_by_loc = {loc: "image_only" for loc in image_only}
+    reason_by_loc.update({loc: "empty" for loc in empty})
+
+    return {
+        "status": status_str,
+        "locator_kind": locator_kind,
+        "units_total": units_total,
+        "units_extracted": units_extracted,
+        "units_empty": len(empty),
+        "units_image_only": len(image_only),
+        # Only locator-bearing units are listed; a `none`-kind empty unit has no
+        # locator to point at (its emptiness is conveyed by status/units_empty).
+        "empty_locators": [loc for loc in non_extracted if loc is not None],
+        "reasons": [
+            {"locator": loc, "reason": reason_by_loc[loc]}
+            for loc in non_extracted
+            if loc is not None
+        ],
+    }
+
+
+def _assert_extractable_content(
+    data: Iterable[Document], filename: Optional[str]
+) -> dict:
+    """Empty-extraction guard + extraction receipt (KI-02 WP-C / WP-G1).
 
     Extraction that yields no Document, or only whitespace, must never be stored
     as a successful embed: a corrupt/scanned/empty file would otherwise return
@@ -995,30 +1108,36 @@ def _assert_extractable_content(data: Iterable[Document], filename: Optional[str
     `list(loader.lazy_load())`), so this scan does not consume a one-shot
     iterator.
 
-    Non-emptiness is measured on `clean_text(...)` — the SAME normalization the
-    pipeline persists (`_prepare_documents_sync` runs `clean_text` on the PDF
-    path, and `clean_text` strips NUL and invalid UTF-8). `str.strip()` alone
-    leaves NUL bytes and lone surrogates intact, so a page that is only NUL /
-    invalid-UTF8 would pass a raw-strip guard and then be cleaned to '' and
-    embedded as an empty chunk — "empty extraction counting as success", the one
-    invariant this guard exists to enforce. Cleaning here keeps the guard's
-    definition of "non-empty" identical to what is actually stored.
+    Emptiness is decided from the extraction receipt: `units_extracted == 0` iff
+    no unit has content that survives `clean_text(...).strip()` — the SAME
+    normalization the pipeline persists (`_prepare_documents_sync` runs
+    `clean_text` on the PDF path, and `clean_text` strips NUL and invalid UTF-8).
+    `str.strip()` alone leaves NUL bytes and lone surrogates intact, so a page
+    that is only NUL / invalid-UTF8 would pass a raw-strip guard and then be
+    cleaned to '' and embedded as an empty chunk — "empty extraction counting as
+    success", the one invariant this guard exists to enforce. This is byte-for-
+    byte the same predicate as the prior `any(... clean_text ...)` guard.
+
+    Returns the extraction receipt so the caller can attach it to the SUCCESS
+    response (additive; existing fields byte-preserved). On an empty extraction
+    the receipt (status 'empty') is embedded in the 422 body alongside the
+    original human-readable message.
     """
-    has_text = any(
-        getattr(doc, "page_content", None)
-        and clean_text(doc.page_content).strip()
-        for doc in data
-    )
-    if not has_text:
+    receipt = _extraction_receipt(data)
+    if receipt["units_extracted"] == 0:
         name = filename or "uploaded file"
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"No extractable text found in '{name}'. The file may be empty, "
-                f"image-only/scanned, corrupted, or password-protected. Nothing "
-                f"was stored."
-            ),
+            detail={
+                "message": (
+                    f"No extractable text found in '{name}'. The file may be empty, "
+                    f"image-only/scanned, corrupted, or password-protected. Nothing "
+                    f"was stored."
+                ),
+                "extraction": receipt,
+            },
         )
+    return receipt
 
 
 async def store_data_in_vector_db(
@@ -1121,7 +1240,8 @@ async def embed_local_file(
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
-        _assert_extractable_content(data, document.filename)
+        # Returns the additive extraction receipt (KI-02 WP-G1) for the response.
+        extraction_receipt = _assert_extractable_content(data, document.filename)
 
         result = await store_data_in_vector_db(
             data,
@@ -1139,6 +1259,7 @@ async def embed_local_file(
                 "file_id": document.file_id,
                 "filename": document.filename,
                 "known_type": known_type,
+                "extraction": extraction_receipt,
             }
         else:
             raise HTTPException(
@@ -1221,6 +1342,7 @@ async def embed_file(
     response_status = True
     response_message = "File processed successfully."
     known_type = None
+    extraction_receipt = None
 
     user_id = get_user_id(request, entity_id)
     logger.info(
@@ -1252,7 +1374,8 @@ async def embed_file(
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
-        _assert_extractable_content(data, file.filename)
+        # Returns the additive extraction receipt (KI-02 WP-G1) for the response.
+        extraction_receipt = _assert_extractable_content(data, file.filename)
 
         result = await store_data_in_vector_db(
             data=data,
@@ -1337,6 +1460,7 @@ async def embed_file(
         "file_id": file_id,
         "filename": file.filename,
         "known_type": known_type,
+        "extraction": extraction_receipt,
     }
 
 
@@ -1413,6 +1537,7 @@ async def embed_file_upload(
     # within the token entitlement and have write granted.
     ent = _require_entity(request, "write", user_id)
     tenant_id = ent["tenant_id"]
+    extraction_receipt = None
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
@@ -1425,7 +1550,8 @@ async def embed_file_upload(
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
-        _assert_extractable_content(data, uploaded_file.filename)
+        # Returns the additive extraction receipt (KI-02 WP-G1) for the response.
+        extraction_receipt = _assert_extractable_content(data, uploaded_file.filename)
 
         result = await store_data_in_vector_db(
             data,
@@ -1469,6 +1595,7 @@ async def embed_file_upload(
         "file_id": file_id,
         "filename": uploaded_file.filename,
         "known_type": known_type,
+        "extraction": extraction_receipt,
     }
 
 
