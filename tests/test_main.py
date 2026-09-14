@@ -31,8 +31,10 @@ def override_vector_store(monkeypatch):
     from app.services.vector_store.async_pg_vector import AsyncPgVector
     from app.routes import document_routes
 
-    # Clear the LRU cache and patch the cached function to return dummy embeddings
-    document_routes.get_cached_query_embedding.cache_clear()
+    # The function is no longer lru-cached (it uses the Redis-backed embedding
+    # cache), so guard the legacy cache_clear call.
+    if hasattr(document_routes.get_cached_query_embedding, "cache_clear"):
+        document_routes.get_cached_query_embedding.cache_clear()
 
     def dummy_get_cached_query_embedding(query):
         return [0.1, 0.2, 0.3]
