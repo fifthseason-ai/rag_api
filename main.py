@@ -21,6 +21,7 @@ from app.config import (
     LogMiddleware,
     logger,
     vector_store,
+    require_auth_config,
 )
 from app.middleware import security_middleware
 from app.routes import document_routes, pgvector_routes
@@ -31,6 +32,9 @@ from app.services.vector_store.factory import close_vector_store_connections
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup logic goes here
+    # Fail closed (D-KSPT-1): never come up in an auth-less state.
+    require_auth_config()
+
     # Create bounded thread pool executor based on CPU cores
     max_workers = min(
         int(os.getenv("RAG_THREAD_POOL_SIZE", str(os.cpu_count()))), 8

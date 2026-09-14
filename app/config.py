@@ -5,6 +5,7 @@ import boto3
 import logging
 import urllib.parse
 from enum import Enum
+from typing import Optional
 from datetime import datetime
 from dotenv import find_dotenv, load_dotenv
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -252,6 +253,26 @@ GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIAL
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 
+## Authentication / entitlement configuration (D-KSPT-1)
+# The signing secret is read live per-request in app.middleware; this module-level
+# value drives the startup guard. Fail closed UNCONDITIONALLY: without JWT_SECRET
+# the service refuses to start. There is no opt-out.
+JWT_SECRET = os.getenv("JWT_SECRET")
+
+
+def require_auth_config() -> None:
+    """Refuse to start when authentication cannot be enforced (D-KSPT-1).
+
+    Called from the app lifespan. If ``JWT_SECRET`` is unset, raise so the process
+    never comes up in an auth-less ("open") state. Missing JWT configuration must
+    fail closed unconditionally — there is no bypass.
+    """
+    if not os.getenv("JWT_SECRET"):
+        raise RuntimeError(
+            "JWT_SECRET is not set; refusing to start because protected routes "
+            "could not be authenticated. Set JWT_SECRET."
+        )
+
 ## Embeddings
 
 
@@ -331,9 +352,65 @@ def init_embeddings(provider, model):
         raise ValueError(f"Unsupported embeddings provider: {provider}")
 
 
-EMBEDDINGS_PROVIDER = EmbeddingsProvider(
-    get_env_variable("EMBEDDINGS_PROVIDER", EmbeddingsProvider.OPENAI.value).lower()
-)
+# Operator-approved embeddings providers (D-KSPT-2; ported from RATB-01 5d9fe48).
+# rag_api cannot distinguish client / second-tenant documents from others, and
+# Richard's ruling is that OpenAI embeddings are NOT authorized for client or
+# second-tenant documents — Bedrock Titan is the explicitly approved provider.
+# So a syntactically-valid provider is not enough: it must also appear in this
+# allow-list. Default is `bedrock` only; an operator may widen it explicitly via
+# RAG_APPROVED_EMBEDDINGS_PROVIDERS (comma-separated). OpenAI is therefore never
+# used unless an operator approves it deliberately — never a silent fallback.
+def _approved_embeddings_providers() -> list:
+    return [
+        p.strip().lower()
+        for p in get_env_variable(
+            "RAG_APPROVED_EMBEDDINGS_PROVIDERS", "bedrock"
+        ).split(",")
+        if p.strip()
+    ]
+
+
+RAG_APPROVED_EMBEDDINGS_PROVIDERS = _approved_embeddings_providers()
+
+
+def resolve_embeddings_provider(
+    value: Optional[str], approved: Optional[list] = None
+) -> EmbeddingsProvider:
+    """Resolve the configured embeddings provider, failing closed (D-KSPT-2).
+
+    There is NO default. A missing or unknown ``EMBEDDINGS_PROVIDER`` raises so
+    that documents are never embedded (or queried) through an unintended provider.
+    Additionally the provider must be in the operator-approved allow-list
+    (``approved``; defaults to ``RAG_APPROVED_EMBEDDINGS_PROVIDERS``, i.e.
+    ``bedrock`` unless widened) — a valid-but-unapproved provider (e.g. an
+    explicitly-set ``openai``) also fails closed. Production uses ``bedrock``.
+    """
+    accepted = ", ".join(p.value for p in EmbeddingsProvider)
+    if value is None or str(value).strip() == "":
+        raise ValueError(
+            "EMBEDDINGS_PROVIDER is required and has no default. Set it explicitly "
+            f"to one of: {accepted}. Production uses 'bedrock' (Amazon Titan)."
+        )
+    provider_raw = str(value).strip().lower()
+    try:
+        provider = EmbeddingsProvider(provider_raw)
+    except ValueError:
+        raise ValueError(
+            f"Unknown EMBEDDINGS_PROVIDER {value!r}. Accepted values: {accepted}."
+        )
+    approved_set = approved if approved is not None else RAG_APPROVED_EMBEDDINGS_PROVIDERS
+    if provider_raw not in approved_set:
+        raise ValueError(
+            f"EMBEDDINGS_PROVIDER '{provider_raw}' is not in the approved set "
+            f"{approved_set}. Approve it explicitly via "
+            f"RAG_APPROVED_EMBEDDINGS_PROVIDERS; rag_api refuses to start with an "
+            f"unapproved embeddings provider. OpenAI embeddings are not authorized "
+            f"for client or second-tenant documents."
+        )
+    return provider
+
+
+EMBEDDINGS_PROVIDER = resolve_embeddings_provider(os.getenv("EMBEDDINGS_PROVIDER"))
 
 if EMBEDDINGS_PROVIDER == EmbeddingsProvider.OPENAI:
     EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-3-small")
