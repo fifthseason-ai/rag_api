@@ -34,7 +34,19 @@ jobs:
 
       - name: Run tests and generate report
         env:
-          OPENAI_API_KEY: test_key
+          # Pin the embeddings provider to Bedrock (Amazon Titan), the provider
+          # production runs. The Bedrock client is built offline from dummy AWS
+          # creds, so tests need no network and no real credentials. JWT_SECRET
+          # is supplied so the identity middleware has a verification key. These
+          # values are valid whether the tree treats them as optional (current
+          # main: openai default, fail-open) or required (fail-closed identity
+          # + approved-provider work landing separately); no OPENAI_API_KEY is
+          # needed once the provider is Bedrock.
+          JWT_SECRET: test_key
+          EMBEDDINGS_PROVIDER: bedrock
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_DEFAULT_REGION: us-east-1
         run: |
           pytest --maxfail=1 --disable-warnings --junitxml=test-results.xml
 
