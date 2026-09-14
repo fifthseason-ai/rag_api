@@ -728,7 +728,9 @@ def test_embed_whitespace_only_file_rejected_no_rows(guard_client):
     """Whitespace-only text extracts to no non-empty content -> 422, no insert."""
     r = _embed(guard_client, "blank.txt", b"   \n\t  \r\n   ", "text/plain")
     assert r.status_code == 422, r.text
-    assert "No extractable text" in r.json()["detail"]
+    # WP-G1: the 422 detail is now a superset dict {message, extraction}; the
+    # original human message is preserved verbatim under "message".
+    assert "No extractable text" in r.json()["detail"]["message"]
     assert guard_client.inserted_batches == []  # NO vector rows written
 
 
