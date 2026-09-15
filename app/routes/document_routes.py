@@ -70,6 +70,7 @@ from app.utils.document_loader import (
     clean_text,
     process_documents,
     cleanup_temp_encoding_file,
+    DocumentVerdictError,
 )
 from app.utils.health import is_health_ok
 
@@ -89,6 +90,40 @@ def get_user_id(request: Request, entity_id: str = None) -> str:
         return entity_id if entity_id else "public"
     else:
         return entity_id if entity_id else request.state.user.get("id")
+
+
+# --- Entitlement enforcement (D-KSPT-1) -------------------------------------
+# Authority is the signed token's entitlement, attached to request.state by
+# app.middleware. Caller-supplied ids (path/body/form) are only ever FILTERS: a
+# request is allowed for an id iff that id is within the token's entitlement and
+# the route's action is authorized. We never fall back to caller ids or widen.
+
+
+def _require_action(request: Request, action: str) -> dict:
+    """Return the entitlement after asserting the route's action is authorized.
+
+    The middleware fails closed, so a protected route always has an entitlement;
+    a missing one (or an action not granted) is forbidden. Never falls open.
+    """
+    ent = getattr(request.state, "entitlement", None)
+    if ent is None:
+        raise HTTPException(status_code=403, detail="Missing entitlement")
+    if action not in ent["actions"]:
+        raise HTTPException(
+            status_code=403, detail=f"Action '{action}' not authorized"
+        )
+    return ent
+
+
+def _require_entity(request: Request, action: str, entity_id: Optional[str]) -> dict:
+    """Assert the action is authorized AND the given entity id is within the token
+    entitlement. Returns the entitlement."""
+    ent = _require_action(request, action)
+    if entity_id is None or str(entity_id) not in ent["entity_ids"]:
+        raise HTTPException(
+            status_code=403, detail="Not authorized for the requested entity"
+        )
+    return ent
 
 
 async def save_upload_file_async(file: UploadFile, temp_file_path: str) -> None:
@@ -159,13 +194,49 @@ def _make_unique_temp_path(user_id: str, filename: str) -> Optional[str]:
 async def load_file_content(
     filename: str, content_type: str, file_path: str, executor
 ) -> tuple:
-    """Load file content using appropriate loader."""
+    """Load file content using appropriate loader.
+
+    A loader that reaches a terminal verdict about the file (KI-02 SP-01.5:
+    password-protected, damaged container) raises `DocumentVerdictError`, which
+    is translated here into a 422 carrying BOTH the machine-readable verdict and
+    a sentence the uploader can act on. This is the single seam every embed/text
+    route loads through, and each of those routes re-raises `HTTPException`
+    unchanged, so the honest answer reaches the caller instead of collapsing into
+    the generic "Error during file processing: ..." 400. The verdict is raised
+    during loading, before any `add_documents` call, so nothing is stored.
+    """
     loader = None
     try:
         loader, known_type, file_ext = get_loader(filename, content_type, file_path)
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
         return data, known_type, file_ext
+    except DocumentVerdictError as verdict_error:
+        logger.warning(
+            "Terminal verdict for %s [verdict=%s]: %s",
+            filename,
+            verdict_error.verdict,
+            verdict_error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": f"'{filename or 'uploaded file'}': {verdict_error}",
+                "extraction": {
+                    "status": "unsupported",
+                    "verdict": verdict_error.verdict,
+                    "locator_kind": "none",
+                    "units_total": 0,
+                    "units_extracted": 0,
+                    "units_empty": 0,
+                    "units_image_only": 0,
+                    "empty_locators": [],
+                    "reasons": [
+                        {"locator": None, "reason": verdict_error.verdict}
+                    ],
+                },
+            },
+        ) from verdict_error
     finally:
         # Clean up temporary UTF-8 file if it was created for encoding conversion
         if loader is not None:
@@ -203,6 +274,7 @@ async def cleanup_temp_file_async(file_path: str) -> None:
 
 @router.get("/ids")
 async def get_all_ids(request: Request):
+    _require_action(request, "read")
     try:
         if isinstance(vector_store, AsyncPgVector):
             ids = await vector_store.get_all_ids(executor=request.app.state.thread_pool)
@@ -245,20 +317,23 @@ async def health_check():
 
 @router.get("/documents", response_model=list[DocumentResponse])
 async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
+    ent = _require_action(request, "read")
     try:
         if isinstance(vector_store, AsyncPgVector):
-            existing_ids = await vector_store.get_filtered_ids(
-                ids, executor=request.app.state.thread_pool
-            )
             documents = await vector_store.get_documents_by_ids(
                 ids, executor=request.app.state.thread_pool
             )
         else:
-            existing_ids = vector_store.get_filtered_ids(ids)
             documents = vector_store.get_documents_by_ids(ids)
 
-        # Ensure all requested ids exist
-        if not all(id in existing_ids for id in ids):
+        # Entitlement filter (D-KSPT-1): a document is only visible if its
+        # owning entity (user_id) is within the token entitlement. Ids outside
+        # the entitlement are treated as not found and never disclosed.
+        documents = [
+            d for d in documents if d.metadata.get("user_id") in ent["entity_ids"]
+        ]
+        authorized_ids = {d.metadata.get("file_id") for d in documents}
+        if not all(id in authorized_ids for id in ids):
             raise HTTPException(status_code=404, detail="One or more IDs not found")
 
         # Ensure documents list is not empty
@@ -294,6 +369,16 @@ async def delete_documents(
     user_id = body.entity_id
     document_origin_type = body.document_origin_type
     subscription_id = body.subscription_id
+
+    # Entitlement (D-KSPT-1): delete is scoped to an authorized entity. The
+    # caller-supplied entity_id is only a filter; it must be within the token
+    # entitlement and the token must grant the delete action. We never delete by
+    # file id alone (which would cross entities).
+    ent = _require_action(request, "delete")
+    if user_id is None or str(user_id) not in ent["entity_ids"]:
+        raise HTTPException(
+            status_code=403, detail="Not authorized for the requested entity"
+        )
 
     try:
         origin_type_value = document_origin_type.value if document_origin_type else None
@@ -524,12 +609,16 @@ async def query_embeddings_by_file_id(
     body: QueryRequestBody,
     request: Request,
 ):
-    if not hasattr(request.state, "user"):
-        user_authorized = body.entity_id if body.entity_id else "public"
-    else:
-        user_authorized = (
-            body.entity_id if body.entity_id else request.state.user.get("id")
+    # Entitlement (D-KSPT-1): authority is the token entitlement. A caller-supplied
+    # entity_id is only a filter and must be within the entitlement. Retrieval is
+    # constrained to the authorized entity set, and results are defensively
+    # re-filtered so a document owned by an unauthorized entity is never returned.
+    ent = _require_action(request, "read")
+    if body.entity_id is not None and str(body.entity_id) not in ent["entity_ids"]:
+        raise HTTPException(
+            status_code=403, detail="Not authorized for the requested entity"
         )
+    user_filter = [body.entity_id] if body.entity_id else list(ent["entity_ids"])
 
     authorized_documents = []
 
@@ -541,37 +630,24 @@ async def query_embeddings_by_file_id(
             body.query,
             embedding,
             body.k,
-            {"file_id": body.file_id, "user_id": user_authorized},
+            {"file_id": body.file_id, "user_id": user_filter},
         )
 
         if not documents:
             return authorized_documents
 
-        document, score = documents[0]
-        doc_metadata = document.metadata
-        doc_user_id = doc_metadata.get("user_id")
-
-        if doc_user_id is None or doc_user_id == user_authorized:
-            authorized_documents = documents
-        else:
-            # If using entity_id and access denied, try again with user's actual ID
-            if body.entity_id and hasattr(request.state, "user"):
-                user_authorized = request.state.user.get("id")
-                if doc_user_id == user_authorized:
-                    authorized_documents = documents
-                else:
-                    if body.entity_id == doc_user_id:
-                        logger.warning(
-                            f"Entity ID {body.entity_id} matches document user_id but user {user_authorized} is not authorized"
-                        )
-                    else:
-                        logger.warning(
-                            f"Access denied for both entity ID {body.entity_id} and user {user_authorized} to document with user_id {doc_user_id}"
-                        )
-            else:
-                logger.warning(
-                    f"Unauthorized access attempt by user {user_authorized} to a document with user_id {doc_user_id}"
-                )
+        authorized_documents = [
+            (doc, score)
+            for (doc, score) in documents
+            if doc.metadata.get("user_id") in ent["entity_ids"]
+        ]
+        if len(authorized_documents) != len(documents):
+            logger.warning(
+                "[query] filtered %d unauthorized document(s) out of %d for file_id=%s",
+                len(documents) - len(authorized_documents),
+                len(documents),
+                body.file_id,
+            )
 
         return authorized_documents
 
@@ -599,6 +675,9 @@ async def query_embeddings_by_entity_id(
     body: QueryByEntityBody,
     request: Request,
 ):
+    # Entitlement (D-KSPT-1): the path entity_id is a filter; it must be within the
+    # token entitlement and read must be granted.
+    _require_entity(request, "read", entity_id)
     logger.info(
         "[query_embeddings_by_entity_id] request [entity_id=%s][query=%r][k=%d][args=%s]",
         entity_id, body.query, body.k, body.args
@@ -901,6 +980,7 @@ def _prepare_documents_sync(
     filename: str = None,
     link: str = None,
     subscription_id: str = None,
+    tenant_id: str = None,
 ) -> List[Document]:
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
@@ -925,6 +1005,10 @@ def _prepare_documents_sync(
                 "user_id": user_id,
                 "digest": generate_digest(doc.page_content),
                 "document_origin_type": document_origin_type,
+                # Tenant tag (D-KSPT-1): stored on every embed path so a later
+                # increment can filter by tenant. rag_api has no tenant column
+                # today, so this lives in cmetadata.
+                **({"tenant_id": tenant_id} if tenant_id else {}),
                 **({"filename": filename} if filename else {}),
                 **({"link": link} if link else {}),
                 **({"subscription_id": subscription_id} if subscription_id else {}),
@@ -933,6 +1017,202 @@ def _prepare_documents_sync(
         )
         for doc in documents
     ]
+
+
+# Per-unit locator metadata keys, in detection precedence. Each loader emits at
+# most ONE of these families (PDF -> `page`, PPTX -> `slide_number`, XLSX
+# elements -> `page_name`), so the precedence only guards a defensive
+# mixed-metadata edge; a format with no per-unit locator (DOCX/MD/TXT/CSV) folds
+# into a single `none` unit.
+_UNIT_LOCATOR_KEYS = (
+    ("page", "page"),           # PDF: 0-indexed page (SafePyPDFLoader / pypdf)
+    ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
+    ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
+)
+
+
+def _extraction_receipt(data: Iterable[Document]) -> dict:
+    """Build the additive extraction receipt for the /embed response (KI-02 WP-G1).
+
+    Reports, per page/slide/sheet UNIT, whether real text was extracted — derived
+    ONLY from loader signals that already exist (empty `page_content` on a scanned
+    PDF page / image-only slide, the PPTX `image_only` marker, the per-slide/page/
+    sheet locator metadata), NEVER success-by-default. A unit counts as EXTRACTED
+    only when its content survives `clean_text(...).strip()` — the exact same
+    normalization the empty guard uses and the pipeline persists — so
+    `units_extracted` equals the units that actually contribute stored chunks
+    (empty/image-only units carry empty content and split to zero chunks). A
+    document with some extracted and some empty units is therefore reported
+    `partial`, and `partial` can never be reported as a plain success.
+
+    Shape:
+      status:         'complete' (every unit extracted) | 'partial' (>=1 extracted
+                      AND >=1 empty/image-only unit) | 'empty' (0 extracted units;
+                      this is the 422 path)
+      locator_kind:   'page' | 'slide' | 'sheet' | 'none'
+      units_total / units_extracted / units_empty / units_image_only
+      empty_locators: sorted locators (page ints / slide ints / sheet names) of
+                      every unit that yielded NO extractable text (locator-bearing
+                      units only)
+      reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
+                      locator-bearing unit
+      formulas:       PRESENT ONLY for formats that report a formula scan
+                      (spreadsheets; KI-02 SP-01.5) —
+                      {scan: 'complete' | 'unavailable',
+                       uncached_cells_total: int,
+                       uncached: [{locator, cells: [...]}]}
+                      A formula cell whose result was never cached in the file
+                      extracts with its NUMBER MISSING (the label survives, the
+                      value does not). We never compute a substitute, so this
+                      block is how the caller learns the extraction is short of
+                      values; `scan: 'unavailable'` means the workbook could not
+                      be re-read to check (never a silent zero).
+
+    Honesty note: PDF has no image-only signal at the loader (a scanned page and a
+    truly blank page are both empty `page_content`), so PDF empty pages are
+    reported `empty`, never `image_only`; only PPTX marks `image_only`.
+    """
+    docs = list(data)
+
+    locator_kind = "none"
+    meta_key: Optional[str] = None
+    for kind, key in _UNIT_LOCATOR_KEYS:
+        if any((getattr(d, "metadata", None) or {}).get(key) is not None for d in docs):
+            locator_kind, meta_key = kind, key
+            break
+
+    # Group Documents into units. With no locator family every Document folds into
+    # ONE logical unit (honest: the loader exposes no sub-locator to cite).
+    units: dict = {}
+    order: list = []
+    # Spreadsheet-only, additive (KI-02 SP-01.5): a formula whose result was never
+    # cached in the file extracts as a MISSING number, not a wrong one, so the
+    # receipt must say so rather than let a "Total" row arrive silently blank.
+    formula_scan: Optional[str] = None
+    uncached_cells: dict = {}
+    for d in docs:
+        meta = getattr(d, "metadata", None) or {}
+        loc = meta.get(meta_key) if meta_key is not None else None
+        if loc not in units:
+            units[loc] = {"content": False, "image_only": False}
+            order.append(loc)
+        pc = getattr(d, "page_content", None)
+        if pc and clean_text(pc).strip():
+            units[loc]["content"] = True
+        if meta.get("image_only") is True:
+            units[loc]["image_only"] = True
+        if meta.get("formula_scan") is not None:
+            formula_scan = meta["formula_scan"]
+        cells = meta.get("formula_uncached_cells")
+        if cells:
+            # Same unit reported twice (elements mode emits several Documents per
+            # sheet) carries the same cell list; keep one copy, not a duplicate.
+            uncached_cells.setdefault(loc, list(cells))
+
+    units_total = len(units)
+    extracted = [loc for loc in order if units[loc]["content"]]
+    image_only = [
+        loc for loc in order
+        if not units[loc]["content"] and units[loc]["image_only"]
+    ]
+    empty = [
+        loc for loc in order
+        if not units[loc]["content"] and not units[loc]["image_only"]
+    ]
+
+    units_extracted = len(extracted)
+    if units_extracted == 0:
+        status_str = "empty"
+    elif units_extracted == units_total:
+        status_str = "complete"
+    else:
+        status_str = "partial"
+
+    def _sort_key(loc):
+        return (0, loc) if isinstance(loc, (int, float)) else (1, str(loc))
+
+    non_extracted = sorted(image_only + empty, key=_sort_key)
+    reason_by_loc = {loc: "image_only" for loc in image_only}
+    reason_by_loc.update({loc: "empty" for loc in empty})
+
+    receipt = {
+        "status": status_str,
+        "locator_kind": locator_kind,
+        "units_total": units_total,
+        "units_extracted": units_extracted,
+        "units_empty": len(empty),
+        "units_image_only": len(image_only),
+        # Only locator-bearing units are listed; a `none`-kind empty unit has no
+        # locator to point at (its emptiness is conveyed by status/units_empty).
+        "empty_locators": [loc for loc in non_extracted if loc is not None],
+        "reasons": [
+            {"locator": loc, "reason": reason_by_loc[loc]}
+            for loc in non_extracted
+            if loc is not None
+        ],
+    }
+
+    # Present ONLY for formats that report a formula scan (spreadsheets today), so
+    # every existing receipt keeps its exact shape.
+    if formula_scan is not None:
+        receipt["formulas"] = {
+            "scan": formula_scan,
+            "uncached_cells_total": sum(len(c) for c in uncached_cells.values()),
+            "uncached": [
+                {"locator": loc, "cells": uncached_cells[loc]}
+                for loc in order
+                if loc in uncached_cells
+            ],
+        }
+
+    return receipt
+
+
+def _assert_extractable_content(
+    data: Iterable[Document], filename: Optional[str]
+) -> dict:
+    """Empty-extraction guard + extraction receipt (KI-02 WP-C / WP-G1).
+
+    Extraction that yields no Document, or only whitespace, must never be stored
+    as a successful embed: a corrupt/scanned/empty file would otherwise return
+    HTTP 200 with zero vector rows, indistinguishable from a real ingest. Raising
+    here — before any `add_documents` call — guarantees no vector rows are written
+    for an empty extraction. Called by every embed route.
+
+    `data` must be a materialized sequence (all embed paths pass
+    `list(loader.lazy_load())`), so this scan does not consume a one-shot
+    iterator.
+
+    Emptiness is decided from the extraction receipt: `units_extracted == 0` iff
+    no unit has content that survives `clean_text(...).strip()` — the SAME
+    normalization the pipeline persists (`_prepare_documents_sync` runs
+    `clean_text` on the PDF path, and `clean_text` strips NUL and invalid UTF-8).
+    `str.strip()` alone leaves NUL bytes and lone surrogates intact, so a page
+    that is only NUL / invalid-UTF8 would pass a raw-strip guard and then be
+    cleaned to '' and embedded as an empty chunk — "empty extraction counting as
+    success", the one invariant this guard exists to enforce. This is byte-for-
+    byte the same predicate as the prior `any(... clean_text ...)` guard.
+
+    Returns the extraction receipt so the caller can attach it to the SUCCESS
+    response (additive; existing fields byte-preserved). On an empty extraction
+    the receipt (status 'empty') is embedded in the 422 body alongside the
+    original human-readable message.
+    """
+    receipt = _extraction_receipt(data)
+    if receipt["units_extracted"] == 0:
+        name = filename or "uploaded file"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": (
+                    f"No extractable text found in '{name}'. The file may be empty, "
+                    f"image-only/scanned, corrupted, or password-protected. Nothing "
+                    f"was stored."
+                ),
+                "extraction": receipt,
+            },
+        )
+    return receipt
 
 
 async def store_data_in_vector_db(
@@ -945,6 +1225,7 @@ async def store_data_in_vector_db(
     filename: str = None,
     link: str = None,
     subscription_id: str = None,
+    tenant_id: str = None,
 ) -> dict:
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
@@ -959,6 +1240,7 @@ async def store_data_in_vector_db(
         filename,
         link,
         subscription_id,
+        tenant_id,
     )
 
     try:
@@ -1017,15 +1299,28 @@ async def embed_local_file(
     else:
         user_id = entity_id if entity_id else request.state.user.get("id")
 
-    loader = None
+    # Entitlement (D-KSPT-1): embedding writes under the resolved entity; that
+    # entity must be within the token entitlement and write must be granted.
+    ent = _require_entity(request, "write", user_id)
+    tenant_id = ent["tenant_id"]
+
     try:
-        loader, known_type, file_ext = get_loader(
-            document.filename, document.file_content_type, file_path
+        # Loads through the shared `load_file_content`, like every other embed route,
+        # instead of repeating get_loader + lazy_load here. That is what gives this
+        # route the terminal verdicts too (KI-02 SP-01.5): the inline copy left an
+        # encrypted or damaged workbook reported as a generic 400 here while /embed
+        # answered honestly. The helper also owns the temp-encoding-file cleanup, so
+        # the local `loader`/`finally` pair below is no longer needed.
+        data, known_type, file_ext = await load_file_content(
+            document.filename,
+            document.file_content_type,
+            file_path,
+            request.app.state.thread_pool,
         )
-        loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(
-            request.app.state.thread_pool, lambda: list(loader.lazy_load())
-        )
+
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        # Returns the additive extraction receipt (KI-02 WP-G1) for the response.
+        extraction_receipt = _assert_extractable_content(data, document.filename)
 
         result = await store_data_in_vector_db(
             data,
@@ -1034,6 +1329,7 @@ async def embed_local_file(
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
             filename=document.filename,
+            tenant_id=tenant_id,
         )
 
         if result:
@@ -1042,6 +1338,7 @@ async def embed_local_file(
                 "file_id": document.file_id,
                 "filename": document.filename,
                 "known_type": known_type,
+                "extraction": extraction_receipt,
             }
         else:
             raise HTTPException(
@@ -1067,10 +1364,6 @@ async def embed_local_file(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT(e),
             )
-    finally:
-        # Clean up temporary UTF-8 file if it was created for encoding conversion
-        if loader is not None:
-            cleanup_temp_encoding_file(loader)
 
 
 async def _generate_summary_background(
@@ -1124,6 +1417,7 @@ async def embed_file(
     response_status = True
     response_message = "File processed successfully."
     known_type = None
+    extraction_receipt = None
 
     user_id = get_user_id(request, entity_id)
     logger.info(
@@ -1139,6 +1433,11 @@ async def embed_file(
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
         )
 
+    # Entitlement (D-KSPT-1): embedding writes under the resolved entity; that
+    # entity must be within the token entitlement and write must be granted.
+    ent = _require_entity(request, "write", user_id)
+    tenant_id = ent["tenant_id"]
+
     try:
         os.makedirs(os.path.dirname(validated_file_path), exist_ok=True)
         await save_upload_file_async(file, validated_file_path)
@@ -1148,6 +1447,10 @@ async def embed_file(
             validated_file_path,
             request.app.state.thread_pool,
         )
+
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        # Returns the additive extraction receipt (KI-02 WP-G1) for the response.
+        extraction_receipt = _assert_extractable_content(data, file.filename)
 
         result = await store_data_in_vector_db(
             data=data,
@@ -1159,6 +1462,7 @@ async def embed_file(
             filename=file.filename,
             link=link,
             subscription_id=subscription_id,
+            tenant_id=tenant_id,
         )
 
         if not result:
@@ -1231,26 +1535,28 @@ async def embed_file(
         "file_id": file_id,
         "filename": file.filename,
         "known_type": known_type,
+        "extraction": extraction_receipt,
     }
 
 
 @router.get("/documents/{id}/context")
 async def load_document_context(request: Request, id: str):
+    ent = _require_action(request, "read")
     ids = [id]
     try:
         if isinstance(vector_store, AsyncPgVector):
-            existing_ids = await vector_store.get_filtered_ids(
-                ids, executor=request.app.state.thread_pool
-            )
             documents = await vector_store.get_documents_by_ids(
                 ids, executor=request.app.state.thread_pool
             )
         else:
-            existing_ids = vector_store.get_filtered_ids(ids)
             documents = vector_store.get_documents_by_ids(ids)
 
-        # Ensure the requested id exists
-        if not all(id in existing_ids for id in ids):
+        # Entitlement filter (D-KSPT-1): only the owning entity's document is
+        # visible. An id outside the entitlement is not found and not disclosed.
+        documents = [
+            d for d in documents if d.metadata.get("user_id") in ent["entity_ids"]
+        ]
+        if not documents:
             raise HTTPException(
                 status_code=404, detail="The specified file_id was not found"
             )
@@ -1302,6 +1608,12 @@ async def embed_file_upload(
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
         )
 
+    # Entitlement (D-KSPT-1): write under the resolved entity, which must be
+    # within the token entitlement and have write granted.
+    ent = _require_entity(request, "write", user_id)
+    tenant_id = ent["tenant_id"]
+    extraction_receipt = None
+
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
         await save_upload_file_async(uploaded_file, validated_temp_file_path)
@@ -1312,6 +1624,10 @@ async def embed_file_upload(
             request.app.state.thread_pool,
         )
 
+        # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
+        # Returns the additive extraction receipt (KI-02 WP-G1) for the response.
+        extraction_receipt = _assert_extractable_content(data, uploaded_file.filename)
+
         result = await store_data_in_vector_db(
             data,
             file_id,
@@ -1319,6 +1635,7 @@ async def embed_file_upload(
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
             filename=uploaded_file.filename,
+            tenant_id=tenant_id,
         )
 
         if not result:
@@ -1353,14 +1670,21 @@ async def embed_file_upload(
         "file_id": file_id,
         "filename": uploaded_file.filename,
         "known_type": known_type,
+        "extraction": extraction_receipt,
     }
 
 
 @router.post("/query_multiple")
 async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
+    # Entitlement (D-KSPT-1): file ids are only filters. Constrain retrieval to
+    # the authorized entity set and defensively drop any document owned by an
+    # entity outside the entitlement.
+    ent = _require_action(request, "read")
     try:
         # Get the embedding of the query text
         embedding = get_cached_query_embedding(body.query)
+
+        filters = {"file_id": body.file_ids, "user_id": list(ent["entity_ids"])}
 
         # Perform hybrid (or dense-only) search filtered by the file_ids in metadata
         documents = await _retrieve_documents(
@@ -1368,8 +1692,14 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             body.query,
             embedding,
             body.k,
-            {"file_id": body.file_ids},
+            filters,
         )
+
+        documents = [
+            (doc, score)
+            for (doc, score) in documents
+            if doc.metadata.get("user_id") in ent["entity_ids"]
+        ]
 
         # Ensure documents list is not empty
         if not documents:
@@ -1416,6 +1746,11 @@ async def extract_text_from_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
         )
+
+    # Entitlement (D-KSPT-1): /text only extracts and returns text from the
+    # uploaded bytes; it writes no vectors, so it is a READ operation (Core mints
+    # act=['read'] for it). The resolved entity must be within the entitlement.
+    _require_entity(request, "read", user_id)
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
@@ -1481,6 +1816,16 @@ async def summarize_entity_files(
         )
 
     user_id = get_user_id(request, entity_id)
+    # Entitlement (D-KSPT-1): summarization reads the entity's documents and
+    # writes the summary under knowledge_id. Both the source entity and the
+    # destination knowledge id must be within the token entitlement, and write
+    # must be granted.
+    ent = _require_entity(request, "write", user_id)
+    if str(knowledge_id) not in ent["entity_ids"]:
+        raise HTTPException(
+            status_code=403, detail="Not authorized for the requested knowledge id"
+        )
+    tenant_id = ent["tenant_id"]
     logger.info(
         "[summarize_entity_files] request [entity_id=%s][user_id=%s][file_id=%s][knowledge_id=%s]",
         entity_id, user_id, file_id, knowledge_id,
@@ -1575,6 +1920,7 @@ async def summarize_entity_files(
                 user_id=knowledge_id,
                 clean_content=False,
                 executor=request.app.state.thread_pool,
+                tenant_id=tenant_id,
             )
             if not result or "error" in result:
                 error_detail = result.get("error", "Unknown error") if result else "No result"

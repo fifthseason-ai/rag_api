@@ -37,17 +37,8 @@ if not _has_pandoc:
     except (ImportError, OSError):
         pass
 
-try:
-    import msoffcrypto  # noqa: F401
-
-    _has_msoffcrypto = True
-except ImportError:
-    _has_msoffcrypto = False
 
 _skip_no_pandoc = pytest.mark.skipif(not _has_pandoc, reason="pandoc not installed")
-_skip_no_msoffcrypto = pytest.mark.skipif(
-    not _has_msoffcrypto, reason="msoffcrypto not installed"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +292,6 @@ LOADER_CASES = [
         _make_xlsx,
         "Test Item",
         id="xlsx",
-        marks=_skip_no_msoffcrypto,
     ),
     pytest.param(
         "test.pptx",
@@ -652,7 +642,6 @@ UNSTRUCTURED_CASES = [
         "test.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         id="xlsx",
-        marks=_skip_no_msoffcrypto,
     ),
     pytest.param(
         "test.pptx",
