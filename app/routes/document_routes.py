@@ -251,6 +251,10 @@ _SERVICE_FAULT_MODULE_ROOTS = frozenset(
         "aiohttp",
         "botocore",
         "boto3",
+        # config.py supports these embeddings providers too; production uses bedrock (botocore).
+        "openai",
+        "google",
+        "ollama",
     }
 )
 
@@ -260,15 +264,61 @@ _SERVICE_FAULT_MODULE_ROOTS = frozenset(
 _CONTENT_FAULT_MODULE_ROOTS = frozenset({"PIL"})
 
 
+# SP-01.10c, after re-review found the module-root set TOO BROAD. A DB driver raises BOTH kinds of
+# error: an outage (OperationalError -- ours, transient) and a complaint about the VALUE being written
+# (DataError -- permanent, and in this service that value is text extracted from the uploaded file: a NUL
+# byte, an invalid UTF-8 sequence, an over-length field). Module root cannot tell them apart, so 10b
+# promoted DataError to a retryable 503 and would retry, forever, a file that can never work -- the PIL
+# bug-shape arriving through psycopg2. Denied by CLASS NAME because every DB driver spells these the
+# same way (PEP 249) and this file imports none of them.
+_CONTENT_FAULT_TYPE_NAMES = frozenset(
+    {
+        "DataError",
+        "IntegrityError",
+        "UnidentifiedImageError",
+    }
+)
+
+# Bounded so a self-referential chain cannot hang a request.
+_CAUSE_CHAIN_LIMIT = 10
+
+
+def _causes(error: BaseException):
+    """The exception and its __cause__/__context__ chain, each link once, bounded.
+
+    langchain wraps provider calls in tenacity, so a real outage can arrive as a RetryError whose cause
+    is the httpx/botocore error that actually happened. Reading only the top exception's module missed
+    every one of those.
+    """
+    seen, queue, out = set(), [error], []
+    while queue and len(out) < _CAUSE_CHAIN_LIMIT:
+        current = queue.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        out.append(current)
+        queue.extend([current.__cause__, current.__context__])
+    return out
+
+
 def is_service_fault(error: BaseException) -> bool:
     """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
-    ourselves — but never accuse the file either (see `describe_failure`)."""
-    root = (type(error).__module__ or "").split(".")[0]
-    if root in _CONTENT_FAULT_MODULE_ROOTS:
-        return False
-    if isinstance(error, _SERVICE_FAULT_TYPES):
-        return True
-    return root in _SERVICE_FAULT_MODULE_ROOTS
+    ourselves -- but never accuse the file either (see `describe_failure`).
+
+    CONTENT WINS OVER THE WHOLE CHAIN, and is checked first. A permanent content fault wrapped in a
+    retry must not be laundered into a transient one; that would retry forever a file that can never
+    work, which is the opposite harm to the one this correction exists to fix but no less wrong.
+    """
+    chain = _causes(error)
+    for link in chain:
+        root = (type(link).__module__ or "").split(".")[0]
+        if root in _CONTENT_FAULT_MODULE_ROOTS or type(link).__name__ in _CONTENT_FAULT_TYPE_NAMES:
+            return False
+    for link in chain:
+        root = (type(link).__module__ or "").split(".")[0]
+        if isinstance(link, _SERVICE_FAULT_TYPES) or root in _SERVICE_FAULT_MODULE_ROOTS:
+            return True
+    return False
 
 
 def describe_failure(error: BaseException, filename: str) -> tuple:

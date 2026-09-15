@@ -345,3 +345,108 @@ def test_a_document_parser_error_is_never_excused_as_infrastructure():
         with pytest.raises(HTTPException) as caught:
             drive(ParseFailure("bad record"))
         assert caught.value.status_code == 400, f"{parser_module} must not read as infrastructure"
+
+
+# ── SP-01.10c — the module-root set was too broad, and blind to wrapping ──────────────────────────
+#
+# Re-review found a REGRESSION that 10b introduced. A DB driver raises BOTH kinds of error: an outage
+# (`OperationalError` -- ours, transient, retryable) and a complaint about the VALUE being written
+# (`DataError` -- permanent, and in this service that value is text extracted from the uploaded file: a
+# NUL byte, an invalid UTF-8 sequence, an over-length field). Module-root detection cannot tell them
+# apart, so 10b promoted `DataError` to a retryable 503 and would retry, forever, a file that can never
+# work. That is precisely the bug-shape the PIL deny-list exists to prevent, arriving through psycopg2
+# instead of PIL -- and 9228ced had it right by accident, because DataError is not an OSError.
+#
+# The second gap: langchain wraps provider calls in tenacity, and the classifier read only the TOP
+# exception's module. A real outage surfacing as `tenacity.RetryError` (cause: httpx/botocore) read as
+# undetermined. The cause chain is now walked, content faults first so a wrapper can never launder one.
+
+
+def test_a_db_data_error_is_the_files_fault_not_an_outage():
+    """RED-first. `DataError` is about the VALUE, which here is text extracted from the upload."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    with pytest.raises(HTTPException) as caught:
+        drive(psycopg2.DataError("invalid byte sequence for encoding UTF8: 0x00"))
+    assert caught.value.status_code == 400, "a permanent content fault must not be sold as retryable"
+    assert "not with your file" not in detail_text(caught.value)
+
+
+def test_sqlalchemy_data_and_integrity_errors_are_not_outages():
+    sa = pytest.importorskip("sqlalchemy.exc")
+    for cls_name in ("DataError", "IntegrityError"):
+        exc_cls = getattr(sa, cls_name)
+        with pytest.raises(HTTPException) as caught:
+            drive(exc_cls("INSERT ...", None, Exception("value too long")))
+        assert caught.value.status_code == 400, f"{cls_name} must not be retryable"
+
+
+def test_the_outage_errors_from_the_same_driver_are_still_service_faults():
+    """CONTROL. Narrowing must not undo 10b: the SAME libraries still report outages as ours."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    sa = pytest.importorskip("sqlalchemy.exc")
+    for exc in (
+        psycopg2.OperationalError("could not connect to server"),
+        psycopg2.InterfaceError("connection already closed"),
+        sa.OperationalError("SELECT 1", None, None),
+    ):
+        with pytest.raises(HTTPException) as caught:
+            drive(exc)
+        assert caught.value.status_code == 503, f"{type(exc).__name__} is still an outage"
+
+
+def test_a_wrapped_outage_is_recognised_through_the_cause_chain():
+    """RED-first. langchain wraps provider calls in tenacity; reading only the top exception's module
+    meant a real outage arrived as undetermined."""
+    httpx = pytest.importorskip("httpx")
+    inner = httpx.ConnectError("connection refused")
+    outer = RuntimeError("retries exhausted")
+    outer.__cause__ = inner
+    with pytest.raises(HTTPException) as caught:
+        drive(outer)
+    assert caught.value.status_code == 503
+    assert "not with your file" in detail_text(caught.value)
+
+
+def test_a_wrapper_can_never_launder_a_content_fault_into_an_outage():
+    """The dangerous direction of walking the chain: if ANY link is a content fault, the whole thing is.
+    Otherwise wrapping a DataError in a retry would make a permanent failure look transient."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    inner = psycopg2.DataError("invalid byte sequence 0x00")
+    outer = RuntimeError("retries exhausted")
+    outer.__cause__ = inner
+    # And the reverse nesting, so neither order launders it.
+    other = psycopg2.OperationalError("connection lost")
+    other.__context__ = psycopg2.DataError("invalid byte sequence 0x00")
+    for exc in (outer, other):
+        with pytest.raises(HTTPException) as caught:
+            drive(exc)
+        assert caught.value.status_code == 400, "a content fault anywhere in the chain wins"
+
+
+def test_the_cause_chain_walk_is_bounded_and_survives_a_cycle():
+    """A self-referential chain must not hang the request."""
+    a = RuntimeError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    with pytest.raises(HTTPException) as caught:
+        drive(a)
+    assert caught.value.status_code == 400
+
+
+def test_the_module_denylist_covers_PIL_errors_beyond_the_named_ones():
+    """My own mutation run caught this: emptying `_CONTENT_FAULT_MODULE_ROOTS` left every test green,
+    because `UnidentifiedImageError` is ALSO on the class-name list. The module entry exists for PIL's
+    OTHER content errors -- a decompression bomb, a bad palette -- which inherit OSError and are just as
+    permanent. Exercised with a synthetic class so the test does not depend on which exceptions this
+    version of Pillow happens to define."""
+
+    class SomeOtherPillowError(OSError):
+        pass
+
+    SomeOtherPillowError.__module__ = "PIL.Image"
+    assert SomeOtherPillowError.__name__ not in ("UnidentifiedImageError", "DataError")
+    with pytest.raises(HTTPException) as caught:
+        drive(SomeOtherPillowError("broken data stream when reading image file"))
+    assert caught.value.status_code == 400, "an OSError from PIL is about the bytes, not our storage"
+    assert "not with your file" not in detail_text(caught.value)
