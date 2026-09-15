@@ -360,6 +360,14 @@ class SheetExcelLoader:
     #: metadata, so a pathological workbook cannot inflate every chunk's metadata.
     _MAX_REPORTED_CELLS = 25
 
+    #: Bounds on the formula scan. It is a DIAGNOSTIC pass over a file an untrusted
+    #: uploader controls, and it re-reads the workbook twice on top of the parse the
+    #: extractor already did — so it must not be the thing that makes a big upload
+    #: expensive. Past either bound the scan stops and reports `unavailable`, which
+    #: is the truth (we did not finish checking), never a clean zero.
+    _MAX_SCAN_BYTES = 25 * 1024 * 1024
+    _MAX_SCAN_CELLS = 2_000_000
+
     def __init__(self, filepath: str):
         self.filepath = filepath
         self._temp_filepath = None  # For compatibility with cleanup function
@@ -456,9 +464,19 @@ class SheetExcelLoader:
             # read it, so we must not claim a clean scan.
             return {}, "unavailable"
         try:
+            if os.path.getsize(self.filepath) > self._MAX_SCAN_BYTES:
+                logger.info(
+                    "Skipping the uncached-formula scan for %s: over the size bound",
+                    self.filepath,
+                )
+                return {}, "unavailable"
+        except OSError:
+            return {}, "unavailable"
+        try:
             from openpyxl import load_workbook
 
             per_sheet = {}
+            cells_seen = 0
             formulas = load_workbook(self.filepath, data_only=False, read_only=True)
             try:
                 values = load_workbook(self.filepath, data_only=True, read_only=True)
@@ -468,6 +486,14 @@ class SheetExcelLoader:
                         f_rows = formulas[name].iter_rows()
                         v_rows = values[name].iter_rows()
                         for f_row, v_row in zip(f_rows, v_rows):
+                            cells_seen += len(f_row)
+                            if cells_seen > self._MAX_SCAN_CELLS:
+                                logger.info(
+                                    "Abandoning the uncached-formula scan for %s: "
+                                    "over the cell bound",
+                                    self.filepath,
+                                )
+                                return {}, "unavailable"
                             for f_cell, v_cell in zip(f_row, v_row):
                                 if (
                                     isinstance(f_cell.value, str)

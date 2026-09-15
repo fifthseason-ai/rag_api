@@ -23,8 +23,11 @@ What is proven:
   * password-protected gets its own `encrypted` verdict, distinct from `corrupt`,
   * a damaged container gets `corrupt`, and an empty workbook stays the existing
     `empty` 422 — all three write zero vector rows,
-  * a retried upload of the same file is idempotent, and another tenant's
-    entitlement cannot embed into this entity.
+  * a retried upload re-derives identical chunks (deterministic extraction — NOT
+    store-level de-duplication, which needs a real database and belongs to
+    SP-01.3), and another tenant's entitlement cannot embed into this entity,
+  * the diagnostic formula scan is BOUNDED, and /local/embed reaches the same
+    verdicts as /embed — the verdict must not depend on which route was used.
 
 Fixtures are SYNTHETIC and built at test time (openpyxl, plus msoffcrypto's own
 encryptor for the password-protected case). No client content. The vector store
@@ -486,9 +489,15 @@ def test_embed_empty_xlsx_is_422_empty_with_no_rows(client, tmp_path):
     assert client.inserted_batches == []
 
 
-def test_retrying_the_same_upload_is_idempotent(client, tmp_path):
+def test_retrying_the_same_upload_re_derives_identical_chunks(client, tmp_path):
     """A retry after a lost response must not make the second answer differ from
-    the first, and must not accumulate a second, divergent set of chunks."""
+    the first, and must not produce a second, DIVERGENT set of chunks.
+
+    Scope, stated plainly: the store here is SIMULATED and does not de-duplicate,
+    so this proves the extraction is deterministic, NOT that the real pgvector
+    path replaces rows for a repeated file_id. Store-level idempotence belongs to
+    SP-01.3's initialize/finalize work and needs a real database.
+    """
     path = tmp_path / "book.xlsx"
     make_multisheet_workbook(str(path), cached_total=True)
     content = path.read_bytes()
@@ -539,4 +548,104 @@ def test_embed_into_another_entity_is_denied_with_no_rows(client, tmp_path):
     )
 
     assert r.status_code == 403, r.text
+    assert client.inserted_batches == []
+
+
+# ===========================================================================
+# Bounded processing — the diagnostic scan must never be what makes an upload
+# expensive (reviewer WPSP1-5-R NOTE-1)
+# ===========================================================================
+
+
+def test_formula_scan_is_skipped_over_the_size_bound(tmp_path, monkeypatch):
+    """A workbook past the byte bound is still extracted; only the extra
+    diagnostic passes are dropped, and the status says so."""
+    path = tmp_path / "book.xlsx"
+    make_multisheet_workbook(str(path), cached_total=False)
+    monkeypatch.setattr(SheetExcelLoader, "_MAX_SCAN_BYTES", 10)
+
+    docs = load_documents(path)
+
+    assert docs, "the size bound must cost us the scan, never the content"
+    assert all(d.metadata["formula_scan"] == "unavailable" for d in docs)
+    assert all("formula_uncached" not in d.metadata for d in docs)
+
+
+def test_formula_scan_is_abandoned_over_the_cell_bound(tmp_path, monkeypatch):
+    """Same for a workbook with too many cells to walk: stop and say
+    `unavailable`, rather than report the formulas found before giving up as if
+    they were the whole answer."""
+    path = tmp_path / "book.xlsx"
+    make_multisheet_workbook(str(path), cached_total=False)
+    monkeypatch.setattr(SheetExcelLoader, "_MAX_SCAN_CELLS", 1)
+
+    cells, scan_status = SheetExcelLoader(str(path))._uncached_formulas()
+
+    assert scan_status == "unavailable"
+    assert cells == {}
+
+
+# ===========================================================================
+# /local/embed reaches the same verdicts (reviewer WPSP1-5-R MINOR-1)
+# ===========================================================================
+
+
+def _local_embed(client, filename, content, *, file_id="f-local", entity_id="userA"):
+    """Write the bytes where /local/embed expects them and embed by path."""
+    from app.config import RAG_UPLOAD_DIR
+
+    target_dir = os.path.join(RAG_UPLOAD_DIR, entity_id)
+    os.makedirs(target_dir, exist_ok=True)
+    with open(os.path.join(target_dir, filename), "wb") as f:
+        f.write(content)
+    return client.post(
+        "/local/embed",
+        json={
+            "filepath": f"{entity_id}/{filename}",
+            "filename": filename,
+            "file_content_type": XLSX_MIME,
+            "file_id": file_id,
+        },
+        params={"entity_id": entity_id},
+        headers=_hdr(ent=[entity_id], act=["write"]),
+    )
+
+
+def test_local_embed_multisheet_xlsx_succeeds_with_sheet_receipt(client, tmp_path):
+    path = tmp_path / "book.xlsx"
+    make_multisheet_workbook(str(path), cached_total=True)
+
+    r = _local_embed(client, "local-book.xlsx", path.read_bytes())
+
+    assert r.status_code == 200, r.text
+    receipt = r.json()["extraction"]
+    assert receipt["locator_kind"] == "sheet"
+    assert receipt["formulas"]["scan"] == "complete"
+    assert sum(len(b) for b in client.inserted_batches) >= 1
+
+
+def test_local_embed_password_protected_xlsx_gets_the_same_verdict(client, tmp_path):
+    """The verdict must not depend on which embed route was used. Before the
+    shared-seam fix this route answered a generic 400 with no verdict while
+    /embed answered 422 `encrypted` for the very same bytes."""
+    path = tmp_path / "protected.xlsx"
+    make_password_protected_workbook(path, tmp_path)
+
+    r = _local_embed(client, "local-protected.xlsx", path.read_bytes())
+
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["extraction"]["verdict"] == "encrypted"
+    assert "password" in detail["message"].lower()
+    assert client.inserted_batches == []
+
+
+def test_local_embed_corrupt_xlsx_gets_the_same_verdict(client, tmp_path):
+    path = tmp_path / "corrupt.xlsx"
+    make_corrupt_workbook(str(path))
+
+    r = _local_embed(client, "local-corrupt.xlsx", path.read_bytes())
+
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["extraction"]["verdict"] == "corrupt"
     assert client.inserted_batches == []

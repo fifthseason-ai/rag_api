@@ -1304,14 +1304,18 @@ async def embed_local_file(
     ent = _require_entity(request, "write", user_id)
     tenant_id = ent["tenant_id"]
 
-    loader = None
     try:
-        loader, known_type, file_ext = get_loader(
-            document.filename, document.file_content_type, file_path
-        )
-        loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(
-            request.app.state.thread_pool, lambda: list(loader.lazy_load())
+        # Loads through the shared `load_file_content`, like every other embed route,
+        # instead of repeating get_loader + lazy_load here. That is what gives this
+        # route the terminal verdicts too (KI-02 SP-01.5): the inline copy left an
+        # encrypted or damaged workbook reported as a generic 400 here while /embed
+        # answered honestly. The helper also owns the temp-encoding-file cleanup, so
+        # the local `loader`/`finally` pair below is no longer needed.
+        data, known_type, file_ext = await load_file_content(
+            document.filename,
+            document.file_content_type,
+            file_path,
+            request.app.state.thread_pool,
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
@@ -1360,10 +1364,6 @@ async def embed_local_file(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT(e),
             )
-    finally:
-        # Clean up temporary UTF-8 file if it was created for encoding conversion
-        if loader is not None:
-            cleanup_temp_encoding_file(loader)
 
 
 async def _generate_summary_background(
