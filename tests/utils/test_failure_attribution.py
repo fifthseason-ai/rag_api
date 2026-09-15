@@ -295,12 +295,19 @@ def test_a_real_infrastructure_error_is_a_service_fault(module_name, cls_name, a
 
 
 def test_concurrent_futures_timeout_is_covered_too():
-    """`asyncio.TimeoutError is concurrent.futures.TimeoutError` is FALSE on this Python, so listing one
-    does not cover the other. Verified in-container rather than assumed."""
-    import asyncio as _asyncio
+    """A pool timeout is ours, on every Python this can run on.
+
+    The first version of this test asserted `asyncio.TimeoutError is not concurrent.futures.TimeoutError`.
+    That is TRUE on 3.10 -- which is what the Dockerfile ships -- and FALSE from 3.11, where both names
+    are the builtin `TimeoutError`, so CI (3.12) reds it. The identity was never the point: it was my
+    reason for listing `asyncio.TimeoutError` separately, and reasons do not belong in assertions.
+
+    What must hold on both is the BEHAVIOUR, so that is what is asserted. On 3.10 the executor converts
+    the pool timeout to `asyncio.TimeoutError` as it crosses `run_in_executor`; from 3.11 the two names
+    are one class that also subclasses OSError. Different routes, same answer.
+    """
     import concurrent.futures as _futures
 
-    assert _asyncio.TimeoutError is not _futures.TimeoutError
     with pytest.raises(HTTPException) as caught:
         drive(_futures.TimeoutError("the pool timed out"))
     assert caught.value.status_code == 503
