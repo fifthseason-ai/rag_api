@@ -64,6 +64,217 @@ class CorruptDocumentError(DocumentVerdictError):
 
     verdict = "corrupt"
 
+
+class UnsupportedDocumentError(DocumentVerdictError):
+    """The file is intact and readable — we simply have no extractor for this format."""
+
+    verdict = "unsupported"
+
+
+#: Leading byte signatures for formats this service has no text extractor for. Named rather than
+#: lumped into "binary" because "we do not read images" is actionable and "unsupported file" is not.
+_BINARY_SIGNATURES = (
+    (b"\x89PNG\r\n\x1a\n", "a PNG image"),
+    (b"\xff\xd8\xff", "a JPEG image"),
+    (b"GIF87a", "a GIF image"),
+    (b"GIF89a", "a GIF image"),
+    (b"BM", "a BMP image"),
+    (b"PK\x03\x04", "a ZIP archive"),
+    (b"Rar!\x1a\x07", "a RAR archive"),
+    (b"7z\xbc\xaf\x27\x1c", "a 7-Zip archive"),
+    (b"\x1f\x8b", "a gzip archive"),
+    (b"ID3", "an MP3 audio file"),
+    (b"OggS", "an Ogg media file"),
+    (b"fLaC", "a FLAC audio file"),
+    (b"\x00\x00\x00\x18ftyp", "an MP4 video file"),
+    (b"\x00\x00\x00\x20ftyp", "an MP4 video file"),
+    (b"MZ", "a Windows executable"),
+    (b"\x7fELF", "a Linux executable"),
+    (b"SQLite format 3\x00", "a SQLite database"),
+)
+
+
+def describe_unsupported_binary(head: bytes) -> Optional[str]:
+    """Name the format behind `head`, or None when nothing recognisable matches.
+
+    RIFF containers carry their real type four bytes in (WAVE / AVI / WEBP), so they are checked
+    separately rather than given a misleading generic name.
+    """
+    if head.startswith(b"RIFF") and len(head) >= 12:
+        return {
+            b"WAVE": "a WAV audio file",
+            b"AVI ": "an AVI video file",
+            b"WEBP": "a WebP image",
+        }.get(head[8:12], "a RIFF media file")
+    if head.startswith(b"PK\x03\x04"):
+        # Office and OpenDocument files ARE zips. Saying "a ZIP archive" to someone whose .docx
+        # reached us with the wrong extension or content type is true and useless — it sends them
+        # looking for an archive they never made. The package declares itself in the first entry.
+        if b"[Content_Types].xml" in head:
+            return "an Office file (.docx/.xlsx/.pptx) that arrived with the wrong file name or type"
+        if b"mimetypeapplication/vnd.oasis.opendocument" in head:
+            return "an OpenDocument file that arrived with the wrong file name or type"
+        return "a ZIP archive"
+    for signature, description in _BINARY_SIGNATURES:
+        if head.startswith(signature):
+            return description
+    return None
+
+
+#: Byte-order marks this service already honours elsewhere (`detect_file_encoding`). A BOM is an
+#: explicit declaration that the file is text, and it outranks every heuristic below.
+_TEXT_BOMS = (
+    codecs.BOM_UTF8,
+    codecs.BOM_UTF32_LE,
+    codecs.BOM_UTF32_BE,
+    codecs.BOM_UTF16_LE,
+    codecs.BOM_UTF16_BE,
+)
+
+
+def decodes_as_utf8(sample: bytes) -> bool:
+    """Whether `sample` is valid UTF-8 TEXT, tolerating a code point cut by the fixed-size read.
+
+    A NUL disqualifies it. NUL is a perfectly valid UTF-8 code point, so a bare `decode()` call
+    happily accepts a run of zero bytes and reports a WAV header — or any NUL-padded binary — as
+    text. Real text does not contain NUL; the encodings that do (UTF-16/32) are recognised by their
+    BOM before this, or by `decodes_as_utf16` after the signature check.
+    """
+    if b"\x00" in sample:
+        return False
+    for trim in range(4):
+        candidate = sample[: len(sample) - trim] if trim else sample
+        try:
+            candidate.decode("utf-8")
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
+
+
+def decodes_as_utf16(sample: bytes) -> bool:
+    """Whether `sample` is UTF-16 text without a BOM.
+
+    UTF-16 encodes ASCII as alternating character/NUL bytes, so a NUL check alone condemns it — and
+    UTF-16 is text this service is expected to read (`detect_file_encoding` handles its BOMs). An
+    arbitrary binary will usually also "decode" as UTF-16 into nonsense, so decoding is not enough on
+    its own: the result must also be overwhelmingly printable.
+    """
+    nul_positions = [index for index, byte in enumerate(sample) if byte == 0]
+    # UTF-16 text in a Latin script is about half NUL bytes, and they sit consistently on the odd
+    # (little-endian) or even (big-endian) offsets. Requiring that alignment is what separates real
+    # UTF-16 from arbitrary binary: any byte run "decodes" as UTF-16 into CJK-looking characters that
+    # `str.isprintable()` happily accepts, so printability alone would wave binaries through.
+    if len(nul_positions) < len(sample) * 0.25:
+        return False
+    odd = sum(1 for index in nul_positions if index % 2)
+    if odd not in (0, len(nul_positions)):
+        return False
+
+    even = sample[: len(sample) - (len(sample) % 2)]
+    for encoding in ("utf-16-le", "utf-16-be"):
+        try:
+            text = even.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if not text:
+            continue
+        printable = sum(1 for ch in text if ch.isprintable() or ch in "\r\n\t")
+        if printable / len(text) > 0.9:
+            return True
+    return False
+
+
+def looks_like_text(sample: bytes, before_signatures: bool) -> bool:
+    """Whether `sample` should be read as text.
+
+    Called twice by `raise_if_unsupported_binary`, around the signature check, because the two halves
+    have different strength and the order matters:
+
+    * `before_signatures=True` — only EVIDENCE that outranks a magic number: a BOM, or valid UTF-8.
+      This is what keeps a note beginning "MZ is the DOS header magic" from being refused as a
+      Windows executable. `MZ` and `BM` are ordinary English bigrams and `ID3`/`GIF87a` occur in
+      technical prose, so a two-byte prefix must never beat the file actually decoding.
+    * `before_signatures=False` — the weaker evidence, consulted only once no signature matched:
+      BOM-less UTF-16, then chardet. chardet is last on purpose. Single-byte encodings decode ANY
+      byte sequence, so a confident-looking guess would wave real binaries through — a PNG does
+      exactly that.
+
+    Deciding by DECODING rather than by counting printable bytes is the other half. A ratio test
+    looks reasonable until you feed it Japanese or Arabic: in UTF-8 every byte of those scripts is
+    >= 0x80, so a byte-counting heuristic calls a perfectly good document binary and refuses it.
+    """
+    if not sample:
+        return True
+    if before_signatures:
+        return sample.startswith(_TEXT_BOMS) or decodes_as_utf8(sample)
+
+    if decodes_as_utf16(sample):
+        return True
+    detected = chardet.detect(sample)
+    encoding, confidence = detected.get("encoding"), detected.get("confidence") or 0
+    if encoding and confidence >= 0.7:
+        try:
+            sample.decode(encoding, errors="strict")
+        except (UnicodeDecodeError, LookupError):
+            return False
+        # A single-byte codec cannot fail, so "it decoded" is only meaningful for a codec that can.
+        return encoding.lower().startswith(("utf", "iso-8859", "windows-125", "cp"))
+    return False
+
+
+def looks_like_binary(sample: bytes) -> bool:
+    """Whether `sample` cannot be read as text.
+
+    Mirrors `raise_if_unsupported_binary`'s decision exactly — including consulting the signature
+    table in the middle — so the predicate and the refusal can never disagree about the same bytes.
+    """
+    if looks_like_text(sample, before_signatures=True):
+        return False
+    if describe_unsupported_binary(sample) is not None:
+        return True
+    return not looks_like_text(sample, before_signatures=False)
+
+
+def raise_if_unsupported_binary(filepath: str, filename: str) -> None:
+    """Refuse a file we have no extractor for, instead of reading its bytes as prose.
+
+    The fallback branch of `get_loader` hands anything unrecognised to `TextLoader`, and nothing
+    downstream refuses on `known_type=False` — it is only reported. So a ZIP used to arrive as one
+    Document of container framing plus fragments of its members, pass the empty-extraction guard and
+    be stored with an extraction receipt reading `complete`. That is a garbage extraction counted as
+    a success, the sibling of the empty-extraction defect WP-C closed, and the uploader was told
+    nothing. An image fared differently but no better: `Could not detect encoding`, which names our
+    internals rather than their problem.
+
+    The order below is the whole design, and it is what stops the refusal being over-eager:
+    decode-as-text evidence that outranks a magic number, THEN signatures, THEN the weaker text
+    evidence. Getting it wrong in either direction is a real loss — refuse a document that used to
+    ingest, or wave a binary through.
+    """
+    try:
+        with open(filepath, "rb") as handle:
+            sample = handle.read(8192)
+    except OSError:
+        # Unreadable here is not evidence of anything; let the loader open it and report honestly.
+        return
+
+    if looks_like_text(sample, before_signatures=True):
+        return
+
+    described = describe_unsupported_binary(sample)
+    if described is None:
+        if looks_like_text(sample, before_signatures=False):
+            return
+        described = "not a text-based format"
+
+    raise UnsupportedDocumentError(
+        f"'{filename}' is {described}, which this service cannot read as text. Upload a document "
+        f"format instead — PDF, Word, PowerPoint, Excel, CSV or plain text.",
+        filename=filename,
+    )
+
+
 def detect_file_encoding(filepath: str) -> str:
     """
     Detect the encoding of a file using BOM markers and chardet for broader support.
@@ -203,6 +414,13 @@ def get_loader(filename: str, file_content_type: str, filepath: str):
     ):
         loader = TextLoader(filepath, autodetect_encoding=True)
     else:
+        # Nothing above claimed this file. Before treating it as prose, check that it actually IS
+        # text: this branch is the only one reached by a format we have no extractor for, so it is
+        # the only place the check belongs. A recognised binary — or anything that does not read as
+        # text — gets an honest `unsupported` verdict naming the format, instead of having its bytes
+        # embedded. Everything else still falls through to TextLoader exactly as before, so a genuine
+        # text file with an unusual extension is unaffected.
+        raise_if_unsupported_binary(filepath, filename)
         loader = TextLoader(filepath, autodetect_encoding=True)
         known_type = False
 
