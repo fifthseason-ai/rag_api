@@ -225,10 +225,50 @@ _SERVICE_FAULT_TYPES = (
 )
 
 
+# SP-01.10b, after independent review checked the class hierarchy instead of assuming it. The typed set
+# above was both too narrow and too wide.
+#
+# TOO NARROW, and this is the part that mattered: psycopg2.OperationalError,
+# sqlalchemy.exc.OperationalError, httpx.ConnectError, redis.ConnectionError and botocore's connection
+# errors are NOT OSError subclasses. A vector-DB or embeddings-API outage therefore landed on the
+# non-retryable 400 path -- the exact production harm this correction exists to close, left open for its
+# most likely cause. Exceptions from these libraries are always about REACHING something; none of them
+# parses a document, so none can be provoked by the uploaded bytes.
+#
+# Detection is by MODULE, not by type, on purpose: this file must not import a driver the image may not
+# carry, and a driver upgrade that renames a class must not silently reopen the hole.
+_SERVICE_FAULT_MODULE_ROOTS = frozenset(
+    {
+        "psycopg2",
+        "psycopg",
+        "asyncpg",
+        "sqlalchemy",
+        "redis",
+        "httpx",
+        "httpcore",
+        "urllib3",
+        "requests",
+        "aiohttp",
+        "botocore",
+        "boto3",
+    }
+)
+
+# TOO WIDE: PIL.UnidentifiedImageError IS an OSError and is a statement about CONTENT -- a document
+# parser reaches it through embedded media. Excusing it as retryable would retry, forever, a file that
+# can never work. Checked BEFORE the typed set so inheritance cannot override the specific knowledge.
+_CONTENT_FAULT_MODULE_ROOTS = frozenset({"PIL"})
+
+
 def is_service_fault(error: BaseException) -> bool:
     """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
     ourselves — but never accuse the file either (see `describe_failure`)."""
-    return isinstance(error, _SERVICE_FAULT_TYPES)
+    root = (type(error).__module__ or "").split(".")[0]
+    if root in _CONTENT_FAULT_MODULE_ROOTS:
+        return False
+    if isinstance(error, _SERVICE_FAULT_TYPES):
+        return True
+    return root in _SERVICE_FAULT_MODULE_ROOTS
 
 
 def describe_failure(error: BaseException, filename: str) -> tuple:
@@ -1606,7 +1646,9 @@ async def embed_file(
     except Exception as e:
         # KI-02 SP-01.10 — same attribution the loader seam uses, for failures that happen OUTSIDE
         # loading (vector-store writes, storage). A connection error to the vector DB is our fault and
-        # must not be returned as "your file is bad"; the raw exception stays in the log.
+        # is ours -- and SP-01.10b is what actually makes that true: psycopg2 and sqlalchemy
+        # errors are not OSError subclasses, so until module-based detection existed this comment
+        # described an intention the code did not implement. The raw exception stays in the log.
         response_status = False
         status_code, response_message = describe_failure(e, getattr(file, "filename", None))
         raise HTTPException(status_code=status_code, detail=response_message)

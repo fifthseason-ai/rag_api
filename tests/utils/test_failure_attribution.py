@@ -249,3 +249,99 @@ def test_a_deliberate_http_answer_from_the_loader_is_never_re_wrapped():
             )
     assert caught.value.status_code == 413
     assert caught.value.detail == "That file is larger than this service accepts."
+
+
+# ── SP-01.10b — the faults independent review found still misattributed ───────────────────────────
+#
+# The first cut recognised a TYPED set: ImportError, MemoryError, OSError, RecursionError,
+# asyncio.TimeoutError. Review checked the hierarchy in-container and found the set both too NARROW and
+# too WIDE, and an inline comment that asserted something false.
+#
+# TOO NARROW, and this is the part that matters: `psycopg2.OperationalError`,
+# `sqlalchemy.exc.OperationalError`, `httpx.ConnectError`, `redis.ConnectionError`, botocore's
+# connection errors and `concurrent.futures.TimeoutError` are NOT OSError subclasses (verified, not
+# assumed). A vector-DB or embeddings-API outage therefore landed on the non-retryable 400 path -- which
+# is the EXACT production harm this increment exists to close, left open for the most likely cause of it.
+# The comment on the embed handler claimed "a connection error to the vector DB ... must not be returned
+# as 'your file is bad'" while the code did precisely that.
+#
+# TOO WIDE: `PIL.UnidentifiedImageError` IS an OSError, and it is a statement about CONTENT. Excusing it
+# as a retryable service fault would retry a file that can never work.
+#
+# Detection is by MODULE for the infrastructure libraries: this file must not import a driver it may not
+# have, and a driver upgrade that renames a class should not silently reopen the hole.
+
+
+REAL_INFRA_FAULTS = [
+    ("psycopg2", "OperationalError", ("connection to server failed",)),
+    ("sqlalchemy.exc", "OperationalError", ("SELECT 1", None, None)),
+    ("httpx", "ConnectError", ("connection refused",)),
+    ("redis.exceptions", "ConnectionError", ("connection lost",)),
+]
+
+
+@pytest.mark.parametrize("module_name,cls_name,args", REAL_INFRA_FAULTS)
+def test_a_real_infrastructure_error_is_a_service_fault(module_name, cls_name, args):
+    """RED-first, against the REAL exception classes rather than a stand-in."""
+    module = pytest.importorskip(module_name)
+    exc_cls = getattr(module, cls_name)
+    assert not issubclass(exc_cls, OSError), (
+        f"{module_name}.{cls_name} is now an OSError; this test no longer proves anything"
+    )
+    with pytest.raises(HTTPException) as caught:
+        drive(exc_cls(*args))
+    assert caught.value.status_code == 503, f"{module_name}.{cls_name} must be retryable"
+    assert "not with your file" in detail_text(caught.value)
+
+
+def test_concurrent_futures_timeout_is_covered_too():
+    """`asyncio.TimeoutError is concurrent.futures.TimeoutError` is FALSE on this Python, so listing one
+    does not cover the other. Verified in-container rather than assumed."""
+    import asyncio as _asyncio
+    import concurrent.futures as _futures
+
+    assert _asyncio.TimeoutError is not _futures.TimeoutError
+    with pytest.raises(HTTPException) as caught:
+        drive(_futures.TimeoutError("the pool timed out"))
+    assert caught.value.status_code == 503
+
+
+def test_detection_is_by_module_so_an_unimported_driver_still_counts():
+    """The mechanism, isolated from whatever happens to be installed: an exception whose module is an
+    infrastructure package is ours even though this file never imports that package."""
+
+    class SomeFutureDriverError(Exception):
+        pass
+
+    SomeFutureDriverError.__module__ = "psycopg.errors"
+    with pytest.raises(HTTPException) as caught:
+        drive(SomeFutureDriverError("server closed the connection unexpectedly"))
+    assert caught.value.status_code == 503
+
+
+def test_a_content_error_that_happens_to_be_an_oserror_is_NOT_excused():
+    """RED-first the other way. `PIL.UnidentifiedImageError` inherits OSError but says the BYTES are
+    unreadable. A retryable 503 here would retry a file that can never work."""
+    PIL = pytest.importorskip("PIL")
+    from PIL import UnidentifiedImageError
+
+    assert issubclass(UnidentifiedImageError, OSError), "the premise of this test has changed"
+    with pytest.raises(HTTPException) as caught:
+        drive(UnidentifiedImageError("cannot identify image file"))
+    err = caught.value
+    assert err.status_code == 400, "a content fault must not be sold as retryable"
+    assert "not with your file" not in detail_text(err)
+    assert "not established" in detail_text(err)
+
+
+def test_a_document_parser_error_is_never_excused_as_infrastructure():
+    """The deny-list must not be so broad that a parser's own failure looks like an outage."""
+
+    class ParseFailure(Exception):
+        pass
+
+    for parser_module in ("openpyxl.reader.excel", "pypdf.errors", "unstructured.partition"):
+        ParseFailure.__module__ = parser_module
+        with pytest.raises(HTTPException) as caught:
+            drive(ParseFailure("bad record"))
+        assert caught.value.status_code == 400, f"{parser_module} must not read as infrastructure"
