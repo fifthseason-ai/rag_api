@@ -114,7 +114,16 @@ def test_get_vector_store_async_passes_use_jsonb():
 
 
 def test_load_file_content_cleans_up_on_lazy_load_failure():
-    """cleanup_temp_encoding_file is called even when lazy_load() raises."""
+    """cleanup_temp_encoding_file is called even when lazy_load() raises.
+
+    KI-02 SP-01.10 changed the EXCEPTION this surfaces, not this test's subject. A raw exception no
+    longer escapes the seam to the caller -- it is attributed and turned into an HTTPException whose
+    message withholds our internals. The cleanup assertion below is the guard and is unchanged; the
+    added assertion makes the test stronger, since the old `match="disk error"` would now pass happily
+    if that internal string were being handed to the caller.
+    """
+    from fastapi import HTTPException
+
     from app.routes.document_routes import load_file_content
 
     mock_loader = MagicMock()
@@ -128,8 +137,11 @@ def test_load_file_content_cleans_up_on_lazy_load_failure():
         with patch(
             "app.routes.document_routes.cleanup_temp_encoding_file"
         ) as mock_cleanup:
-            with pytest.raises(RuntimeError, match="disk error"):
+            with pytest.raises(HTTPException) as caught:
                 asyncio.run(
                     load_file_content("f.csv", "text/csv", "/fake/path", executor=None)
                 )
             mock_cleanup.assert_called_once_with(mock_loader)
+            # The failure is reported without our exception text.
+            assert "disk error" not in str(caught.value.detail)
+            assert "f.csv" in str(caught.value.detail)

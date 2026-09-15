@@ -191,6 +191,86 @@ def _make_unique_temp_path(user_id: str, filename: str) -> Optional[str]:
     return str(Path(RAG_UPLOAD_DIR, user_id, unique_name).resolve())
 
 
+# ── KI-02 SP-01.10 — honest failure attribution ───────────────────────────────────────────────────
+#
+# SP-01.5 fixed the production Excel failure by pinning `msoffcrypto-tool`. That fixed the INSTANCE.
+# The CLASS was this: a dependency missing from OUR image surfaced as
+#
+#     400 "Error during file processing: No module named 'msoffcrypto'"
+#
+# — our fault, reported to the uploader as their file's fault, over a status code that means "your
+# request is bad, do not retry", so Core's listener recorded those files as failed instead of retrying
+# them once the image was fixed. Reproduced against this seam for a missing dependency, an
+# out-of-memory, and a parser error that echoed our internal temp path back to the caller.
+#
+# These types are unambiguously OURS. Nothing about the uploaded bytes can cause them:
+#   * ImportError        — includes ModuleNotFoundError: our image is missing a package.
+#   * MemoryError        — our process, our limits.
+#   * OSError            — includes ConnectionError, TimeoutError, PermissionError, FileNotFoundError
+#                          and "no space left on device". The file we would be reading is one WE just
+#                          wrote to OUR temp directory, so an OS-level failure on it is our storage,
+#                          never the uploader's content.
+#   * RecursionError     — our parser, not their document.
+# `asyncio.TimeoutError` is listed separately because on Python 3.10 it is NOT an OSError subclass.
+#
+# Everything else is left at its existing status ON PURPOSE. There is no evidence for a different code,
+# and changing it would silently change retry behaviour for every consumer. What changes is that the
+# caller stops receiving our exception text and is told plainly that the cause is not established.
+_SERVICE_FAULT_TYPES = (
+    ImportError,
+    MemoryError,
+    OSError,
+    RecursionError,
+    asyncio.TimeoutError,
+)
+
+
+def is_service_fault(error: BaseException) -> bool:
+    """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
+    ourselves — but never accuse the file either (see `describe_failure`)."""
+    return isinstance(error, _SERVICE_FAULT_TYPES)
+
+
+def describe_failure(error: BaseException, filename: str) -> tuple:
+    """Turn a non-verdict failure into `(status_code, caller_message)` and log the real detail.
+
+    The caller gets a sentence and a reference. The operator gets the exception, its type and the
+    traceback under that same reference. Withholding internals is only acceptable because the reference
+    makes them findable — a test asserts the reference actually reaches the log.
+
+    `detail` is deliberately a plain STRING on these paths. Core's direct-upload consumer interpolates
+    `detail` straight into the user's toast (`crud.js:341`), so an object renders there as
+    `[object Object]` — a live defect this lane found and recorded. The machine-readable half is the
+    STATUS CODE, which every consumer already reads; the human half is the sentence. Neither needs the
+    other to be fixed first.
+    """
+    reference = uuid.uuid4().hex[:12]
+    name = filename or "the uploaded file"
+    service = is_service_fault(error)
+    if service:
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        message = (
+            f"'{name}' could not be processed because of a problem on our side, "
+            f"not with your file. It is safe to try again. Reference: {reference}."
+        )
+    else:
+        status_code = status.HTTP_400_BAD_REQUEST
+        message = (
+            f"'{name}' could not be read. The cause is not established \u2014 it may be the file "
+            f"or this service. Reference: {reference}."
+        )
+    logger.error(
+        "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+        reference,
+        name,
+        "service" if service else "undetermined",
+        type(error).__name__,
+        error,
+        traceback.format_exc(),
+    )
+    return status_code, message
+
+
 async def load_file_content(
     filename: str, content_type: str, file_path: str, executor
 ) -> tuple:
@@ -237,6 +317,15 @@ async def load_file_content(
                 },
             },
         ) from verdict_error
+    except HTTPException:
+        # Already an honest, deliberate answer (e.g. raised by `get_loader`). Never re-wrap it.
+        raise
+    except Exception as error:
+        # KI-02 SP-01.10 — anything that is not a terminal verdict about the FILE. The uploader is never
+        # told their file is bad on the strength of an exception we have not classified, and never
+        # receives `str(error)`.
+        status_code, message = describe_failure(error, filename)
+        raise HTTPException(status_code=status_code, detail=message) from error
     finally:
         # Clean up temporary UTF-8 file if it was created for encoding conversion
         if loader is not None:
@@ -1515,17 +1604,12 @@ async def embed_file(
         )
         raise http_exc
     except Exception as e:
+        # KI-02 SP-01.10 — same attribution the loader seam uses, for failures that happen OUTSIDE
+        # loading (vector-store writes, storage). A connection error to the vector DB is our fault and
+        # must not be returned as "your file is bad"; the raw exception stays in the log.
         response_status = False
-        response_message = f"Error during file processing: {str(e)}"
-        logger.error(
-            "Error during file processing: %s\nTraceback: %s",
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error during file processing: {str(e)}",
-        )
+        status_code, response_message = describe_failure(e, getattr(file, "filename", None))
+        raise HTTPException(status_code=status_code, detail=response_message)
     finally:
         await cleanup_temp_file_async(validated_file_path)
 
@@ -1651,16 +1735,10 @@ async def embed_file_upload(
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error during file processing | File: %s | Error: %s | Traceback: %s",
-            uploaded_file.filename,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error during file processing: {str(e)}",
-        )
+        # KI-02 SP-01.10 — see `describe_failure`. Attribution by status code, sentence to the caller,
+        # exception and traceback to the log under a shared reference.
+        status_code, message = describe_failure(e, uploaded_file.filename)
+        raise HTTPException(status_code=status_code, detail=message)
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
 
