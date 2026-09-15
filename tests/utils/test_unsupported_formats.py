@@ -186,7 +186,8 @@ def test_an_empty_file_is_not_called_unsupported(tmp_path):
     path.write_bytes(b"")
 
     loader, _, _ = get_loader("blank.notes", "application/x-unknown", str(path))
-    assert loader.load() == [] or all(not d.page_content.strip() for d in loader.load())
+    docs = loader.load()
+    assert all(not d.page_content.strip() for d in docs)
 
 
 @pytest.mark.parametrize(
@@ -283,3 +284,158 @@ def test_embed_still_accepts_a_real_document(client):
 
     assert r.status_code == 200, r.text
     assert sum(len(b) for b in client.inserted_batches) >= 1
+
+
+# ===========================================================================
+# False refusals the independent review found (WPSP1-6A-R MAJOR-1 / MAJOR-2)
+#
+# Both were regressions introduced by the first version of this guard, and both were silent losses of
+# a document that used to ingest. They are the reason the refusal decides by DECODING first and only
+# consults magic numbers once the bytes have failed to decode.
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "label,encoding",
+    [
+        ("utf16-bom", "utf-16"),
+        ("utf16le-nobom", "utf-16-le"),
+        ("utf16be-nobom", "utf-16-be"),
+        ("utf32-bom", "utf-32"),
+    ],
+)
+def test_short_bom_less_utf16_is_not_refused(tmp_path, label, encoding):
+    """The case chardet alone does NOT cover, and the reason the UTF-16 path exists.
+
+    For a SHORT UTF-16 sample chardet answers `ascii` with confidence 1.00 — and `ascii` is not one
+    of the multi-byte encodings the confidence branch accepts, so it contributes nothing. A longer
+    sample is detected as `utf-16le` at 0.85 and would pass without the dedicated check, which is
+    exactly how this gap hid: the first fixture was long enough to be covered by accident.
+    """
+    if encoding not in ("utf-16-le", "utf-16-be"):
+        pytest.skip("BOM-bearing encodings are settled by the BOM, not by detection")
+    path = tmp_path / f"short-{label}.notes"
+    path.write_bytes("Hi there.".encode(encoding))
+
+    # Must not raise.
+    get_loader(f"short-{label}.notes", "application/octet-stream", str(path))
+
+
+@pytest.mark.parametrize(
+    "label,encoding",
+    [
+        ("utf16-bom", "utf-16"),
+        ("utf16le-nobom", "utf-16-le"),
+        ("utf16be-nobom", "utf-16-be"),
+        ("utf32-bom", "utf-32"),
+    ],
+)
+def test_utf16_and_utf32_text_is_not_refused(tmp_path, label, encoding):
+    """MAJOR-1. UTF-16 encodes ASCII as alternating character/NUL bytes, so the first version's
+    "a NUL means binary" rule condemned it — and the docstring asserting no handled encoding emits a
+    NUL was simply wrong: `detect_file_encoding` in this same module handles UTF-16 and UTF-32 BOMs.
+    A UTF-16 document arriving with an unusual extension and no `text/*` type was refused outright,
+    with a message ('not a text-based format') that was itself untrue."""
+    text = "Quarterly revenue grew twelve percent across EMEA."
+    path = tmp_path / f"{label}.notes"
+    path.write_bytes(text.encode(encoding))
+
+    # Not refused — that is what this increment owns.
+    loader, _, _ = get_loader(f"{label}.notes", "application/octet-stream", str(path))
+    content = " ".join(d.page_content for d in loader.load())
+
+    if encoding in ("utf-16", "utf-32"):
+        # With a BOM, TextLoader's autodetect decodes it properly and the text round-trips.
+        assert "Quarterly revenue" in content
+    else:
+        # WITHOUT a BOM, TextLoader's own autodetect still mis-decodes it — a PRE-EXISTING limitation
+        # of that loader, not something this guard introduced, and out of scope here. What matters is
+        # that the file is no longer REFUSED, and that its characters are present rather than the
+        # file being rejected outright.
+        assert "Q" in content and "u" in content
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "MZ Corporation reported a strong quarter across every region. ",
+        "BM means Building Materials in this report, not a bitmap. ",
+        "ID3 tags explained, for the audio engineering team. ",
+        "GIF87a is an old image format, described here for completeness. ",
+    ],
+)
+def test_prose_beginning_with_a_binary_signature_is_not_refused(tmp_path, opening):
+    """MAJOR-2. `MZ` and `BM` are ordinary English bigrams and `ID3`/`GIF87a` occur in technical
+    prose, so a two-byte prefix must never outrank the file actually decoding as text. Before the
+    correction these were refused AND mis-named — told they were a Windows executable, a BMP image,
+    an MP3."""
+    path = tmp_path / "note.notes"
+    path.write_text(opening * 5, encoding="utf-8")
+
+    loader, _, _ = get_loader("note.notes", "application/octet-stream", str(path))
+
+    assert opening.split()[0] in " ".join(d.page_content for d in loader.load())
+
+
+def test_a_misnamed_office_file_is_told_what_it_actually_is(tmp_path):
+    """MINOR-2. An Office file IS a zip, so a .docx that reaches us with the wrong extension and an
+    octet-stream type was refused as 'a ZIP archive' — true, and useless: it sends someone looking
+    for an archive they never made."""
+    path = tmp_path / "contract.bin"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types/>')
+        z.writestr("word/document.xml", "<w:document/>")
+
+    with pytest.raises(UnsupportedDocumentError) as exc:
+        get_loader("contract.bin", "application/octet-stream", str(path))
+
+    message = str(exc.value).lower()
+    assert "office" in message and "wrong file name or type" in message
+
+
+def test_a_plain_zip_is_still_called_a_zip(tmp_path):
+    """Control for the case above: naming Office files must not relabel ordinary archives."""
+    path = tmp_path / "archive.zip"
+    make_zip(str(path))
+
+    with pytest.raises(UnsupportedDocumentError) as exc:
+        get_loader("archive.zip", "application/zip", str(path))
+
+    assert "zip archive" in str(exc.value).lower()
+
+
+# ===========================================================================
+# The verdict reaches the other routes too (WPSP1-6A-R NOTE-2: only /embed was covered)
+# ===========================================================================
+
+
+def test_text_route_refuses_an_unsupported_file(client, tmp_path):
+    path = tmp_path / "photo.png"
+    make_png(str(path))
+
+    r = client.post(
+        "/text",
+        data={"file_id": "f-text-png", "entity_id": "userA"},
+        files={"file": ("photo.png", io.BytesIO(path.read_bytes()), "image/png")},
+        headers=_hdr(ent=["userA"], act=["read"]),
+    )
+
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["extraction"]["verdict"] == "unsupported"
+    assert client.inserted_batches == []
+
+
+def test_embed_upload_route_refuses_an_unsupported_file(client, tmp_path):
+    path = tmp_path / "archive.zip"
+    make_zip(str(path))
+
+    r = client.post(
+        "/embed-upload",
+        data={"file_id": "f-upload-zip", "entity_id": "userA"},
+        files={"uploaded_file": ("archive.zip", io.BytesIO(path.read_bytes()), "application/zip")},
+        headers=_hdr(ent=["userA"], act=["write"]),
+    )
+
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["extraction"]["verdict"] == "unsupported"
+    assert client.inserted_batches == []
