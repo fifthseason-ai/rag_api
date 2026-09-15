@@ -50,7 +50,6 @@ from tests.utils.test_parser_fitness import (
     make_corrupt_ooxml,
     make_docx,
     make_multisheet_xlsx,
-    _skip_no_msoffcrypto,
 )
 
 _SECRET = "testsecret"
@@ -443,11 +442,11 @@ def test_embed_complete_pdf_reports_complete(rec_client, tmp_path):
     assert stored_pages == {0, 1, 2}
 
 
-@_skip_no_msoffcrypto
-def test_embed_xlsx_sheet_receipt_when_msoffcrypto_present(rec_client, tmp_path):
-    """XLSX (msoffcrypto-gated): a workbook whose sheets all carry data reports
-    locator_kind 'sheet' and complete. Skipped where msoffcrypto is absent (not
-    in requirements.txt — Demian's decision), exactly as the WP-C xlsx tests."""
+def test_embed_xlsx_sheet_receipt(rec_client, tmp_path):
+    """XLSX: a workbook whose sheets all carry data reports locator_kind 'sheet'
+    and complete. This used to skip whenever msoffcrypto was missing — which was
+    exactly when Excel was broken; msoffcrypto-tool is now a pinned requirement
+    (KI-02 SP-01.5) and the case always runs."""
     path = tmp_path / "book.xlsx"
     make_multisheet_xlsx(str(path))
     r = _embed(

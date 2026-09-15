@@ -16,9 +16,10 @@ documents. The tests prove, per format:
     NO vector rows written).
 
 Coverage notes recorded in WPC-REPORT.md:
-  * XLSX real extraction requires the optional `msoffcrypto` package, which is
-    absent from requirements.txt and from the CI image; those cases skip when it
-    is missing (mirrors tests/utils/test_lazy_load.py).
+  * XLSX cases were originally gated on the optional `msoffcrypto` package being
+    importable, so they skipped in CI while every .xlsx failed in production.
+    msoffcrypto-tool is now a pinned requirement and the gate is gone (KI-02
+    SP-01.5); tests/utils/test_xlsx_capability.py carries the full Excel suite.
   * OCR of image-only PDFs is env-gated (PDF_EXTRACT_IMAGES=True + rapidocr) and
     not exercised here; the default (False) product behaviour — scan pages yield
     empty text and are caught by the empty-extraction guard — is asserted.
@@ -37,17 +38,6 @@ from app.utils.document_loader import (
     process_documents,
     SlidePowerPointLoader,
     SafePyPDFLoader,
-)
-
-try:
-    import msoffcrypto  # noqa: F401
-
-    _has_msoffcrypto = True
-except ImportError:
-    _has_msoffcrypto = False
-
-_skip_no_msoffcrypto = pytest.mark.skipif(
-    not _has_msoffcrypto, reason="msoffcrypto not installed (not in requirements.txt)"
 )
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -543,13 +533,14 @@ def test_docx_extracts_heading_body_table_and_header_footer(tmp_path):
 
 
 # ===========================================================================
-# XLSX — routing + sheet citations (msoffcrypto-gated) + honest failure
+# XLSX — routing + sheet citations + honest failure
+# (deeper Excel coverage: tests/utils/test_xlsx_capability.py)
 # ===========================================================================
 
 
 def test_xlsx_routes_to_excel_loader(tmp_path):
     """Routing is deterministic and needs no optional deps."""
-    from langchain_community.document_loaders import UnstructuredExcelLoader
+    from app.utils.document_loader import SheetExcelLoader
 
     path = tmp_path / "book.xlsx"
     make_multisheet_xlsx(str(path))
@@ -558,13 +549,12 @@ def test_xlsx_routes_to_excel_loader(tmp_path):
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         str(path),
     )
-    assert isinstance(loader, UnstructuredExcelLoader)
+    assert isinstance(loader, SheetExcelLoader)
     assert known_type is True and ext == "xlsx"
 
 
-@_skip_no_msoffcrypto
 def test_xlsx_documents_carry_sheet_citation(tmp_path):
-    """With msoffcrypto present, get_loader's mode='elements' surfaces the exact
+    """get_loader's mode='elements' surfaces the exact
     sheet citation (page_name = sheet name, page_number = sheet index) on every
     Document. Under the default 'single' mode this metadata is entirely absent —
     this asserts the WP-C fix that adds sheet citations."""

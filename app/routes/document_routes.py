@@ -70,6 +70,7 @@ from app.utils.document_loader import (
     clean_text,
     process_documents,
     cleanup_temp_encoding_file,
+    DocumentVerdictError,
 )
 from app.utils.health import is_health_ok
 
@@ -193,13 +194,49 @@ def _make_unique_temp_path(user_id: str, filename: str) -> Optional[str]:
 async def load_file_content(
     filename: str, content_type: str, file_path: str, executor
 ) -> tuple:
-    """Load file content using appropriate loader."""
+    """Load file content using appropriate loader.
+
+    A loader that reaches a terminal verdict about the file (KI-02 SP-01.5:
+    password-protected, damaged container) raises `DocumentVerdictError`, which
+    is translated here into a 422 carrying BOTH the machine-readable verdict and
+    a sentence the uploader can act on. This is the single seam every embed/text
+    route loads through, and each of those routes re-raises `HTTPException`
+    unchanged, so the honest answer reaches the caller instead of collapsing into
+    the generic "Error during file processing: ..." 400. The verdict is raised
+    during loading, before any `add_documents` call, so nothing is stored.
+    """
     loader = None
     try:
         loader, known_type, file_ext = get_loader(filename, content_type, file_path)
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
         return data, known_type, file_ext
+    except DocumentVerdictError as verdict_error:
+        logger.warning(
+            "Terminal verdict for %s [verdict=%s]: %s",
+            filename,
+            verdict_error.verdict,
+            verdict_error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": f"'{filename or 'uploaded file'}': {verdict_error}",
+                "extraction": {
+                    "status": "unsupported",
+                    "verdict": verdict_error.verdict,
+                    "locator_kind": "none",
+                    "units_total": 0,
+                    "units_extracted": 0,
+                    "units_empty": 0,
+                    "units_image_only": 0,
+                    "empty_locators": [],
+                    "reasons": [
+                        {"locator": None, "reason": verdict_error.verdict}
+                    ],
+                },
+            },
+        ) from verdict_error
     finally:
         # Clean up temporary UTF-8 file if it was created for encoding conversion
         if loader is not None:
@@ -1019,6 +1056,17 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       units only)
       reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
                       locator-bearing unit
+      formulas:       PRESENT ONLY for formats that report a formula scan
+                      (spreadsheets; KI-02 SP-01.5) —
+                      {scan: 'complete' | 'unavailable',
+                       uncached_cells_total: int,
+                       uncached: [{locator, cells: [...]}]}
+                      A formula cell whose result was never cached in the file
+                      extracts with its NUMBER MISSING (the label survives, the
+                      value does not). We never compute a substitute, so this
+                      block is how the caller learns the extraction is short of
+                      values; `scan: 'unavailable'` means the workbook could not
+                      be re-read to check (never a silent zero).
 
     Honesty note: PDF has no image-only signal at the loader (a scanned page and a
     truly blank page are both empty `page_content`), so PDF empty pages are
@@ -1037,6 +1085,11 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     # ONE logical unit (honest: the loader exposes no sub-locator to cite).
     units: dict = {}
     order: list = []
+    # Spreadsheet-only, additive (KI-02 SP-01.5): a formula whose result was never
+    # cached in the file extracts as a MISSING number, not a wrong one, so the
+    # receipt must say so rather than let a "Total" row arrive silently blank.
+    formula_scan: Optional[str] = None
+    uncached_cells: dict = {}
     for d in docs:
         meta = getattr(d, "metadata", None) or {}
         loc = meta.get(meta_key) if meta_key is not None else None
@@ -1048,6 +1101,13 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             units[loc]["content"] = True
         if meta.get("image_only") is True:
             units[loc]["image_only"] = True
+        if meta.get("formula_scan") is not None:
+            formula_scan = meta["formula_scan"]
+        cells = meta.get("formula_uncached_cells")
+        if cells:
+            # Same unit reported twice (elements mode emits several Documents per
+            # sheet) carries the same cell list; keep one copy, not a duplicate.
+            uncached_cells.setdefault(loc, list(cells))
 
     units_total = len(units)
     extracted = [loc for loc in order if units[loc]["content"]]
@@ -1075,7 +1135,7 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     reason_by_loc = {loc: "image_only" for loc in image_only}
     reason_by_loc.update({loc: "empty" for loc in empty})
 
-    return {
+    receipt = {
         "status": status_str,
         "locator_kind": locator_kind,
         "units_total": units_total,
@@ -1091,6 +1151,21 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             if loc is not None
         ],
     }
+
+    # Present ONLY for formats that report a formula scan (spreadsheets today), so
+    # every existing receipt keeps its exact shape.
+    if formula_scan is not None:
+        receipt["formulas"] = {
+            "scan": formula_scan,
+            "uncached_cells_total": sum(len(c) for c in uncached_cells.values()),
+            "uncached": [
+                {"locator": loc, "cells": uncached_cells[loc]}
+                for loc in order
+                if loc in uncached_cells
+            ],
+        }
+
+    return receipt
 
 
 def _assert_extractable_content(

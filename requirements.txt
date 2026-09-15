@@ -20,6 +20,12 @@ markdown==3.8.2
 networkx==3.2.1
 pandas==2.2.1
 openpyxl==3.1.5
+# UnstructuredExcelLoader imports msoffcrypto at load time, so WITHOUT this package every
+# .xlsx/.xls raises ModuleNotFoundError and no spreadsheet can ever be ingested (KI-02
+# SP-01.5, reproduced on a production-equivalent image). MIT licence; its only runtime
+# deps (cryptography, olefile) are already in the closure, so installing it adds exactly
+# one package. No OSV/PyPI advisory for msoffcrypto-tool or olefile as of 2026-09-15.
+msoffcrypto-tool==6.0.0
 docx2txt==0.9
 pypandoc==1.15
 PyJWT==2.8.0
