@@ -450,3 +450,63 @@ def test_the_module_denylist_covers_PIL_errors_beyond_the_named_ones():
         drive(SomeOtherPillowError("broken data stream when reading image file"))
     assert caught.value.status_code == 400, "an OSError from PIL is about the bytes, not our storage"
     assert "not with your file" not in detail_text(caught.value)
+
+
+def test_a_suppressed_context_is_not_treated_as_a_cause():
+    """RED-first, from round-3 review. `raise X from None` sets `__suppress_context__`: the developer has
+    said explicitly that whatever was being handled is INCIDENTAL. Python's own traceback machinery hides
+    it, and the classifier must mirror that — otherwise a genuine transient outage raised while some
+    unrelated content error happened to be in flight gets marked permanent, which is the laundering
+    problem running in reverse and costs a file that would have worked."""
+    httpx = pytest.importorskip("httpx")
+    psycopg2 = pytest.importorskip("psycopg2")
+
+    try:
+        try:
+            raise psycopg2.DataError("invalid byte sequence 0x00")
+        except psycopg2.DataError:
+            raise httpx.ConnectError("connection refused") from None
+    except httpx.ConnectError as outage:
+        captured = outage
+
+    assert captured.__suppress_context__ is True
+    assert isinstance(captured.__context__, psycopg2.DataError), "the premise of this test has changed"
+
+    with pytest.raises(HTTPException) as caught:
+        drive(captured)
+    assert caught.value.status_code == 503, "a suppressed context must not make an outage permanent"
+    assert "not with your file" in detail_text(caught.value)
+
+
+def test_an_UNSUPPRESSED_context_still_counts():
+    """CONTROL. Only the explicit signal is honoured; an ordinary implicit context is still read, so the
+    fix cannot be used to hide a real content fault."""
+    httpx = pytest.importorskip("httpx")
+    psycopg2 = pytest.importorskip("psycopg2")
+
+    try:
+        try:
+            raise psycopg2.DataError("invalid byte sequence 0x00")
+        except psycopg2.DataError:
+            raise httpx.ConnectError("connection refused")
+    except httpx.ConnectError as outage:
+        captured = outage
+
+    assert captured.__suppress_context__ is False
+    with pytest.raises(HTTPException) as caught:
+        drive(captured)
+    assert caught.value.status_code == 400, "an unsuppressed content context still wins"
+
+
+def test_a_suppressed_context_does_not_hide_a_content_fault_in_the_CAUSE():
+    """`from None` suppresses the CONTEXT only. An explicit `__cause__` is never suppressed, so a content
+    fault deliberately chained still wins."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    httpx = pytest.importorskip("httpx")
+
+    outage = httpx.ConnectError("connection refused")
+    outage.__cause__ = psycopg2.DataError("invalid byte sequence 0x00")
+    outage.__suppress_context__ = True
+    with pytest.raises(HTTPException) as caught:
+        drive(outage)
+    assert caught.value.status_code == 400

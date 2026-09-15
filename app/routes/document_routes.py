@@ -297,7 +297,14 @@ def _causes(error: BaseException):
             continue
         seen.add(id(current))
         out.append(current)
-        queue.extend([current.__cause__, current.__context__])
+        # `raise X from None` sets __suppress_context__: the author has said explicitly that whatever was
+        # being handled is INCIDENTAL. Python's own traceback machinery hides a suppressed context, and
+        # this must mirror it -- otherwise a genuine transient outage raised while some unrelated content
+        # error happened to be in flight is marked permanent, which is the laundering problem running in
+        # reverse and costs a file that would have worked. An explicit __cause__ is never suppressed.
+        queue.append(current.__cause__)
+        if not getattr(current, "__suppress_context__", False):
+            queue.append(current.__context__)
     return out
 
 
