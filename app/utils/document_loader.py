@@ -64,6 +64,121 @@ class CorruptDocumentError(DocumentVerdictError):
 
     verdict = "corrupt"
 
+
+class UnsupportedDocumentError(DocumentVerdictError):
+    """The file is intact and readable — we simply have no extractor for this format."""
+
+    verdict = "unsupported"
+
+
+#: Leading byte signatures for formats this service has no text extractor for. Named rather than
+#: lumped into "binary" because "we do not read images" is actionable and "unsupported file" is not.
+_BINARY_SIGNATURES = (
+    (b"\x89PNG\r\n\x1a\n", "a PNG image"),
+    (b"\xff\xd8\xff", "a JPEG image"),
+    (b"GIF87a", "a GIF image"),
+    (b"GIF89a", "a GIF image"),
+    (b"BM", "a BMP image"),
+    (b"PK\x03\x04", "a ZIP archive"),
+    (b"Rar!\x1a\x07", "a RAR archive"),
+    (b"7z\xbc\xaf\x27\x1c", "a 7-Zip archive"),
+    (b"\x1f\x8b", "a gzip archive"),
+    (b"ID3", "an MP3 audio file"),
+    (b"OggS", "an Ogg media file"),
+    (b"fLaC", "a FLAC audio file"),
+    (b"\x00\x00\x00\x18ftyp", "an MP4 video file"),
+    (b"\x00\x00\x00\x20ftyp", "an MP4 video file"),
+    (b"MZ", "a Windows executable"),
+    (b"\x7fELF", "a Linux executable"),
+    (b"SQLite format 3\x00", "a SQLite database"),
+)
+
+
+def describe_unsupported_binary(head: bytes) -> Optional[str]:
+    """Name the format behind `head`, or None when nothing recognisable matches.
+
+    RIFF containers carry their real type four bytes in (WAVE / AVI / WEBP), so they are checked
+    separately rather than given a misleading generic name.
+    """
+    if head.startswith(b"RIFF") and len(head) >= 12:
+        return {
+            b"WAVE": "a WAV audio file",
+            b"AVI ": "an AVI video file",
+            b"WEBP": "a WebP image",
+        }.get(head[8:12], "a RIFF media file")
+    for signature, description in _BINARY_SIGNATURES:
+        if head.startswith(signature):
+            return description
+    return None
+
+
+def looks_like_binary(sample: bytes) -> bool:
+    """True when `sample` cannot be decoded as text.
+
+    Decided by DECODING, not by counting printable bytes. A ratio test looks reasonable until you
+    feed it Japanese or Arabic: in UTF-8 every byte of those scripts is >= 0x80, so a byte-counting
+    heuristic calls a perfectly good document binary and refuses it. Non-Latin text is exactly the
+    content this service must not lose.
+
+    A NUL byte is the one reliable tell — no text encoding handled here emits one. Otherwise the
+    sample must decode, either as UTF-8 or as whatever chardet is confident about. Deliberately
+    conservative: anything that decodes is treated as text and parsed as before.
+    """
+    if not sample:
+        return False
+    if b"\x00" in sample:
+        return True
+
+    # The sample is a fixed-size read, so it may end mid-character. Drop up to three trailing bytes
+    # rather than let a truncated code point masquerade as a decode failure.
+    for trim in range(4):
+        candidate = sample[: len(sample) - trim] if trim else sample
+        try:
+            candidate.decode("utf-8")
+            return False
+        except UnicodeDecodeError:
+            continue
+
+    detected = chardet.detect(sample)
+    encoding, confidence = detected.get("encoding"), detected.get("confidence") or 0
+    if encoding and confidence >= 0.7:
+        try:
+            sample.decode(encoding, errors="strict")
+            return False
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return True
+
+
+def raise_if_unsupported_binary(filepath: str, filename: str) -> None:
+    """Refuse a file we have no extractor for, instead of reading its bytes as prose.
+
+    The fallback branch of `get_loader` hands anything unrecognised to `TextLoader`, and nothing
+    downstream refuses on `known_type=False` — it is only reported. So a ZIP used to arrive as one
+    Document of container framing plus fragments of its members, pass the empty-extraction guard and
+    be stored with an extraction receipt reading `complete`. That is a garbage extraction counted as
+    a success, the sibling of the empty-extraction defect WP-C closed, and the uploader was told
+    nothing. An image fared differently but no better: `Could not detect encoding`, which names our
+    internals rather than their problem.
+    """
+    try:
+        with open(filepath, "rb") as handle:
+            sample = handle.read(8192)
+    except OSError:
+        return
+
+    described = describe_unsupported_binary(sample)
+    if described is None and not looks_like_binary(sample):
+        return
+
+    what = described or "not a text-based format"
+    raise UnsupportedDocumentError(
+        f"'{filename}' is {what}, which this service cannot read as text. Upload a document "
+        f"format instead — PDF, Word, PowerPoint, Excel, CSV or plain text.",
+        filename=filename,
+    )
+
+
 def detect_file_encoding(filepath: str) -> str:
     """
     Detect the encoding of a file using BOM markers and chardet for broader support.
@@ -203,6 +318,13 @@ def get_loader(filename: str, file_content_type: str, filepath: str):
     ):
         loader = TextLoader(filepath, autodetect_encoding=True)
     else:
+        # Nothing above claimed this file. Before treating it as prose, check that it actually IS
+        # text: this branch is the only one reached by a format we have no extractor for, so it is
+        # the only place the check belongs. A recognised binary — or anything that does not read as
+        # text — gets an honest `unsupported` verdict naming the format, instead of having its bytes
+        # embedded. Everything else still falls through to TextLoader exactly as before, so a genuine
+        # text file with an unusual extension is unaffected.
+        raise_if_unsupported_binary(filepath, filename)
         loader = TextLoader(filepath, autodetect_encoding=True)
         known_type = False
 
