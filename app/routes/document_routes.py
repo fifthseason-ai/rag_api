@@ -321,6 +321,29 @@ def _is_name_too_long(error: BaseException) -> bool:
     )
 
 
+def _is_pandoc_missing(error: BaseException) -> bool:
+    """Whether this failure is pandoc not being installed on the server.
+
+    FILES-01 F2 -- this is a REGRESSION REPAIR, not a new policy. `/text` and `/local/embed` each carry
+    an explicit `"No pandoc was found" in str(e)` branch answering with
+    `ERROR_MESSAGES.PANDOC_NOT_INSTALLED`. Those branches sit on the OUTER handler, but the failure they
+    target is raised inside `loader.lazy_load()`, and SP-01.10 now converts that into an `HTTPException`
+    at the `load_file_content` seam -- which the outer handlers re-raise untouched. So the branches
+    stopped being reached and the one actionable answer on those handlers was silently replaced by "the
+    cause is not established". Measured, not inferred: a route test drives a pandoc-less loader and reads
+    the response.
+
+    It belongs HERE because `describe_failure` is now the single classifier every intake path flows
+    through; putting it back on the outer handlers would restore a branch that can no longer execute.
+
+    Status stays 400, exactly as it was before the regression. A missing server package is infrastructure
+    but it is not TRANSIENT: no amount of retrying installs pandoc, and a 503 would tell Core's listener
+    to retry forever a file that cannot work until an operator acts -- the same harm the DataError and
+    ENAMETOOLONG corrections exist to prevent. The message carries the operator action instead.
+    """
+    return any("No pandoc was found" in str(link) for link in _causes(error))
+
+
 def is_service_fault(error: BaseException) -> bool:
     """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
     ourselves -- but never accuse the file either (see `describe_failure`).
@@ -358,6 +381,22 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
     """
     reference = uuid.uuid4().hex[:12]
     name = filename or "the uploaded file"
+    if _is_pandoc_missing(error):
+        # FILES-01 F2 -- restore the actionable answer the outer handlers can no longer produce.
+        # An operator can fix this; "the cause is not established" told nobody anything.
+        logger.error(
+            "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+            reference,
+            name,
+            "service:pandoc_not_installed",
+            type(error).__name__,
+            error,
+            traceback.format_exc(),
+        )
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            f"{ERROR_MESSAGES.PANDOC_NOT_INSTALLED} Reference: {reference}.",
+        )
     if _is_name_too_long(error):
         # SP-01.15 -- we know exactly what is wrong here, so say it instead of "cause not established".
         logger.error(
@@ -1988,22 +2027,32 @@ async def extract_text_from_file(
         )
         raise http_exc
     except Exception as e:
+        # FILES-01 F2 -- the last caller-facing `str(e)` on this lane's file-intake surface.
+        #
+        # `save_upload_file_async` (SP-01.13) and `load_file_content` (SP-01.10) now raise
+        # `HTTPException` and are re-raised untouched above. Two calls in the `try` are behind neither
+        # seam: `os.makedirs`, whose `PermissionError`/`OSError` carries OUR temp directory in `str(e)`,
+        # and `extract_text_from_documents`. Both landed here and were echoed to the caller verbatim --
+        # proven at route level, with an injected marker that reached the response body.
+        #
+        # Worse than the disclosure: every one of them was answered 400, telling the caller their file is
+        # bad and telling Core's listener not to retry, for faults that are ours. `describe_failure`
+        # attributes it instead -- a service fault becomes a retryable 503 that exonerates the file, a
+        # missing pandoc keeps its actionable operator message, and anything unclassified keeps its 400
+        # but says the cause is not established rather than guessing. The exception and traceback stay in
+        # the log, under the reference the caller is given.
+        #
+        # The `"No pandoc was found"` branch that stood here is gone deliberately, not dropped: it could
+        # no longer execute (the loader failure it targets is converted to an `HTTPException` upstream),
+        # and the answer it produced now comes from `describe_failure` where it is reachable again.
         logger.error(
             "Error during text extraction | File: %s | Error: %s | Traceback: %s",
             file.filename,
             str(e),
             traceback.format_exc(),
         )
-        if "No pandoc was found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error during text extraction: {str(e)}",
-            )
+        status_code, message = describe_failure(e, file.filename)
+        raise HTTPException(status_code=status_code, detail=message) from e
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
 
