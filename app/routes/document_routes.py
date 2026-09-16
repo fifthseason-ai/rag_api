@@ -1556,7 +1556,24 @@ async def store_data_in_vector_db(
             str(e),
             traceback.format_exc(),
         )
-        return {"message": "An error occurred while adding documents.", "error": str(e)}
+        # FILES-01 F3 -- failure is FALSY, and that is the whole point.
+        #
+        # This used to return {"message": "An error occurred...", "error": str(e)}. Both that and the
+        # success value are truthy dicts, so the four callers each invented their own way to read it
+        # and only one was right:
+        #     /summarize     `if not result or "error" in result:`  correct
+        #     /local/embed   `if result:`                           ALWAYS true -> 200 {"status": true}
+        #     /embed-upload  `if not result:`                       NEVER true  -> 200 {"status": true}
+        #     /embed         has an `if "error" in result` check, but sets response_message = the RAW
+        #                    exception and falls through to the 200 success return
+        # A vector-store outage was therefore reported to the uploader and to Core as a successful
+        # ingest with zero rows written -- and on /embed it also handed the caller str(e), the exact
+        # disclosure closed everywhere else on this surface.
+        #
+        # Returning None makes `if result:`, `if not result:` and `"error" in result` agree at once, so
+        # the fix lands at the shared producer instead of in three consumers that could each drift
+        # again. Nothing is lost: the exception and traceback are logged right here, where they happen.
+        return None
 
 
 @router.post("/local/embed")
