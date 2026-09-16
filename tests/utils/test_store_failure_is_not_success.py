@@ -294,3 +294,86 @@ async def test_store_still_reports_success_truthily(monkeypatch):
     )
 
     assert result, "success must remain truthy"
+
+
+# ===========================================================================
+# /local/embed's outer handler -- the last raw str(e) on the intake surface
+# (re-review NOTE-2)
+# ===========================================================================
+
+_LOCAL_MARKER = "FILES01-LOCAL-MARKER-4b7e"
+
+
+def test_local_embed_does_not_echo_the_exception_to_the_caller(
+    client, monkeypatch, local_file
+):
+    """`ERROR_MESSAGES.DEFAULT(e)` interpolates the exception verbatim
+    (`f"Something went wrong :/\n{err}"`), so anything reaching this handler handed
+    the caller our internal text -- and at 400, telling Core not to retry a fault that
+    may well be ours."""
+
+    def boom(data, filename):
+        raise ValueError(f"internal detail at /tmp/uploads/tenantA/x {_LOCAL_MARKER}")
+
+    monkeypatch.setattr(document_routes, "_assert_extractable_content", boom)
+
+    r = _local_embed(client, local_file)
+
+    assert _LOCAL_MARKER not in r.text, f"exception text reached the caller: {r.text}"
+    assert "/tmp/uploads" not in r.text
+    assert "Something went wrong" not in r.text
+
+
+def test_local_embed_attributes_our_outage_as_retryable(
+    client, monkeypatch, local_file
+):
+    """Same attribution contract as /text: our fault is a retryable 503 that
+    exonerates the file, not a permanent 400 blaming it."""
+
+    def boom(data, filename):
+        raise MemoryError(f"cannot allocate 4.2 GiB {_LOCAL_MARKER}")
+
+    monkeypatch.setattr(document_routes, "_assert_extractable_content", boom)
+
+    r = _local_embed(client, local_file)
+
+    assert r.status_code == 503, f"got {r.status_code}: {r.text}"
+    assert "not with your file" in r.text
+    assert _LOCAL_MARKER not in r.text
+
+
+def test_local_embed_keeps_the_actionable_pandoc_message(
+    client, monkeypatch, local_file
+):
+    """The dead substring branch is gone; the answer it used to give must survive via
+    the shared classifier, matched by type and position instead."""
+    from app.constants import ERROR_MESSAGES
+
+    def boom(data, filename):
+        raise OSError("No pandoc was found: either install pandoc and add it")
+
+    monkeypatch.setattr(document_routes, "_assert_extractable_content", boom)
+
+    r = _local_embed(client, local_file)
+
+    assert ERROR_MESSAGES.PANDOC_NOT_INSTALLED in r.text, r.text
+    assert r.status_code == 400, r.text
+
+
+def test_local_embed_filename_cannot_disguise_our_outage_as_pandoc(
+    client, monkeypatch, local_file
+):
+    """The caller-influenceable-substring bug must not be re-introduced here either."""
+    from app.constants import ERROR_MESSAGES
+
+    def boom(data, filename):
+        raise PermissionError(
+            13, "Permission denied: '/tmp/uploads/tenantA/No pandoc was found.txt'"
+        )
+
+    monkeypatch.setattr(document_routes, "_assert_extractable_content", boom)
+
+    r = _local_embed(client, local_file)
+
+    assert r.status_code == 503, f"got {r.status_code}: {r.text}"
+    assert ERROR_MESSAGES.PANDOC_NOT_INSTALLED not in r.text

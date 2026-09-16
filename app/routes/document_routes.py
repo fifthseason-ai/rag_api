@@ -1649,17 +1649,30 @@ async def embed_local_file(
         )
         raise http_exc
     except Exception as e:
-        logger.error(e)
-        if "No pandoc was found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT(e),
-            )
+        # FILES-01 F3 (re-review NOTE-2) -- the last raw `str(e)` on the intake surface.
+        #
+        # This handler carried BOTH of the defects already fixed on /text:
+        #   * `ERROR_MESSAGES.DEFAULT(e)` interpolates the exception verbatim
+        #     (`constants.py`: f"Something went wrong :/\n{err}"), so any failure reaching here
+        #     handed the caller our internal text -- and at 400, telling Core's listener that a
+        #     fault which may well be ours is the uploader's file and must not be retried.
+        #   * the `"No pandoc was found" in str(e)` branch was DEAD (the loader failure it targets
+        #     is converted to an HTTPException upstream and re-raised by the handler above) AND was
+        #     the caller-influenceable substring match that an independent review broke on /text: a
+        #     save-path OSError embeds our temp path, which is built from the uploader's filename.
+        #
+        # Both are now the shared, reviewed `describe_failure`: pandoc keeps its actionable operator
+        # message via a match pinned to type and position, a service fault becomes a retryable 503
+        # that exonerates the file, and anything unclassified keeps 400 without the raw text. The
+        # exception and traceback stay in the log under the reference the caller is given.
+        logger.error(
+            "Error in embed_local_file | File: %s | Error: %s | Traceback: %s",
+            document.filename,
+            str(e),
+            traceback.format_exc(),
+        )
+        status_code, message = describe_failure(e, document.filename)
+        raise HTTPException(status_code=status_code, detail=message) from e
 
 
 async def _generate_summary_background(
