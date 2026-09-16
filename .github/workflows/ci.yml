@@ -88,10 +88,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `label` is only an artifact/job label now -- it is NOT a build target. See the
+          # build step: no `target:` is passed, so each Dockerfile builds its final stage,
+          # exactly as `deploy/push.sh` does.
           - file: Dockerfile.lite
-            target: lite
+            label: lite
           - file: Dockerfile
-            target: main
+            label: main
 
     steps:
       # The full image is multi-gigabyte. `images.yaml` already needs this on the
@@ -114,19 +117,38 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # Built from the SAME Dockerfile and the SAME requirements file the published
-      # image uses, so `pip` resolves here exactly as it resolves for production.
+      # image uses, so `pip` resolves here as it resolves for production.
       # `push: false` -- this gate never publishes anything.
+      #
+      # DELIBERATELY UNCACHED. The first version of this job carried
+      # `cache-from/cache-to: type=gha`, and an independent review showed that defeated the job's
+      # own premise. A `RUN pip install -r requirements.lite.txt` layer is keyed on the parent
+      # digest and the requirements file BYTES -- not on what pip actually resolves. On a cache
+      # hit pip never re-runs, so the gate tests a FROZEN dependency closure, while
+      # `deploy/push.sh` has no cache and re-resolves on every operator deploy. With
+      # `tenacity>=9.0.0` unbounded and the transitive set floating, the divergence is
+      # realizable: a PR touching only app code hits the cached layer and goes green on the old
+      # closure while a deploy resolves a newer, broken one. This job exists BECAUSE dependency
+      # resolution can differ between environments; caching the resolution away would have made
+      # it assert the opposite of what it checks.
+      #
+      # The cost is nil in practice: the measured 5m27s (lite) and 15m53s (main) were COLD-cache
+      # runs, and a ~12.7GB image would thrash GitHub's ~10GB cache budget anyway -- the cache
+      # was buying unreliability, not speed.
+      #
+      # No `target:` either, for the same parity reason: `deploy/push.sh:22` builds
+      # `Dockerfile.lite` with NO `--target`, i.e. whatever the final stage is. Pinning a stage
+      # name happens to coincide today (each Dockerfile has exactly one), but if a stage were
+      # ever appended, production would ship the new final stage while this gate kept testing the
+      # old named one -- passing while the parity it promises was silently broken.
       - name: Build the shipped image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ${{ matrix.file }}
-          target: ${{ matrix.target }}
           push: false
           load: true
           tags: rag-api-shipped:ci
-          cache-from: type=gha,scope=shipped-${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=shipped-${{ matrix.target }}
 
       # Record what was actually tested, so a later reader does not have to trust
       # this comment. If the base image moves, this line moves with it.
@@ -136,8 +158,13 @@ jobs:
           docker run --rm rag-api-shipped:ci python -c "import platform; print('platform', platform.platform())"
 
       # Test dependencies only -- the application dependencies are already in the
-      # image, installed the way the image installs them. Adding them in a layer on
-      # top keeps the runtime under test byte-identical to what ships.
+      # image, installed the way the image installs them. A layer on top is the closest
+      # practical thing to running against what ships. NOT "byte-identical", which an earlier
+      # version of this comment claimed and review corrected: pip may upgrade a shared
+      # dependency if a test requirement demands a newer one (`httpx==0.28.1` here is pinned
+      # over whatever the app resolved). The set is small and app-independent, but the suite
+      # runs against the shipped closure PLUS these perturbations, and saying otherwise
+      # overstates the guarantee.
       #
       # `psycopg[binary]` is a TEST-HARNESS dependency, not an application one, and
       # is deliberately not added to any requirements file. `pytest-postgresql`
@@ -200,11 +227,11 @@ jobs:
             rag-api-shipped-test:ci \
             python -m pytest --maxfail=1 --disable-warnings \
                              -p no:cacheprovider \
-                             --junitxml=/artifacts/test-results-${{ matrix.target }}.xml
+                             --junitxml=/artifacts/test-results-${{ matrix.label }}.xml
 
       - name: Upload shipped-runtime test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-shipped-${{ matrix.target }}
-          path: artifacts/test-results-${{ matrix.target }}.xml
+          name: test-results-shipped-${{ matrix.label }}
+          path: artifacts/test-results-${{ matrix.label }}.xml
