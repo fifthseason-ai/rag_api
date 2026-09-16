@@ -580,6 +580,7 @@ def test_sync_save_failure_does_not_echo_our_path_or_exception():
     assert TEMP not in text
     assert INTERNAL not in text
     assert "not with your file" in text
+    assert "q4-forecast.xlsx" in text  # the sync caller also learns WHICH file (review coverage nit)
 
 
 def test_save_failure_carries_a_reference_to_the_log(caplog):
