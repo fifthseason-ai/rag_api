@@ -177,6 +177,10 @@ def test_makedirs_permission_failure_does_not_leak_our_temp_path(client, monkeyp
     body = r.text
     assert _MARKER not in body, f"exception text reached the caller: {body}"
     assert "/tmp/uploads" not in body, f"internal path reached the caller: {body}"
+    # Review note: absence-only assertions would also pass for a wrong status or a
+    # message with nothing the operator can look up. Pin both.
+    assert r.status_code == 503, f"our own directory failing is ours: {r.status_code}"
+    assert _REFERENCE.search(body), f"no reference for the operator: {body}"
 
 
 def test_our_outage_is_retryable_and_does_not_blame_the_file(client, monkeypatch):
@@ -396,7 +400,14 @@ def test_missing_pandoc_still_tells_the_operator_what_to_install(client, monkeyp
             pass
 
         def lazy_load(self):
-            raise RuntimeError("No pandoc was found: either install pandoc and add it")
+            # The REAL type, read out of the shipped image rather than guessed:
+            # pypandoc/__init__.py:802 raises OSError, not RuntimeError. An earlier
+            # version of this test raised RuntimeError and would have passed against a
+            # classifier that could never fire in production.
+            raise OSError(
+                "No pandoc was found: either install pandoc and add it\n"
+                "to your PATH or or call pypandoc.download_pandoc(...)"
+            )
 
     monkeypatch.setattr(
         document_routes, "get_loader", lambda *a, **kw: (_PandocMissingLoader(), True, "epub")
@@ -408,3 +419,62 @@ def test_missing_pandoc_still_tells_the_operator_what_to_install(client, monkeyp
         "the actionable missing-pandoc message no longer reaches the caller; "
         f"got {r.status_code}: {r.text}"
     )
+    # Permanent, not retryable: no amount of retrying installs pandoc.
+    assert r.status_code == 400, r.text
+
+
+def test_a_filename_cannot_disguise_our_outage_as_a_pandoc_problem(client, monkeypatch):
+    """The regression an independent review found in my own first version.
+
+    The pandoc check originally matched `"No pandoc was found" in str(link)` anywhere
+    in the cause chain. A save-path `OSError` carries the temp path in its message,
+    and that path is built from the UPLOADER'S FILENAME -- so naming a file
+    `No pandoc was found.txt` made a genuine, retryable storage outage answer
+    `400 install pandoc` on every route sharing this classifier. A retryable fault
+    turned permanent by a value the caller chooses.
+
+    This is the shared classifier, so the blast radius was /embed, /local/embed and
+    /embed-upload too, not just this route.
+    """
+    hostile = "No pandoc was found.txt"
+
+    def boom(documents, file_ext):
+        # The real shape: an OSError whose message embeds our temp path, which in turn
+        # embeds the caller's filename.
+        raise PermissionError(
+            13, f"Permission denied: '/tmp/uploads/tenantA/{hostile}'"
+        )
+
+    monkeypatch.setattr(document_routes, "extract_text_from_documents", boom)
+
+    r = _text(client, filename=hostile, content=b"x")
+
+    assert r.status_code == 503, (
+        "a caller-chosen filename turned our outage into a permanent failure; "
+        f"got {r.status_code}: {r.text}"
+    )
+    assert ERROR_MESSAGES.PANDOC_NOT_INSTALLED not in r.text
+    assert "not with your file" in r.text
+
+
+def test_an_unclassified_failure_stays_permanent_and_does_not_claim_it_is_temporary(
+    client, monkeypatch
+):
+    """The positive half of the attribution contract, which the first version of this
+    file left unpinned: a review mutation that answered 503 to EVERYTHING passed 14 of
+    15 tests. "Our side, safe to try again" for a file that is genuinely unreadable is
+    a retry loop that never ends, and it is the mirror image of the harm this lane
+    exists to fix.
+    """
+
+    def boom(documents, file_ext):
+        raise ValueError(f"unparseable structure {_MARKER}")
+
+    monkeypatch.setattr(document_routes, "extract_text_from_documents", boom)
+
+    r = _text(client)
+
+    assert r.status_code == 400, f"an unclassified failure must not be sold as transient: {r.text}"
+    assert "not with your file" not in r.text
+    assert "cause is not established" in r.text
+    assert _MARKER not in r.text
