@@ -55,3 +55,156 @@ jobs:
         with:
           name: test-results
           path: test-results.xml
+
+  # ===========================================================================
+  # FILES-01 F1 -- test the environment the production image actually ships.
+  #
+  # The job above proves things about Python 3.12. Nothing deployed runs 3.12:
+  # `Dockerfile` is `FROM python:3.10` and `Dockerfile.lite` is
+  # `FROM python:3.10-slim` (measured in the built image: 3.10.21). So every
+  # statement CI made about exception hierarchies, standard-library behaviour and
+  # dependency resolution was a statement about a runtime nobody deploys.
+  #
+  # That is not theoretical. KI-02 hit a real disagreement: a test asserting
+  # `asyncio.TimeoutError is not concurrent.futures.TimeoutError` is TRUE on 3.10
+  # and FALSE from 3.11, so it passed on the production-equivalent image and failed
+  # in CI. And the failure this whole lane exists for -- Excel never ingesting --
+  # was a dependency present in one environment and absent in another. This is the
+  # same shape one layer up: a `requirements` change can resolve cleanly on 3.12
+  # and differently on 3.10, and CI would be green.
+  #
+  # `Dockerfile.lite` is FIRST and is the one that matters most: `deploy/push.sh`
+  # builds *it* for ECR/ECS, so it is the runtime serving production. `Dockerfile`
+  # is also a shipped artifact (`images.yaml` publishes it to ghcr on every push to
+  # main), so both are gated.
+  #
+  # This job deliberately does NOT push an image, tag a release or roll a service.
+  # It builds, tests, and throws the image away.
+  # ===========================================================================
+  shipped-runtime:
+    name: Shipped runtime (${{ matrix.file }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - file: Dockerfile.lite
+            target: lite
+          - file: Dockerfile
+            target: main
+
+    steps:
+      # The full image is multi-gigabyte. `images.yaml` already needs this on the
+      # same runners, so it is the repo's established pattern rather than a new one.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Built from the SAME Dockerfile and the SAME requirements file the published
+      # image uses, so `pip` resolves here exactly as it resolves for production.
+      # `push: false` -- this gate never publishes anything.
+      - name: Build the shipped image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          push: false
+          load: true
+          tags: rag-api-shipped:ci
+          cache-from: type=gha,scope=shipped-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=shipped-${{ matrix.target }}
+
+      # Record what was actually tested, so a later reader does not have to trust
+      # this comment. If the base image moves, this line moves with it.
+      - name: Record the runtime under test
+        run: |
+          docker run --rm rag-api-shipped:ci python -c "import sys; print('python', sys.version)"
+          docker run --rm rag-api-shipped:ci python -c "import platform; print('platform', platform.platform())"
+
+      # Test dependencies only -- the application dependencies are already in the
+      # image, installed the way the image installs them. Adding them in a layer on
+      # top keeps the runtime under test byte-identical to what ships.
+      #
+      # `psycopg[binary]` is a TEST-HARNESS dependency, not an application one, and
+      # is deliberately not added to any requirements file. `pytest-postgresql`
+      # imports psycopg at collection time; psycopg needs libpq, and `python:3.10-slim`
+      # (the base of the image that actually serves production) does not carry it, so
+      # collection aborts before a single test runs. The binary wheel brings its own
+      # libpq into this throwaway layer. The application does not use psycopg -- it
+      # uses asyncpg and psycopg2-binary -- so the shipped image is unchanged and no
+      # production dependency is being smuggled in to make a test pass.
+      - name: Add test dependencies on top of the shipped image
+        run: |
+          docker build -t rag-api-shipped-test:ci - <<'DOCKERFILE'
+          FROM rag-api-shipped:ci
+          RUN pip install --no-cache-dir -r test_requirements.txt "psycopg[binary]"
+          DOCKERFILE
+
+      # A requirements grep or an import check is NOT proof of extraction. This runs
+      # real synthetic workbooks through the real loader inside the shipped image:
+      # multi-sheet extraction with per-sheet citations, cached vs uncached formulas,
+      # and the refusals -- password-protected, damaged container, empty workbook,
+      # and unsupported formats that must be named rather than read as prose.
+      # These suites are unconditional by construction: they fail loudly if
+      # msoffcrypto is ever dropped again, instead of skipping themselves the way the
+      # pre-SP-01.5 tests did when the dependency that broke production went missing.
+      - name: Prove real extraction and refusal in the shipped image
+        env:
+          JWT_SECRET: test_key
+          EMBEDDINGS_PROVIDER: bedrock
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          docker run --rm \
+            -e JWT_SECRET -e EMBEDDINGS_PROVIDER \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+            rag-api-shipped-test:ci \
+            python -m pytest tests/utils/test_xlsx_capability.py \
+                             tests/utils/test_unsupported_formats.py \
+                             tests/utils/test_parser_fitness.py \
+                             -p no:cacheprovider --disable-warnings -q
+
+      # User-visible exception BEHAVIOUR on the shipped runtime -- the status code and
+      # the sentence a caller receives -- not the identity of an exception class,
+      # which is exactly the version-specific detail that made a test straddle 3.10
+      # and 3.12. Retryable infrastructure failures must stay distinct from permanent
+      # content failures on the runtime that serves users.
+      - name: Run the full suite on the shipped runtime
+        env:
+          JWT_SECRET: test_key
+          EMBEDDINGS_PROVIDER: bedrock
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          mkdir -p artifacts
+          docker run --rm \
+            -e JWT_SECRET -e EMBEDDINGS_PROVIDER \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+            -v "${{ github.workspace }}/artifacts:/artifacts" \
+            rag-api-shipped-test:ci \
+            python -m pytest --maxfail=1 --disable-warnings \
+                             -p no:cacheprovider \
+                             --junitxml=/artifacts/test-results-${{ matrix.target }}.xml
+
+      - name: Upload shipped-runtime test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-shipped-${{ matrix.target }}
+          path: artifacts/test-results-${{ matrix.target }}.xml
