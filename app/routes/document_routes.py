@@ -340,8 +340,31 @@ def _is_pandoc_missing(error: BaseException) -> bool:
     but it is not TRANSIENT: no amount of retrying installs pandoc, and a 503 would tell Core's listener
     to retry forever a file that cannot work until an operator acts -- the same harm the DataError and
     ENAMETOOLONG corrections exist to prevent. The message carries the operator action instead.
+
+    HOW IT MATCHES, and why not the obvious way. An independent review broke the first version of this,
+    which was `"No pandoc was found" in str(link)` over the whole chain. That substring is
+    CALLER-INFLUENCEABLE: a save-path `OSError` carries the temp path in its message, and that path is
+    built by `_make_unique_temp_path` from the UPLOADER'S FILENAME. A file named
+    `No pandoc was found.txt` therefore made a genuine, retryable storage outage answer 400 "install
+    pandoc" -- turning a 503 into a permanent do-not-retry for every route sharing this classifier. That
+    is exactly the harm the DataError and ENAMETOOLONG corrections exist to prevent, re-opened by me.
+
+    So the match is pinned to what the library actually does, verified in the shipped image rather than
+    assumed: `pypandoc/__init__.py:802` raises `OSError("No pandoc was found: either install pandoc ...")`
+    -- the phrase is the START of the message. A user-controlled filename can only ever reach an OSError
+    message through the `[Errno N] strerror: 'path'` form, where it is never at position 0, so
+    `startswith` closes the injection. `isinstance(OSError)` narrows it further, and no code in `app/`
+    constructs a single-argument OSError from user input (checked).
+
+    NOTE for anyone tempted by the reviewer's other suggestion -- moving this check to run only when
+    `is_service_fault` is False. It looks safer and would SILENTLY BREAK THE REPAIR: pypandoc raises an
+    OSError, OSError is a service-fault type, so the real case would never reach the branch and the
+    actionable message would be lost again. Discriminate by type and position, not by order.
     """
-    return any("No pandoc was found" in str(link) for link in _causes(error))
+    return any(
+        isinstance(link, OSError) and str(link).startswith("No pandoc was found")
+        for link in _causes(error)
+    )
 
 
 def is_service_fault(error: BaseException) -> bool:
@@ -2027,7 +2050,9 @@ async def extract_text_from_file(
         )
         raise http_exc
     except Exception as e:
-        # FILES-01 F2 -- the last caller-facing `str(e)` on this lane's file-intake surface.
+        # FILES-01 F2 -- the last caller-facing `str(e)` on the /text intake path. (NOT the last in the
+        # file: /local/embed's else-branch still returns ERROR_MESSAGES.DEFAULT(e), which interpolates
+        # str(e) verbatim. That route is outside this increment; recorded, not silently absorbed.)
         #
         # `save_upload_file_async` (SP-01.13) and `load_file_content` (SP-01.10) now raise
         # `HTTPException` and are re-raised untouched above. Two calls in the `try` are behind neither
