@@ -517,3 +517,81 @@ def test_a_suppressed_context_does_not_hide_a_content_fault_in_the_CAUSE():
     with pytest.raises(HTTPException) as caught:
         drive(outage)
     assert caught.value.status_code == 400
+
+
+# ── SP-01.13 — the residual caller-facing str(e) sites on this lane's own upload/extract path ─────
+#
+# SP-01.10 fixed the embed handlers and named these three as scoped out. They echo str(e) to the caller:
+# a disk or permission failure while saving to OUR temp directory puts our temp path in the caller's
+# message. Routed through the same describe_failure -- a save failure is our storage (503); the /text
+# else-branch keeps its status but loses str(e). The pandoc special-case is preserved: it is honest and
+# actionable and must not be swept into the generic path.
+
+import app.routes.document_routes as dr
+
+
+import tempfile, os as _os
+_TMPDIR = tempfile.mkdtemp(prefix="ki02-sp0113-")
+TEMP = _os.path.join(_TMPDIR, "q4-forecast.xlsx")
+INTERNAL = "PERMISSION-DENIED-INTERNAL-DETAIL-9x7"
+
+
+class _FakeUpload:
+    def __init__(self, filename):
+        self.filename = filename
+
+    async def read(self, _n):
+        raise PermissionError(f"[Errno 13] Permission denied: '{TEMP}' {INTERNAL}")
+
+    @property
+    def file(self):
+        raise PermissionError(f"[Errno 13] Permission denied: '{TEMP}' {INTERNAL}")
+
+
+def _detail(exc):
+    d = exc.detail
+    return d if isinstance(d, str) else str(d.get("message", d))
+
+
+def test_async_save_failure_does_not_echo_our_path_or_exception():
+    import asyncio
+
+    up = _FakeUpload("q4-forecast.xlsx")
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(dr.save_upload_file_async(up, TEMP))
+    err = caught.value
+    # A save failure is our storage: ours, transient, retryable.
+    assert err.status_code == 503
+    text = _detail(err)
+    assert TEMP not in text
+    assert INTERNAL not in text
+    assert "Errno 13" not in text
+    assert "not with your file" in text  # a save failure is never the uploaded file's fault
+    assert "q4-forecast.xlsx" in text  # the caller still learns WHICH file
+
+
+def test_sync_save_failure_does_not_echo_our_path_or_exception():
+    up = _FakeUpload("q4-forecast.xlsx")
+    with pytest.raises(HTTPException) as caught:
+        dr.save_upload_file_sync(up, TEMP)
+    err = caught.value
+    assert err.status_code == 503
+    text = _detail(err)
+    assert TEMP not in text
+    assert INTERNAL not in text
+    assert "not with your file" in text
+
+
+def test_save_failure_carries_a_reference_to_the_log(caplog):
+    import asyncio
+    import logging
+
+    up = _FakeUpload("q4-forecast.xlsx")
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(dr.save_upload_file_async(up, TEMP))
+    text = _detail(caught.value)
+    assert "Reference:" in text
+    ref = text.split("Reference:")[1].strip().rstrip(".")
+    assert ref in caplog.text  # the operator can find the withheld detail
+    assert INTERNAL in caplog.text  # and the detail IS in the log, not discarded

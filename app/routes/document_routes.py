@@ -140,10 +140,11 @@ async def save_upload_file_async(file: UploadFile, temp_file_path: str) -> None:
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save the uploaded file. Error: {str(e)}",
-        )
+        # KI-02 SP-01.13 -- a save failure is OUR storage (our temp directory), so it is a service fault:
+        # 503, no str(e), no temp path. describe_failure logs the exception and traceback under a
+        # reference the caller is given. The path is still in the log line above for the operator.
+        status_code, message = describe_failure(e, getattr(file, "filename", None))
+        raise HTTPException(status_code=status_code, detail=message)
 
 
 def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
@@ -158,10 +159,9 @@ def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save the uploaded file. Error: {str(e)}",
-        )
+        # KI-02 SP-01.13 -- see save_upload_file_async.
+        status_code, message = describe_failure(e, getattr(file, "filename", None))
+        raise HTTPException(status_code=status_code, detail=message)
 
 
 def validate_file_path(base_dir: str, file_path: str) -> Optional[str]:
