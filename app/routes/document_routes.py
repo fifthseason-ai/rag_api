@@ -2281,5 +2281,10 @@ async def summarize_entity_files(
         # would have turned a fix into a new leak on a route that previously never saw those exceptions.
         # Same reviewed contract as every other intake path: attribution by status code, a sentence plus
         # a reference to the caller, the exception and traceback to the log.
-        status_code, message = describe_failure(e, file_id)
+        #
+        # `None`, not `file_id`: this route has no filename in scope, and passing the id put an
+        # internal identifier where the sentence says "filename" -- which would have told a user to
+        # "shorten the file name" of something that is not a name they chose. `describe_failure`
+        # falls back to "the uploaded file": vaguer, but not wrong.
+        status_code, message = describe_failure(e, None)
         raise HTTPException(status_code=status_code, detail=message) from e
