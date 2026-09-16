@@ -619,6 +619,10 @@ def test_a_too_long_filename_is_a_content_fault_not_a_retryable_outage():
     assert "not with your file" not in text  # it IS about the name
     assert "too long" in text.lower()  # and it says so, actionably
     assert "q4-forecast.xlsx" in text
+    # and it leaks nothing (review E): no temp path, no raw exception, no errno.
+    assert TEMP_PATH not in text
+    assert "Errno" not in text
+    assert "/tmp/" not in text
 
 
 def test_the_service_fault_classifier_does_not_call_ENAMETOOLONG_ours():
