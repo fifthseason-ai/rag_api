@@ -35,14 +35,26 @@ that COULD be ingested was reported as bad. Here, a file that was NOT ingested i
 reported as fine -- and it is worse, because a false failure is visible and a false
 success is not.
 
-The fix is at the shared source, not in three callers
-=====================================================
+The fix is at the shared source, not in the callers -- and my first attempt was wrong
+=====================================================================================
 Three consumers reading one producer's return value three different ways is the
 defect; patching each reader would leave the next caller free to get it wrong again.
-`store_data_in_vector_db` now returns `None` on failure, which makes every existing
-check correct at once -- `if result:`, `if not result:` and `"error" in result` all
-agree on a falsy value. The exception and traceback are still logged at the point of
-failure, so no diagnostic detail is lost.
+
+My first fix returned `None`. That killed the fake success but DISCARDED THE
+EXCEPTION, so an outage and a PERMANENT content fault became indistinguishable --
+both a flat 500. `describe_failure` classifies a driver's `DataError` as content
+precisely because the value being written here is text extracted from the upload,
+and it is reachable: `clean_text` only runs when `clean_content` is True (PDF-only),
+so a NUL byte in a non-PDF extraction reaches pgvector. Under the `None` fix that
+permanent fault was answered 5xx, so a listener keying retry on 5xx would retry
+forever a file that can never store. That harm was STRICTLY NEW.
+
+`store_data_in_vector_db` now RAISES. There is no sentinel value for a caller to
+interpret, so `if result:`, `if not result:` and `"error" in result` are all moot,
+and every caller already owns `except Exception -> describe_failure` -- the same seam
+the loader path uses. An outage becomes a retryable 503 that exonerates the file; a
+content fault stays a permanent 400. The exception and traceback are logged at the
+point of failure before it leaves.
 
 Everything here is synthetic: the store is simulated and made to fail; no client
 content, no network, no database.
@@ -63,6 +75,31 @@ from app.services.vector_store.async_pg_vector import AsyncPgVector
 
 _SECRET = "test_key"
 _OUTAGE = "pgvector connection refused FILES01-STORE-OUTAGE"
+
+
+class _DriverDataError(Exception):
+    """A DataError as a REAL driver raises it, and the distinction is load-bearing.
+
+    Re-review MAJOR-1: the first version of the content-fault test below defined its
+    DataError locally, so the class's `__module__` was this test module. `psycopg2`
+    and `sqlalchemy` are in `_SERVICE_FAULT_MODULE_ROOTS`, this module is not — so a
+    locally-defined DataError reached 400 through the "cause not established" branch
+    whether or not `is_service_fault` matched the NAME. Deleting `"DataError"` from
+    `_CONTENT_FAULT_TYPE_NAMES` left that test green: a guard that stays green with
+    its own mechanism removed.
+
+    Spoofing `__module__` to a service root is what makes the test load-bearing. With
+    the name-match present the exception is content (permanent 400); with it removed
+    the module root wins and it becomes a retryable 503 — so the test goes red, which
+    is the only thing that makes it evidence.
+    """
+
+    __module__ = "psycopg2.errors"
+
+
+_driver_data_error = type(
+    "DataError", (_DriverDataError,), {"__module__": "psycopg2.errors"}
+)
 
 
 def _hdr(ent, act, tid="tenantA", uid="testuser"):
@@ -294,12 +331,8 @@ def test_a_permanent_content_fault_is_not_retried_forever(client, monkeypatch):
     never store, however many times it tries -- the exact mirror of the outage harm.
     """
 
-    class DataError(Exception):
-        """Shaped like psycopg2/sqlalchemy's, which describe_failure matches by NAME
-        because every DB driver spells it the same way (PEP 249)."""
-
     async def boom(self, docs, ids=None, executor=None):
-        raise DataError("invalid byte sequence for encoding UTF8: 0x00")
+        raise _driver_data_error("invalid byte sequence for encoding UTF8: 0x00")
 
     monkeypatch.setattr(AsyncPgVector, "aadd_documents", boom)
 
@@ -413,3 +446,90 @@ def test_local_embed_filename_cannot_disguise_our_outage_as_pandoc(
 
     assert r.status_code == 503, f"got {r.status_code}: {r.text}"
     assert ERROR_MESSAGES.PANDOC_NOT_INSTALLED not in r.text
+
+
+# ===========================================================================
+# /summarize -- the fourth caller. Re-review MAJOR-2: reverting its handler to
+# `str(e)` survived the entire suite, because nothing posted to this route at all.
+# ===========================================================================
+
+_SUMMARY_MARKER = "FILES01-SUMMARY-MARKER-77c1"
+
+
+@pytest.fixture()
+def summarize_ready(monkeypatch):
+    """Get a request far enough into /summarize to reach the store call.
+
+    Everything stubbed here is upstream of the thing under test: an LLM, the cached
+    summary lookup, the grouped-document read and the summary persistence. The store
+    itself is NOT stubbed -- it fails through the real `store_data_in_vector_db`, so
+    what is being asserted is how the route attributes a propagated store failure.
+    """
+    from langchain_core.documents import Document as LCDocument
+
+    monkeypatch.setattr(document_routes, "llm", object(), raising=False)
+
+    async def no_cached(user_id):
+        return []
+
+    async def grouped(*a, **kw):
+        return {"file-1": [LCDocument(page_content="body", metadata={})]}
+
+    def summarize(llm_instance, files):
+        return [{"file_id": "file-1", "summary": "a summary", "chunk_count": 1}]
+
+    async def upsert(*a, **kw):
+        return None
+
+    monkeypatch.setattr(document_routes, "get_summaries_by_user", no_cached, raising=False)
+    monkeypatch.setattr(document_routes, "summarize_files", summarize, raising=False)
+    monkeypatch.setattr(document_routes, "upsert_file_summary", upsert, raising=False)
+    monkeypatch.setattr(
+        AsyncPgVector, "get_documents_grouped_by_file_id", grouped, raising=False
+    )
+
+
+def _summarize(client, entity="userA"):
+    return client.post(
+        f"/summarize/{entity}",
+        data={"file_id": "sumfile", "knowledge_id": entity},
+        headers=_write_hdr(entity),
+    )
+
+
+def test_summarize_attributes_a_store_outage_as_retryable(
+    client, monkeypatch, summarize_ready
+):
+    """`/summarize` is the fourth caller of the producer. Propagation made its outer
+    handler reachable for store failures for the first time, so its attribution needs
+    the same proof as the other three."""
+
+    async def boom(self, docs, ids=None, executor=None):
+        raise ConnectionError(f"{_OUTAGE} {_SUMMARY_MARKER}")
+
+    monkeypatch.setattr(AsyncPgVector, "aadd_documents", boom)
+
+    r = _summarize(client)
+
+    assert r.status_code == 503, f"got {r.status_code}: {r.text}"
+    assert "not with your file" in r.text
+    assert _SUMMARY_MARKER not in r.text, f"the raw exception reached the caller: {r.text}"
+    assert _OUTAGE not in r.text
+
+
+def test_summarize_does_not_echo_the_exception_to_the_caller(
+    client, monkeypatch, summarize_ready
+):
+    """The specific regression the re-review found unprotected: this handler used to
+    be `raise HTTPException(500, detail=str(e))`. Reverting it must go red."""
+
+    async def boom(self, docs, ids=None, executor=None):
+        raise ValueError(f"internal detail /tmp/uploads/tenantA/x {_SUMMARY_MARKER}")
+
+    monkeypatch.setattr(AsyncPgVector, "aadd_documents", boom)
+
+    r = _summarize(client)
+
+    assert _SUMMARY_MARKER not in r.text, f"the raw exception reached the caller: {r.text}"
+    assert "/tmp/uploads" not in r.text
+    assert r.status_code == 400, f"got {r.status_code}: {r.text}"
