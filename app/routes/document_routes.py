@@ -1,5 +1,6 @@
 # app/routes/document_routes.py
 import os
+import errno
 import uuid
 from pathlib import Path
 import hashlib
@@ -140,10 +141,11 @@ async def save_upload_file_async(file: UploadFile, temp_file_path: str) -> None:
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save the uploaded file. Error: {str(e)}",
-        )
+        # KI-02 SP-01.13 -- a save failure is OUR storage (our temp directory), so it is a service fault:
+        # 503, no str(e), no temp path. describe_failure logs the exception and traceback under a
+        # reference the caller is given. The path is still in the log line above for the operator.
+        status_code, message = describe_failure(e, getattr(file, "filename", None))
+        raise HTTPException(status_code=status_code, detail=message)
 
 
 def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
@@ -158,10 +160,9 @@ def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save the uploaded file. Error: {str(e)}",
-        )
+        # KI-02 SP-01.13 -- see save_upload_file_async.
+        status_code, message = describe_failure(e, getattr(file, "filename", None))
+        raise HTTPException(status_code=status_code, detail=message)
 
 
 def validate_file_path(base_dir: str, file_path: str) -> Optional[str]:
@@ -189,6 +190,213 @@ def _make_unique_temp_path(user_id: str, filename: str) -> Optional[str]:
     p = Path(filename)
     unique_name = f"{p.stem}_{uuid.uuid4().hex}{p.suffix}"
     return str(Path(RAG_UPLOAD_DIR, user_id, unique_name).resolve())
+
+
+# ── KI-02 SP-01.10 — honest failure attribution ───────────────────────────────────────────────────
+#
+# SP-01.5 fixed the production Excel failure by pinning `msoffcrypto-tool`. That fixed the INSTANCE.
+# The CLASS was this: a dependency missing from OUR image surfaced as
+#
+#     400 "Error during file processing: No module named 'msoffcrypto'"
+#
+# — our fault, reported to the uploader as their file's fault, over a status code that means "your
+# request is bad, do not retry", so Core's listener recorded those files as failed instead of retrying
+# them once the image was fixed. Reproduced against this seam for a missing dependency, an
+# out-of-memory, and a parser error that echoed our internal temp path back to the caller.
+#
+# These types are unambiguously OURS. Nothing about the uploaded bytes can cause them:
+#   * ImportError        — includes ModuleNotFoundError: our image is missing a package.
+#   * MemoryError        — our process, our limits.
+#   * OSError            — includes ConnectionError, TimeoutError, PermissionError, FileNotFoundError
+#                          and "no space left on device". The file we would be reading is one WE just
+#                          wrote to OUR temp directory, so an OS-level failure on it is our storage,
+#                          never the uploader's content.
+#   * RecursionError     — our parser, not their document.
+# `asyncio.TimeoutError` is listed separately because on Python 3.10 it is NOT an OSError subclass.
+#
+# Everything else is left at its existing status ON PURPOSE. There is no evidence for a different code,
+# and changing it would silently change retry behaviour for every consumer. What changes is that the
+# caller stops receiving our exception text and is told plainly that the cause is not established.
+_SERVICE_FAULT_TYPES = (
+    ImportError,
+    MemoryError,
+    OSError,
+    RecursionError,
+    asyncio.TimeoutError,
+)
+
+
+# SP-01.10b, after independent review checked the class hierarchy instead of assuming it. The typed set
+# above was both too narrow and too wide.
+#
+# TOO NARROW, and this is the part that mattered: psycopg2.OperationalError,
+# sqlalchemy.exc.OperationalError, httpx.ConnectError, redis.ConnectionError and botocore's connection
+# errors are NOT OSError subclasses. A vector-DB or embeddings-API outage therefore landed on the
+# non-retryable 400 path -- the exact production harm this correction exists to close, left open for its
+# most likely cause. Exceptions from these libraries are always about REACHING something; none of them
+# parses a document, so none can be provoked by the uploaded bytes.
+#
+# Detection is by MODULE, not by type, on purpose: this file must not import a driver the image may not
+# carry, and a driver upgrade that renames a class must not silently reopen the hole.
+_SERVICE_FAULT_MODULE_ROOTS = frozenset(
+    {
+        "psycopg2",
+        "psycopg",
+        "asyncpg",
+        "sqlalchemy",
+        "redis",
+        "httpx",
+        "httpcore",
+        "urllib3",
+        "requests",
+        "aiohttp",
+        "botocore",
+        "boto3",
+        # config.py supports these embeddings providers too; production uses bedrock (botocore).
+        "openai",
+        "google",
+        "ollama",
+    }
+)
+
+# TOO WIDE: PIL.UnidentifiedImageError IS an OSError and is a statement about CONTENT -- a document
+# parser reaches it through embedded media. Excusing it as retryable would retry, forever, a file that
+# can never work. Checked BEFORE the typed set so inheritance cannot override the specific knowledge.
+_CONTENT_FAULT_MODULE_ROOTS = frozenset({"PIL"})
+
+
+# SP-01.10c, after re-review found the module-root set TOO BROAD. A DB driver raises BOTH kinds of
+# error: an outage (OperationalError -- ours, transient) and a complaint about the VALUE being written
+# (DataError -- permanent, and in this service that value is text extracted from the uploaded file: a NUL
+# byte, an invalid UTF-8 sequence, an over-length field). Module root cannot tell them apart, so 10b
+# promoted DataError to a retryable 503 and would retry, forever, a file that can never work -- the PIL
+# bug-shape arriving through psycopg2. Denied by CLASS NAME because every DB driver spells these the
+# same way (PEP 249) and this file imports none of them.
+_CONTENT_FAULT_TYPE_NAMES = frozenset(
+    {
+        "DataError",
+        "IntegrityError",
+        "UnidentifiedImageError",
+    }
+)
+
+# Bounded so a self-referential chain cannot hang a request.
+_CAUSE_CHAIN_LIMIT = 10
+
+
+def _causes(error: BaseException):
+    """The exception and its __cause__/__context__ chain, each link once, bounded.
+
+    langchain wraps provider calls in tenacity, so a real outage can arrive as a RetryError whose cause
+    is the httpx/botocore error that actually happened. Reading only the top exception's module missed
+    every one of those.
+    """
+    seen, queue, out = set(), [error], []
+    while queue and len(out) < _CAUSE_CHAIN_LIMIT:
+        current = queue.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        out.append(current)
+        # `raise X from None` sets __suppress_context__: the author has said explicitly that whatever was
+        # being handled is INCIDENTAL. Python's own traceback machinery hides a suppressed context, and
+        # this must mirror it -- otherwise a genuine transient outage raised while some unrelated content
+        # error happened to be in flight is marked permanent, which is the laundering problem running in
+        # reverse and costs a file that would have worked. An explicit __cause__ is never suppressed.
+        queue.append(current.__cause__)
+        if not getattr(current, "__suppress_context__", False):
+            queue.append(current.__context__)
+    return out
+
+
+def _is_name_too_long(error: BaseException) -> bool:
+    """Whether any link in the chain is an ENAMETOOLONG. SP-01.15: the temp path is built from the user's
+    filename, so a name too long for the filesystem is a permanent CONTENT fault -- it fails identically
+    forever, so it must never be a retryable 503. Whether the length is the user's filename or our temp
+    directory cannot be told from the errno, but 503 "retry, it's us" is wrong either way; the actionable
+    half a caller can act on is the filename, so the message names it."""
+    return any(
+        isinstance(link, OSError) and link.errno == errno.ENAMETOOLONG
+        for link in _causes(error)
+    )
+
+
+def is_service_fault(error: BaseException) -> bool:
+    """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
+    ourselves -- but never accuse the file either (see `describe_failure`).
+
+    CONTENT WINS OVER THE WHOLE CHAIN, and is checked first. A permanent content fault wrapped in a
+    retry must not be laundered into a transient one; that would retry forever a file that can never
+    work, which is the opposite harm to the one this correction exists to fix but no less wrong.
+    """
+    if _is_name_too_long(error):
+        return False
+    chain = _causes(error)
+    for link in chain:
+        root = (type(link).__module__ or "").split(".")[0]
+        if root in _CONTENT_FAULT_MODULE_ROOTS or type(link).__name__ in _CONTENT_FAULT_TYPE_NAMES:
+            return False
+    for link in chain:
+        root = (type(link).__module__ or "").split(".")[0]
+        if isinstance(link, _SERVICE_FAULT_TYPES) or root in _SERVICE_FAULT_MODULE_ROOTS:
+            return True
+    return False
+
+
+def describe_failure(error: BaseException, filename: str) -> tuple:
+    """Turn a non-verdict failure into `(status_code, caller_message)` and log the real detail.
+
+    The caller gets a sentence and a reference. The operator gets the exception, its type and the
+    traceback under that same reference. Withholding internals is only acceptable because the reference
+    makes them findable — a test asserts the reference actually reaches the log.
+
+    `detail` is deliberately a plain STRING on these paths. Core's direct-upload consumer interpolates
+    `detail` straight into the user's toast (`crud.js:341`), so an object renders there as
+    `[object Object]` — a live defect this lane found and recorded. The machine-readable half is the
+    STATUS CODE, which every consumer already reads; the human half is the sentence. Neither needs the
+    other to be fixed first.
+    """
+    reference = uuid.uuid4().hex[:12]
+    name = filename or "the uploaded file"
+    if _is_name_too_long(error):
+        # SP-01.15 -- we know exactly what is wrong here, so say it instead of "cause not established".
+        logger.error(
+            "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+            reference,
+            name,
+            "content:name_too_long",
+            type(error).__name__,
+            error,
+            traceback.format_exc(),
+        )
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            f"'{name}' could not be saved because the file name is too long. Shorten it and upload "
+            f"again. Reference: {reference}.",
+        )
+    service = is_service_fault(error)
+    if service:
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        message = (
+            f"'{name}' could not be processed because of a problem on our side, "
+            f"not with your file. It is safe to try again. Reference: {reference}."
+        )
+    else:
+        status_code = status.HTTP_400_BAD_REQUEST
+        message = (
+            f"'{name}' could not be read. The cause is not established \u2014 it may be the file "
+            f"or this service. Reference: {reference}."
+        )
+    logger.error(
+        "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+        reference,
+        name,
+        "service" if service else "undetermined",
+        type(error).__name__,
+        error,
+        traceback.format_exc(),
+    )
+    return status_code, message
 
 
 async def load_file_content(
@@ -237,6 +445,15 @@ async def load_file_content(
                 },
             },
         ) from verdict_error
+    except HTTPException:
+        # Already an honest, deliberate answer (e.g. raised by `get_loader`). Never re-wrap it.
+        raise
+    except Exception as error:
+        # KI-02 SP-01.10 — anything that is not a terminal verdict about the FILE. The uploader is never
+        # told their file is bad on the strength of an exception we have not classified, and never
+        # receives `str(error)`.
+        status_code, message = describe_failure(error, filename)
+        raise HTTPException(status_code=status_code, detail=message) from error
     finally:
         # Clean up temporary UTF-8 file if it was created for encoding conversion
         if loader is not None:
@@ -1515,17 +1732,14 @@ async def embed_file(
         )
         raise http_exc
     except Exception as e:
+        # KI-02 SP-01.10 — same attribution the loader seam uses, for failures that happen OUTSIDE
+        # loading (vector-store writes, storage). A connection error to the vector DB is our fault and
+        # is ours -- and SP-01.10b is what actually makes that true: psycopg2 and sqlalchemy
+        # errors are not OSError subclasses, so until module-based detection existed this comment
+        # described an intention the code did not implement. The raw exception stays in the log.
         response_status = False
-        response_message = f"Error during file processing: {str(e)}"
-        logger.error(
-            "Error during file processing: %s\nTraceback: %s",
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error during file processing: {str(e)}",
-        )
+        status_code, response_message = describe_failure(e, getattr(file, "filename", None))
+        raise HTTPException(status_code=status_code, detail=response_message)
     finally:
         await cleanup_temp_file_async(validated_file_path)
 
@@ -1651,16 +1865,10 @@ async def embed_file_upload(
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error during file processing | File: %s | Error: %s | Traceback: %s",
-            uploaded_file.filename,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error during file processing: {str(e)}",
-        )
+        # KI-02 SP-01.10 — see `describe_failure`. Attribution by status code, sentence to the caller,
+        # exception and traceback to the log under a shared reference.
+        status_code, message = describe_failure(e, uploaded_file.filename)
+        raise HTTPException(status_code=status_code, detail=message)
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
 
