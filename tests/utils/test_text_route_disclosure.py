@@ -478,3 +478,29 @@ def test_an_unclassified_failure_stays_permanent_and_does_not_claim_it_is_tempor
     assert "not with your file" not in r.text
     assert "cause is not established" in r.text
     assert _MARKER not in r.text
+
+
+def test_only_an_oserror_can_be_a_missing_pandoc(client, monkeypatch):
+    """Pin the `isinstance(link, OSError)` half of the pandoc match.
+
+    Re-review NOTE-1: dropping that conjunct and keeping only
+    `str(link).startswith(...)` SURVIVED all 17 tests. No reachable non-OSError whose
+    message starts with the phrase was found, so it is defence in depth rather than a
+    live hole -- but an unpinned guard is one refactor away from being deleted as
+    redundant, and this lane's own rule is to test the tests.
+
+    A non-OSError carrying the phrase must fall through to ordinary classification,
+    never to the operator-action answer.
+    """
+
+    def boom(documents, file_ext):
+        raise RuntimeError("No pandoc was found: either install pandoc and add it")
+
+    monkeypatch.setattr(document_routes, "extract_text_from_documents", boom)
+
+    r = _text(client)
+
+    assert ERROR_MESSAGES.PANDOC_NOT_INSTALLED not in r.text, (
+        "a non-OSError was accepted as a missing-pandoc install; the isinstance "
+        f"guard is not doing its job. got {r.status_code}: {r.text}"
+    )
