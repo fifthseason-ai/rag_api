@@ -596,3 +596,44 @@ def test_save_failure_carries_a_reference_to_the_log(caplog):
     ref = text.split("Reference:")[1].strip().rstrip(".")
     assert ref in caplog.text  # the operator can find the withheld detail
     assert INTERNAL in caplog.text  # and the detail IS in the log, not discarded
+
+
+# ── SP-01.15 — a filename too long for the filesystem is the name, not our outage ─────────────────
+#
+# SP-01.13 review found it: the temp path is built from the user's filename (_make_unique_temp_path =
+# {stem}_{32hex}{suffix}), so a ~250-char filename makes the save open() raise ENAMETOOLONG (an OSError).
+# is_service_fault mapped every OSError to a retryable 503, so this became "safe to try again" for a file
+# that fails identically forever -- the same "retry a file that can never work" shape as DataError/PIL.
+# ENAMETOOLONG is now a content fault with an honest, actionable message, and never a retryable 503.
+
+import errno as _errno
+
+
+def test_a_too_long_filename_is_a_content_fault_not_a_retryable_outage():
+    exc = OSError(_errno.ENAMETOOLONG, "File name too long")
+    with pytest.raises(HTTPException) as caught:
+        drive(exc)
+    err = caught.value
+    assert err.status_code == 400, "a name too long fails identically forever -- never a retryable 503"
+    text = detail_text(err)
+    assert "not with your file" not in text  # it IS about the name
+    assert "too long" in text.lower()  # and it says so, actionably
+    assert "q4-forecast.xlsx" in text
+
+
+def test_the_service_fault_classifier_does_not_call_ENAMETOOLONG_ours():
+    import app.routes.document_routes as dr
+
+    assert dr.is_service_fault(OSError(_errno.ENAMETOOLONG, "File name too long")) is False
+    # A DIFFERENT OSError (disk full) is still ours.
+    assert dr.is_service_fault(OSError(_errno.ENOSPC, "No space left on device")) is True
+
+
+def test_ENAMETOOLONG_wins_across_a_wrapper_too():
+    inner = OSError(_errno.ENAMETOOLONG, "File name too long")
+    outer = RuntimeError("save failed")
+    outer.__cause__ = inner
+    with pytest.raises(HTTPException) as caught:
+        drive(outer)
+    assert caught.value.status_code == 400
+    assert "too long" in detail_text(caught.value).lower()

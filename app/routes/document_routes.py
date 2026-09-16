@@ -1,5 +1,6 @@
 # app/routes/document_routes.py
 import os
+import errno
 import uuid
 from pathlib import Path
 import hashlib
@@ -308,6 +309,18 @@ def _causes(error: BaseException):
     return out
 
 
+def _is_name_too_long(error: BaseException) -> bool:
+    """Whether any link in the chain is an ENAMETOOLONG. SP-01.15: the temp path is built from the user's
+    filename, so a name too long for the filesystem is a permanent CONTENT fault -- it fails identically
+    forever, so it must never be a retryable 503. Whether the length is the user's filename or our temp
+    directory cannot be told from the errno, but 503 "retry, it's us" is wrong either way; the actionable
+    half a caller can act on is the filename, so the message names it."""
+    return any(
+        isinstance(link, OSError) and link.errno == errno.ENAMETOOLONG
+        for link in _causes(error)
+    )
+
+
 def is_service_fault(error: BaseException) -> bool:
     """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
     ourselves -- but never accuse the file either (see `describe_failure`).
@@ -316,6 +329,8 @@ def is_service_fault(error: BaseException) -> bool:
     retry must not be laundered into a transient one; that would retry forever a file that can never
     work, which is the opposite harm to the one this correction exists to fix but no less wrong.
     """
+    if _is_name_too_long(error):
+        return False
     chain = _causes(error)
     for link in chain:
         root = (type(link).__module__ or "").split(".")[0]
@@ -343,6 +358,22 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
     """
     reference = uuid.uuid4().hex[:12]
     name = filename or "the uploaded file"
+    if _is_name_too_long(error):
+        # SP-01.15 -- we know exactly what is wrong here, so say it instead of "cause not established".
+        logger.error(
+            "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+            reference,
+            name,
+            "content:name_too_long",
+            type(error).__name__,
+            error,
+            traceback.format_exc(),
+        )
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            f"'{name}' could not be saved because the file name is too long. Shorten it and upload "
+            f"again. Reference: {reference}.",
+        )
     service = is_service_fault(error)
     if service:
         status_code = status.HTTP_503_SERVICE_UNAVAILABLE
