@@ -179,8 +179,10 @@ def test_embed_does_not_report_success_when_the_store_failed(client, failing_sto
         f"body={r.text}"
     )
     assert '"status":true' not in r.text.replace(" ", "").lower()
-    # Our outage, not the file's fault -- so it must be retryable once the store is back.
-    assert r.status_code >= 500, f"an outage must not be permanent: {r.status_code} {r.text}"
+    # Review note: asserting only ">= 500" passed equally for a flat, unclassified 500 and for the
+    # correct attributed answer, so it pinned nothing that matters. Pin the attribution itself.
+    assert r.status_code == 503, f"an outage must be retryable and attributed: {r.status_code} {r.text}"
+    assert "not with your file" in r.text
     assert _OUTAGE not in r.text, "the raw exception reached the caller"
 
 
@@ -193,7 +195,8 @@ def test_embed_upload_does_not_report_success_when_the_store_failed(
         "a vector-store outage was reported to the caller as a successful ingest; "
         f"body={r.text}"
     )
-    assert r.status_code >= 500, f"an outage must not be permanent: {r.status_code} {r.text}"
+    assert r.status_code == 503, f"an outage must be retryable and attributed: {r.status_code} {r.text}"
+    assert "not with your file" in r.text
     assert _OUTAGE not in r.text
 
 
@@ -211,6 +214,8 @@ def test_local_embed_does_not_report_success_when_the_store_failed(
     body = r.text
     assert '"status":true' not in body.replace(" ", "").lower()
     assert _OUTAGE not in body
+    assert r.status_code == 503, f"an outage must be retryable and attributed: {r.status_code} {body}"
+    assert "not with your file" in body
 
 
 # ===========================================================================
@@ -249,14 +254,18 @@ def test_local_embed_still_succeeds_when_the_store_works(
 
 
 @pytest.mark.asyncio
-async def test_store_returns_falsy_on_failure_so_no_caller_can_misread_it(
-    monkeypatch,
-):
-    """The root cause, stated as an invariant.
+async def test_store_propagates_failure_so_the_caller_can_attribute_it(monkeypatch):
+    """The root cause, stated as an invariant -- and CORRECTED after review.
 
     Failure used to be a TRUTHY dict carrying an "error" key, which is why three
-    callers checking `if result:` / `if not result:` all got it wrong. Any falsy
-    value makes every one of those checks correct simultaneously.
+    callers checking `if result:` / `if not result:` all got it wrong.
+
+    My first fix returned None. That killed the fake success but traded one harm for
+    another: swallowing the exception left every store failure indistinguishable, so
+    an outage and a PERMANENT content fault both became a flat 500 -- and a listener
+    keying retry on 5xx would retry forever a file that can never store. Propagating
+    is the version that cannot be misread at all: there is no sentinel for a caller to
+    interpret, and every caller already has `except Exception -> describe_failure`.
     """
 
     async def boom(self, docs, ids=None, executor=None):
@@ -264,17 +273,44 @@ async def test_store_returns_falsy_on_failure_so_no_caller_can_misread_it(
 
     monkeypatch.setattr(AsyncPgVector, "aadd_documents", boom)
 
-    result = await document_routes.store_data_in_vector_db(
-        data=[document_routes.Document(page_content="x", metadata={})],
-        file_id="f",
-        user_id="u",
-        executor=None,
-    )
+    with pytest.raises(ConnectionError):
+        await document_routes.store_data_in_vector_db(
+            data=[document_routes.Document(page_content="x", metadata={})],
+            file_id="f",
+            user_id="u",
+            executor=None,
+        )
 
-    assert not result, (
-        "failure must be falsy: a truthy failure value is what let `if result:` and "
-        f"`if not result:` both report success. got {result!r}"
+
+def test_a_permanent_content_fault_is_not_retried_forever(client, monkeypatch):
+    """The harm my own first fix introduced, now pinned.
+
+    `describe_failure` classifies a DB driver's `DataError` as CONTENT, not service,
+    because the value being written here is text extracted from the upload. It is
+    reachable: `clean_text` only runs when `clean_content` is True, which is
+    PDF-only, so a NUL byte in a non-PDF extraction reaches pgvector unmodified.
+
+    Collapsing that to a generic 5xx tells Core's listener to retry a file that can
+    never store, however many times it tries -- the exact mirror of the outage harm.
+    """
+
+    class DataError(Exception):
+        """Shaped like psycopg2/sqlalchemy's, which describe_failure matches by NAME
+        because every DB driver spells it the same way (PEP 249)."""
+
+    async def boom(self, docs, ids=None, executor=None):
+        raise DataError("invalid byte sequence for encoding UTF8: 0x00")
+
+    monkeypatch.setattr(AsyncPgVector, "aadd_documents", boom)
+
+    r = _embed(client)
+
+    assert r.status_code == 400, (
+        "a permanent content fault was answered with a retryable status; a listener "
+        f"keying retry on 5xx will retry it forever. got {r.status_code}: {r.text}"
     )
+    assert "not with your file" not in r.text
+    assert "0x00" not in r.text
 
 
 @pytest.mark.asyncio

@@ -1556,7 +1556,7 @@ async def store_data_in_vector_db(
             str(e),
             traceback.format_exc(),
         )
-        # FILES-01 F3 -- failure is FALSY, and that is the whole point.
+        # FILES-01 F3 -- PROPAGATE, so the caller can attribute the failure.
         #
         # This used to return {"message": "An error occurred...", "error": str(e)}. Both that and the
         # success value are truthy dicts, so the four callers each invented their own way to read it
@@ -1567,13 +1567,23 @@ async def store_data_in_vector_db(
         #     /embed         has an `if "error" in result` check, but sets response_message = the RAW
         #                    exception and falls through to the 200 success return
         # A vector-store outage was therefore reported to the uploader and to Core as a successful
-        # ingest with zero rows written -- and on /embed it also handed the caller str(e), the exact
-        # disclosure closed everywhere else on this surface.
+        # ingest with zero rows written -- and on /embed it also handed the caller str(e).
         #
-        # Returning None makes `if result:`, `if not result:` and `"error" in result` agree at once, so
-        # the fix lands at the shared producer instead of in three consumers that could each drift
-        # again. Nothing is lost: the exception and traceback are logged right here, where they happen.
-        return None
+        # My first fix returned None. That killed the fake success, but an independent review showed it
+        # traded one harm for another: swallowing the exception left every store failure indistinguishable,
+        # so an outage and a PERMANENT content fault both became a flat 500. `describe_failure` classifies
+        # a psycopg2/sqlalchemy DataError as content (`_CONTENT_FAULT_TYPE_NAMES`) precisely because the
+        # value being written is text extracted from the upload -- a NUL byte in a non-PDF extraction
+        # reaches pgvector unmodified, since `clean_text` only runs when clean_content is True. Under the
+        # None fix that permanent fault was answered 5xx, so a listener keying retry on 5xx would retry
+        # forever a file that can never store. I introduced that; this corrects it.
+        #
+        # Raising is also the fix that cannot be misread: there is no sentinel value for a caller to
+        # interpret, so `if result:` / `if not result:` / `"error" in result` are all moot. Every caller
+        # already has `except Exception -> describe_failure`, the same seam the loader path uses, so an
+        # outage becomes a retryable 503 that exonerates the file and a content fault stays a permanent
+        # 400. The exception and traceback are logged here, where they happen, before it leaves.
+        raise
 
 
 @router.post("/local/embed")
@@ -1637,9 +1647,13 @@ async def embed_local_file(
                 "extraction": extraction_receipt,
             }
         else:
+            # Defensive only: `store_data_in_vector_db` now raises rather than returning a falsy
+            # sentinel, so a store failure cannot reach here. Kept as a guard, and given the same
+            # message its sibling routes use instead of the generic "Something went wrong :/" --
+            # a string this lane's own tests forbid on the attributed path.
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=ERROR_MESSAGES.DEFAULT(),
+                detail="Failed to process/store the file data.",
             )
     except HTTPException as http_exc:
         logger.error(
@@ -2262,4 +2276,10 @@ async def summarize_entity_files(
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        # FILES-01 F3 -- this handler became REACHABLE for store failures when
+        # `store_data_in_vector_db` started propagating instead of swallowing, so leaving `str(e)` here
+        # would have turned a fix into a new leak on a route that previously never saw those exceptions.
+        # Same reviewed contract as every other intake path: attribution by status code, a sentence plus
+        # a reference to the caller, the exception and traceback to the log.
+        status_code, message = describe_failure(e, file_id)
+        raise HTTPException(status_code=status_code, detail=message) from e
