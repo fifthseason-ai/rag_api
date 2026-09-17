@@ -46,14 +46,41 @@ _SECRET = "test_key"
 PDF = "application/pdf"
 
 
-def _pdf(user_password=None, owner_password=None, pages=1, text_hint=None):
-    """A real PDF built by pypdf. `text_hint` is unused for blank pages but keeps the
-    intent readable at the call site."""
+#: Real extractable text, so "it still works" can mean CONTENT FLOWED rather than merely
+#: "it was not refused". Review caught the first version of this file asserting the weaker
+#: thing against a blank page.
+OWNER_TEXT_MARKER = "FS-OWNERPW-ROWTEXT-12345"
+
+
+def _pdf(user_password=None, owner_password=None, pages=1, text=None):
+    """A real PDF built by pypdf, optionally carrying real extractable text."""
     from pypdf import PdfWriter
 
     w = PdfWriter()
-    for _ in range(pages):
-        w.add_blank_page(width=200, height=200)
+    if text:
+        # reportlab is not a dependency; build a text-bearing page with pypdf itself by
+        # writing a minimal content stream.
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+        page = w.add_blank_page(width=300, height=200)
+        stream = DecodedStreamObject()
+        stream.set_data(f"BT /F1 12 Tf 20 100 Td ({text}) Tj ET".encode("latin-1"))
+        page[NameObject("/Contents")] = w._add_object(stream)
+
+        font = DictionaryObject()
+        font[NameObject("/Type")] = NameObject("/Font")
+        font[NameObject("/Subtype")] = NameObject("/Type1")
+        font[NameObject("/BaseFont")] = NameObject("/Helvetica")
+        font_ref = w._add_object(font)
+
+        fonts = DictionaryObject()
+        fonts[NameObject("/F1")] = font_ref
+        resources = DictionaryObject()
+        resources[NameObject("/Font")] = fonts
+        page[NameObject("/Resources")] = resources
+    else:
+        for _ in range(pages):
+            w.add_blank_page(width=200, height=200)
     if user_password is not None or owner_password is not None:
         w.encrypt(
             user_password=user_password if user_password is not None else "",
@@ -155,26 +182,37 @@ def test_owner_password_only_pdf_still_extracts(client, tmp_path):
 
     A fix keyed on `is_encrypted` alone passes every test above and silently breaks
     this one. That is exactly why this test exists.
-    """
-    data = _pdf(user_password="", owner_password="ownerpw")
 
-    loader = SafePyPDFLoader(str(tmp_path / "x.pdf"))  # noqa: F841 - loader path below
+    It carries REAL TEXT on purpose. An earlier version used a blank page and could only
+    assert "not refused as encrypted" -- which would also have passed if the loader had
+    refused for some other reason. Review caught that. The assertion now is that the
+    content actually came through and was stored.
+    """
+    data = _pdf(user_password="", owner_password="ownerpw", text=OWNER_TEXT_MARKER)
     path = tmp_path / "owner.pdf"
     path.write_bytes(data)
 
-    # It must not raise at the loader...
+    # It must not raise at the loader, and the text must really be there...
     pages = list(SafePyPDFLoader(str(path)).lazy_load())
     assert pages, "an owner-password PDF must still yield pages"
-
-    # ...and it must not be refused as encrypted at the route. A blank page has no
-    # text, so the honest answer is the empty-extraction 422 -- NOT `encrypted`.
-    r = _embed(client, "owner.pdf", data)
-    detail = r.json().get("detail")
-    verdict = detail.get("extraction", {}).get("verdict") if isinstance(detail, dict) else None
-    assert verdict != "encrypted", (
-        "an owner-password PDF was refused as password-protected; it is readable and "
-        f"must not be. got {r.status_code}: {r.text}"
+    extracted = "\n".join(p.page_content for p in pages)
+    assert OWNER_TEXT_MARKER in extracted, (
+        "an owner-password PDF is readable and its text must still be extracted; "
+        f"got {extracted[:200]!r}"
     )
+
+    # ...and at the route it must SUCCEED and actually write, not merely avoid the
+    # `encrypted` verdict.
+    r = _embed(client, "owner.pdf", data)
+    assert r.status_code == 200, (
+        "an owner-password PDF was not ingested; it is readable and must be. "
+        f"got {r.status_code}: {r.text}"
+    )
+    assert client.written, "the owner-password PDF produced no rows"
+    stored = "\n".join(
+        d.page_content for batch in client.written for d in batch
+    )
+    assert OWNER_TEXT_MARKER in stored, "the text never reached the store"
 
 
 def test_plain_pdf_is_untouched(tmp_path):

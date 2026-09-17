@@ -536,12 +536,20 @@ class SafePyPDFLoader:
             if not reader.is_encrypted:
                 return
             unlocked = reader.decrypt("")
-        except DocumentVerdictError:
-            raise
         except Exception as probe_error:
             # The check itself failed. Say nothing rather than invent a verdict from a probe that
-            # did not work -- the parser below will produce its own honest answer.
-            logger.debug(
+            # did not work -- the parser below produces its own honest answer, i.e. we degrade to the
+            # behaviour that shipped before this check existed.
+            #
+            # No `except DocumentVerdictError: raise` guard here: review showed it was unreachable.
+            # Nothing inside this `try` raises one, and the EncryptedDocumentError below is raised
+            # OUTSIDE it, so it can never be swallowed. An uncovered guard that implies a tested path
+            # is worse than no guard.
+            #
+            # `info`, not `debug`, to match SheetExcelLoader._precheck_container: an inconclusive
+            # pre-check means the caller may get a vaguer message than we could have given, which an
+            # operator should be able to see.
+            logger.info(
                 "PDF encryption pre-check inconclusive for %s: %s", self.filepath, probe_error
             )
             return
