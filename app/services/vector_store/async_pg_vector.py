@@ -77,11 +77,12 @@ class AsyncPgVector(ExtendedPgVector):
         user_id: Optional[str] = None,
         document_origin_type: Optional[str] = None,
         subscription_id: Optional[str] = None,
+        text_source: Optional[str] = None,
         executor=None,
     ) -> None:
         executor = executor or self._get_thread_pool()
         await self._run_in_executor(
-            executor, self._delete_multiple, ids, collection_only, user_id=user_id, document_origin_type=document_origin_type, subscription_id=subscription_id
+            executor, self._delete_multiple, ids, collection_only, user_id=user_id, document_origin_type=document_origin_type, subscription_id=subscription_id, text_source=text_source
         )
 
     async def asimilarity_search_with_score_by_vector(

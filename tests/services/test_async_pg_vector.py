@@ -63,12 +63,16 @@ async def test_delete_passes_args(store):
     with patch.object(ExtendedPgVector, "_delete_multiple") as mock:
         await store.delete(ids=["id1"], collection_only=True)
     # AsyncPgVector forwards the owner-scoping kwargs to the sync super() method.
+    # `text_source` (FILES-01) is forwarded the same way, and is asserted here rather
+    # than absorbed by a loose matcher because every filter in the delete path NARROWS:
+    # one that fails to arrive widens the delete to the whole file.
     mock.assert_called_once_with(
         ["id1"],
         True,
         user_id=None,
         document_origin_type=None,
         subscription_id=None,
+        text_source=None,
     )
 
 

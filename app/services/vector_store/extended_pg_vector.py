@@ -187,6 +187,7 @@ class ExtendedPgVector(PGVector):
         user_id: Optional[str] = None,
         document_origin_type: Optional[str] = None,
         subscription_id: Optional[str] = None,
+        text_source: Optional[str] = None,
     ) -> None:
         with Session(self._bind) as session:
             self.logger.debug(
@@ -215,6 +216,15 @@ class ExtendedPgVector(PGVector):
             if subscription_id is not None:
                 stmt = stmt.where(
                     self.EmbeddingStore.cmetadata["subscription_id"].astext == subscription_id
+                )
+            if text_source is not None:
+                # Narrows the delete to the rows ONE producer wrote (FILES-01), so an
+                # escalation can embed better text first and remove only what it
+                # superseded. Every clause here narrows; a filter that failed to arrive
+                # would therefore delete MORE than the caller asked, which is why this
+                # parameter is covered end to end rather than only at this layer.
+                stmt = stmt.where(
+                    self.EmbeddingStore.cmetadata["text_source"].astext == text_source
                 )
             session.execute(stmt)
             session.commit()
