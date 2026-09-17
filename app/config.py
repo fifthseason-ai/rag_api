@@ -146,7 +146,7 @@ PDF_OCR_LOW_CONFIDENCE_BELOW = float(
 # are taller than they are wide. Measured on the fixture corpus: 0.00 on every upright
 # page, 1.00 on a sideways one -- so 0.6 sits in a very wide empty margin rather than
 # being tuned. This matters because a sideways scan loses ~60% of its characters while
-# mean confidence stays at 0.89: confidence alone cannot see it.
+# mean confidence stays HIGH (0.89-0.96 across fixtures): confidence alone cannot see it.
 PDF_OCR_SIDEWAYS_BOX_RATIO = float(get_env_variable("PDF_OCR_SIDEWAYS_BOX_RATIO", "0.6"))
 
 # --- Hybrid retrieval (VI-436) ---

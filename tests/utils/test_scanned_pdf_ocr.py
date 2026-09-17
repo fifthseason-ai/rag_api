@@ -27,8 +27,9 @@ metric scored a PERFECT extraction at 0.63 because the engine joined two words -
 metric was wrong, not the engine -- so these assert on characters recovered.
 
 A KNOWN, MEASURED LIMITATION, deliberately left visible rather than hidden:
-an UPSIDE-DOWN (180 deg) scan with no /Rotate is read at ~0.31 recall with 0.95
-confidence and horizontal boxes, so neither confidence nor geometry detects it. It is
+an UPSIDE-DOWN (180 deg) scan with no /Rotate is read at LOW recall (0.31-0.43 across
+fixtures measured here and independently by review) but HIGH confidence (~0.95), with
+horizontal boxes -- so neither confidence nor geometry detects it. It is
 reported as recovered. `test_upside_down_scan_is_a_known_blind_spot` pins that as the
 CURRENT behaviour so it cannot change silently, and it is named as a gap to Core rather
 than papered over. rapidocr's `use_angle_cls` was measured and does NOT fix it.
@@ -421,8 +422,9 @@ def test_a_native_pdf_costs_nothing_and_reports_no_ocr(client):
 def test_sideways_scan_is_never_reported_as_complete(client):
     """THE HONESTY GUARD, and the defect the fixture corpus actually found.
 
-    A page rotated 90 degrees with no /Rotate to say so comes back with only ~0.37 of
-    its characters -- but at mean confidence 0.89, because confidence averages the
+    A page rotated 90 degrees with no /Rotate to say so comes back with only a fraction of
+    its characters (0.37-0.51 measured across fixtures) -- but at HIGH mean confidence
+    (0.89-0.96), because confidence averages the
     lines that WERE detected and is blind to everything missed. The first version of
     this feature reported that page as `complete` with no escalation: nonempty text
     presented as success, which is exactly the failure Core named.
@@ -436,6 +438,15 @@ def test_sideways_scan_is_never_reported_as_complete(client):
     assert response.status_code == 200, response.text
     receipt = _receipt(response)
     assert receipt["ocr"]["pages_orientation_suspect"] == 1
+    # ...and NOT also under low confidence. Review found the first version counting this
+    # page in BOTH buckets: one weak page, two increments, and a false label besides,
+    # because a sideways page comes back CONFIDENT -- which is the entire reason the
+    # geometric signal had to exist. A counter that double-counts is a counter that lies.
+    assert receipt["ocr"]["pages_low_confidence"] == 0, receipt["ocr"]
+    assert receipt["ocr"]["mean_confidence"] > 0.8, (
+        "this page must be recorded as HIGH confidence; if it were low, confidence alone "
+        "would have caught it and the geometric signal would be unnecessary"
+    )
     assert receipt["escalation"]["recommended"] is True
     assert receipt["escalation"]["reason"] == "ocr_orientation_suspect"
     assert receipt["escalation"]["locators"] == [0]
@@ -489,6 +500,23 @@ def test_an_unreadable_page_yields_nothing_and_asks_for_escalation(client):
     assert receipt["ocr"]["pages_no_text"] == 1
     assert receipt["escalation"]["recommended"] is True
     assert receipt["reasons"] == [{"locator": 0, "reason": "ocr_no_text"}]
+
+
+def test_a_page_with_nothing_to_read_is_not_counted_as_attempted(client):
+    """`pages_attempted` must mean "the engine looked at this page".
+
+    Review found it being set before the image check, so a page with no embedded image
+    at all counted as attempted -- the field then meant "we considered this page", which
+    is not what its docstring says and not what Core is reading it for.
+    """
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    response = _embed(client, "blank.pdf", _bytes(writer))
+
+    receipt = _receipt(response)
+    assert receipt["ocr"]["pages_attempted"] == 0, receipt["ocr"]
+    assert receipt["ocr"]["pages_no_text"] == 0, "nothing was read, so nothing came back empty"
+    assert receipt["escalation"]["recommended"] is False
 
 
 def test_a_blank_page_does_not_invent_an_escalation(client):
@@ -613,6 +641,48 @@ def test_ocr_can_be_switched_off_entirely(client, monkeypatch):
     receipt = _receipt(response)
     assert "ocr" not in receipt
     assert receipt["reasons"] == [{"locator": 0, "reason": "empty"}]
+
+
+def test_the_kill_switch_leaves_no_residue_on_a_native_pdf(client, monkeypatch):
+    """The switch has to be TOTAL, including on the format the feature touches.
+
+    Review found provenance being stamped on native pages unconditionally, so a native
+    PDF gained a `text_sources` block even with OCR disabled -- which made the
+    "byte-identical to the pre-OCR build" claim false exactly where the kill switch is
+    meant to be complete. The switch is what an operator reaches for when something is
+    wrong, so 'almost off' is not a state it may have.
+    """
+    monkeypatch.setattr("app.utils.document_loader.PDF_OCR_ENABLED", False)
+    monkeypatch.setattr("app.utils.ocr.PDF_OCR_ENABLED", False)
+
+    writer = PdfWriter()
+    _text_page(writer, INVOICE)
+    response = _embed(client, "native.pdf", _bytes(writer))
+
+    assert response.status_code == 200, response.text
+    receipt = _receipt(response)
+    for added in ("ocr", "escalation", "text_sources"):
+        assert added not in receipt, f"{added} survived the kill switch: {receipt}"
+    assert char_recall(_stored(client), INVOICE) >= 0.95, "the PDF must still ingest"
+
+
+def test_a_native_pdf_carries_provenance_while_ocr_is_on(client):
+    """The other side of the switch: with OCR enabled a native PDF DOES report its
+    provenance, because Core reads `text_source` at retrieval time across the whole
+    corpus and a missing producer would read as an unknown one."""
+    writer = PdfWriter()
+    _text_page(writer, INVOICE)
+    response = _embed(client, "native.pdf", _bytes(writer))
+
+    assert response.status_code == 200, response.text
+    receipt = _receipt(response)
+    assert receipt["text_sources"] == {"native": [0]}
+    assert "ocr" not in receipt, "no OCR ran, so no OCR block"
+    assert all(
+        d.metadata.get("text_source") == "native"
+        for batch in client.written
+        for d in batch
+    )
 
 
 def test_one_unreadable_image_does_not_lose_the_rest_of_the_page(client, monkeypatch):

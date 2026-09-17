@@ -28,10 +28,15 @@ WHAT WAS MEASURED BEFORE IT WAS WRITTEN (deployed lite image, network disabled)
 * Character recall against known ground truth on upright scans: **0.96-1.00**.
   (An earlier word-level metric said 0.63 -- that metric was wrong, not the engine:
   it scored "quarterlycapacity" as two misses when every character was recovered.)
-* Honouring the page's own /Rotate takes rotated scans from **0.31-0.37 to 0.99**.
-  Whole-page rotation with NO /Rotate signal stays weak (0.00-0.37) and is exactly
-  what the insufficient/escalation outcome is for -- rapidocr's use_angle_cls does
-  not help there (measured: it classifies text-line flips, not page rotation).
+* Honouring the page's own /Rotate lifts rotated scans to **0.99**. Whole-page rotation
+  with NO /Rotate signal stays weak and is exactly what the insufficient/escalation
+  outcome is for -- rapidocr's use_angle_cls does not help there (measured: it
+  classifies text-line flips, not page rotation).
+  The weak figures are fixture-dependent and should be read as a RANGE, not a constant:
+  0.00-0.50 for sideways and 0.31-0.43 for upside-down across the fixtures measured
+  here and independently by review. What is stable is the SHAPE -- a large share of the
+  page is lost while the engine's confidence stays high (0.89-0.96) -- and that is the
+  claim the design rests on, not any single number.
 * Peak RSS rises to ~764 MB for a 12-page scan and ~1.0 GB at 33.7 MP/page, and
   quality is flat from 3.7 MP to 33.7 MP -- which is why oversized images are
   downscaled to a pixel cap rather than OCR'd whole, and why the caps exist at all.
@@ -222,7 +227,7 @@ def _to_array(data: bytes, rotation: int, budget: "OcrBudget", notes: List[str])
     """Decode one embedded image into an RGB array the engine can read.
 
     Honours the page's own /Rotate: measured, that alone lifts rotated scans from
-    0.31-0.37 to 0.99 character recall. PDF /Rotate is degrees CLOCKWISE at display
+    a weak reading to 0.99 character recall. PDF /Rotate is degrees CLOCKWISE at display
     time and PIL rotates counter-clockwise, so the correction is rotate(-rotation).
     (My first fixture had this backwards and made a correct correction look broken --
     the sign is measured, not reasoned.)
@@ -230,18 +235,45 @@ def _to_array(data: bytes, rotation: int, budget: "OcrBudget", notes: List[str])
     import numpy as np
     from PIL import Image
 
+    # `Image.open` reads the header only, so the declared size is known BEFORE any
+    # pixels are decoded. Review found the first version converting to RGB first and
+    # capping afterwards, which bounded the engine's work but not the decode: an image
+    # between the cap and PIL's own ~89 MP default would materialise whole before being
+    # shrunk. The cap is applied to the decode itself now.
+    #
+    # Measured on a 60 MP JPEG with a 16 MP cap, peak RSS in a fresh process:
+    # +180 MB through the draft path against +229 MB decoding whole and resizing after.
+    # Real and worth having -- but a 22% saving, not an elimination, because the capped
+    # image and its array still have to exist. Said that way because the first attempt to
+    # measure this used tracemalloc, which sees only Python allocations and reported the
+    # two strategies as identical; PIL's decode buffer is a C allocation.
     image = Image.open(io.BytesIO(data))
-    if image.mode != "RGB":
-        image = image.convert("RGB")
     pixels = image.width * image.height
-    if budget.max_pixels > 0 and pixels > budget.max_pixels:
-        # Quality is flat from 3.7 MP to 33.7 MP but RSS is not, so cap the pixels
+    oversized = budget.max_pixels > 0 and pixels > budget.max_pixels
+
+    if oversized:
+        # Quality is flat from 3.7 MP to 33.7 MP but memory is not, so cap the pixels
         # rather than the quality.
         ratio = (budget.max_pixels / pixels) ** 0.5
+        target = (max(1, int(image.width * ratio)), max(1, int(image.height * ratio)))
+        # For JPEG -- which is what a scanner produces -- `draft` decodes at reduced
+        # resolution in the DCT domain, so the full-size bitmap never exists. It is a
+        # no-op for other formats, which then fall back to decode-then-resize below.
+        try:
+            image.draft("RGB", target)
+        except Exception:
+            pass
+        notes.append("downscaled")
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    if oversized and image.width * image.height > budget.max_pixels:
+        # `draft` only lands on power-of-two-ish steps, and does nothing at all for
+        # non-JPEG, so finish the job exactly.
+        ratio = (budget.max_pixels / (image.width * image.height)) ** 0.5
         image = image.resize(
             (max(1, int(image.width * ratio)), max(1, int(image.height * ratio)))
         )
-        notes.append("downscaled")
     if rotation:
         image = image.rotate(-rotation, expand=True)
     return np.array(image)
@@ -297,7 +329,6 @@ def ocr_page(page, budget: "OcrBudget") -> PageOcrResult:
         result.reason = "engine_unavailable"
         return result
 
-    result.attempted = True
     started = time.monotonic()
     try:
         rotation = int(getattr(page, "rotation", 0) or 0) % 360
@@ -328,6 +359,11 @@ def ocr_page(page, budget: "OcrBudget") -> PageOcrResult:
         except Exception as error:
             logger.info("OCR failed on one page image: %s", error)
             continue
+        # `attempted` is set HERE, not before the image loop: a page with nothing to
+        # read was never looked at by the engine, whatever we intended. Review caught it
+        # being set up front, which counted a blank page as attempted and made
+        # `pages_attempted` mean something other than what its docstring says.
+        result.attempted = True
         result.images_read += 1
         if not lines:
             continue
@@ -345,7 +381,7 @@ def ocr_page(page, budget: "OcrBudget") -> PageOcrResult:
         result.reason = "ocr_no_text"
     elif result.tall_box_ratio >= PDF_OCR_SIDEWAYS_BOX_RATIO:
         # The page is sideways and the PDF gave no /Rotate to say so. Measured, this
-        # costs 60% of the page's characters while mean confidence stays at 0.89 --
+        # costs most of the page's characters while mean confidence stays at 0.89-0.96 --
         # which is exactly why confidence alone must not be the only signal.
         result.reason = "ocr_orientation_suspect"
     elif is_low_confidence(result.text, result.confidence):

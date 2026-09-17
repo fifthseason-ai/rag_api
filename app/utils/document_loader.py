@@ -11,7 +11,13 @@ from pypdf import PdfReader
 
 from langchain_core.documents import Document
 
-from app.config import known_source_ext, PDF_EXTRACT_IMAGES, CHUNK_OVERLAP, logger
+from app.config import (
+    known_source_ext,
+    PDF_EXTRACT_IMAGES,
+    PDF_OCR_ENABLED,
+    CHUNK_OVERLAP,
+    logger,
+)
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
@@ -625,9 +631,16 @@ class SafePyPDFLoader:
             self._ocr_handle = open(self.filepath, "rb")
             reader = PdfReader(self._ocr_handle)
             if reader.is_encrypted:
-                # `_refuse_if_locked` has already established the empty password opens
-                # it (a user-password PDF never reaches here), so this only re-applies
-                # that to THIS reader. An owner-password scan is a readable scan.
+                # Re-applies to THIS reader what `_refuse_if_locked` already established:
+                # the empty password opens the file. An owner-password scan is a readable
+                # scan and must be OCR'd like any other.
+                #
+                # Not "a user-password PDF never reaches here" -- review was right that
+                # the claim was too absolute. If the pre-check's own probe fails, it stays
+                # silent by design and a locked file can arrive here. There is no bypass:
+                # `decrypt("")` then returns NOT_DECRYPTED, reading the page fails, the
+                # failure is caught and the page is reported empty. Nothing is stored and
+                # no password is guessed.
                 reader.decrypt("")
             self._ocr_reader_obj = reader
         return self._ocr_reader_obj
@@ -652,7 +665,15 @@ class SafePyPDFLoader:
                 if (document.page_content or "").strip():
                     # Real text on the page. Never OCR it -- that is what would produce
                     # duplicate text for a mixed document.
-                    metadata.setdefault("text_source", "native")
+                    #
+                    # The provenance stamp is gated on the feature being ON. Review found
+                    # it was being written unconditionally, so a NATIVE PDF gained a
+                    # `text_sources` block in its receipt even with OCR disabled -- which
+                    # made the "byte-identical to the pre-OCR build" claim false for the
+                    # one format the feature touches, exactly where the kill switch is
+                    # supposed to be total.
+                    if PDF_OCR_ENABLED:
+                        metadata.setdefault("text_source", "native")
                     yield document
                     continue
                 if budget is None:

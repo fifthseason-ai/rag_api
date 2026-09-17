@@ -74,7 +74,7 @@ from app.utils.document_loader import (
     cleanup_temp_encoding_file,
     DocumentVerdictError,
 )
-from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget, OcrCancelled
+from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget
 from app.utils.health import is_health_ok
 
 router = APIRouter()
@@ -482,6 +482,14 @@ async def load_file_content(
     # half: `run_in_executor` cancels the FUTURE when the caller goes away, but the
     # worker THREAD keeps running -- so without this a disconnected client leaves a
     # 50-page OCR burning CPU for nobody. The loader checks this flag between pages.
+    #
+    # There is deliberately NO `except OcrCancelled` handler here. The flag is set only
+    # inside the `except asyncio.CancelledError` below, which re-raises immediately, so
+    # by the time the worker thread raises `OcrCancelled` nobody is awaiting that future
+    # and the exception is discarded -- which is the correct outcome, because a cancelled
+    # request has no caller left to answer. The first version answered 503 there; review
+    # showed it was unreachable, and an uncovered handler that implies a tested path is
+    # worse than no handler (the same call made for the dead verdict guard in #29).
     stop = threading.Event()
     try:
         loader, known_type, file_ext = get_loader(
@@ -494,14 +502,6 @@ async def load_file_content(
             stop.set()
             raise
         return data, known_type, file_ext
-    except OcrCancelled as cancelled:
-        # The flag above was set, so this thread stopped on purpose. Retryable and
-        # service-side: nothing was stored and the uploader's file is not at fault.
-        logger.info("extraction cancelled for %s", filename)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"message": "Extraction was cancelled before it completed. Nothing was stored."},
-        ) from cancelled
     except DocumentVerdictError as verdict_error:
         logger.warning(
             "Terminal verdict for %s [verdict=%s]: %s",
@@ -1360,7 +1360,15 @@ _ESCALATABLE_OCR_REASONS = frozenset(
      "page_limit", "time_limit", "cancelled", "budget_exhausted"}
 )
 
-#: Outcomes where OCR DID produce stored text but it should not read as clean success.
+#: Outcomes where OCR DID produce stored text that should not read as clean success.
+#: Deliberately NOT used for any per-reason count: each weak page is counted under its own
+#: reason exactly once, so the buckets stay addable.
+#:
+#: Review caught the first version counting an orientation-suspect page under BOTH
+#: `pages_low_confidence` and `pages_orientation_suspect` -- one weak page, two increments.
+#: The label was false as well as duplicated: a sideways page comes back at HIGH
+#: confidence (~0.96 measured), which is the entire reason the geometric signal exists, so
+#: reporting it as low confidence contradicted the data and this module's own docstring.
 _OCR_WEAK_REASONS = frozenset({"ocr_low_confidence", "ocr_orientation_suspect"})
 
 #: Page-level outcomes that mean a BOUND stopped the work rather than the page itself
@@ -1546,7 +1554,8 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     ocr_locs = [loc for loc in order if units[loc]["ocr"] is not None]
     if ocr_locs:
         recovered = [loc for loc in ocr_locs if units[loc]["source"] == "ocr"]
-        weak = [loc for loc in recovered if units[loc]["ocr"] in _OCR_WEAK_REASONS]
+        weak = [loc for loc in recovered if units[loc]["ocr"] == "ocr_low_confidence"]
+        suspect = [loc for loc in recovered if units[loc]["ocr"] == "ocr_orientation_suspect"]
         attempted = [loc for loc in ocr_locs if units[loc]["attempted"]]
         not_attempted = [
             loc for loc in ocr_locs
@@ -1579,12 +1588,10 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             # never read as clean success.
             "pages_low_confidence": len(weak),
             # Pages whose detected text runs vertically: read, but almost certainly
-            # sideways, so most of the page was missed. Counted separately because it
-            # is a DIFFERENT fact from low confidence -- these pages come back
-            # confident and wrong.
-            "pages_orientation_suspect": len(
-                [loc for loc in ocr_locs if units[loc]["ocr"] == "ocr_orientation_suspect"]
-            ),
+            # sideways, so most of the page was missed. Counted separately AND
+            # exclusively -- it is a DIFFERENT fact from low confidence, because these
+            # pages come back confident and wrong. A page is never in both buckets.
+            "pages_orientation_suspect": len(suspect),
             "mean_confidence": (
                 round(sum(confidences) / len(confidences), 4) if confidences else None
             ),
