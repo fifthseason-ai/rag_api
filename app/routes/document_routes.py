@@ -321,6 +321,52 @@ def _is_name_too_long(error: BaseException) -> bool:
     )
 
 
+def _is_pandoc_missing(error: BaseException) -> bool:
+    """Whether this failure is pandoc not being installed on the server.
+
+    FILES-01 F2 -- this is a REGRESSION REPAIR, not a new policy. `/text` and `/local/embed` each carry
+    an explicit `"No pandoc was found" in str(e)` branch answering with
+    `ERROR_MESSAGES.PANDOC_NOT_INSTALLED`. Those branches sit on the OUTER handler, but the failure they
+    target is raised inside `loader.lazy_load()`, and SP-01.10 now converts that into an `HTTPException`
+    at the `load_file_content` seam -- which the outer handlers re-raise untouched. So the branches
+    stopped being reached and the one actionable answer on those handlers was silently replaced by "the
+    cause is not established". Measured, not inferred: a route test drives a pandoc-less loader and reads
+    the response.
+
+    It belongs HERE because `describe_failure` is now the single classifier every intake path flows
+    through; putting it back on the outer handlers would restore a branch that can no longer execute.
+
+    Status stays 400, exactly as it was before the regression. A missing server package is infrastructure
+    but it is not TRANSIENT: no amount of retrying installs pandoc, and a 503 would tell Core's listener
+    to retry forever a file that cannot work until an operator acts -- the same harm the DataError and
+    ENAMETOOLONG corrections exist to prevent. The message carries the operator action instead.
+
+    HOW IT MATCHES, and why not the obvious way. An independent review broke the first version of this,
+    which was `"No pandoc was found" in str(link)` over the whole chain. That substring is
+    CALLER-INFLUENCEABLE: a save-path `OSError` carries the temp path in its message, and that path is
+    built by `_make_unique_temp_path` from the UPLOADER'S FILENAME. A file named
+    `No pandoc was found.txt` therefore made a genuine, retryable storage outage answer 400 "install
+    pandoc" -- turning a 503 into a permanent do-not-retry for every route sharing this classifier. That
+    is exactly the harm the DataError and ENAMETOOLONG corrections exist to prevent, re-opened by me.
+
+    So the match is pinned to what the library actually does, verified in the shipped image rather than
+    assumed: `pypandoc/__init__.py:802` raises `OSError("No pandoc was found: either install pandoc ...")`
+    -- the phrase is the START of the message. A user-controlled filename can only ever reach an OSError
+    message through the `[Errno N] strerror: 'path'` form, where it is never at position 0, so
+    `startswith` closes the injection. `isinstance(OSError)` narrows it further, and no code in `app/`
+    constructs a single-argument OSError from user input (checked).
+
+    NOTE for anyone tempted by the reviewer's other suggestion -- moving this check to run only when
+    `is_service_fault` is False. It looks safer and would SILENTLY BREAK THE REPAIR: pypandoc raises an
+    OSError, OSError is a service-fault type, so the real case would never reach the branch and the
+    actionable message would be lost again. Discriminate by type and position, not by order.
+    """
+    return any(
+        isinstance(link, OSError) and str(link).startswith("No pandoc was found")
+        for link in _causes(error)
+    )
+
+
 def is_service_fault(error: BaseException) -> bool:
     """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
     ourselves -- but never accuse the file either (see `describe_failure`).
@@ -358,6 +404,22 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
     """
     reference = uuid.uuid4().hex[:12]
     name = filename or "the uploaded file"
+    if _is_pandoc_missing(error):
+        # FILES-01 F2 -- restore the actionable answer the outer handlers can no longer produce.
+        # An operator can fix this; "the cause is not established" told nobody anything.
+        logger.error(
+            "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+            reference,
+            name,
+            "service:pandoc_not_installed",
+            type(error).__name__,
+            error,
+            traceback.format_exc(),
+        )
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            f"{ERROR_MESSAGES.PANDOC_NOT_INSTALLED} Reference: {reference}.",
+        )
     if _is_name_too_long(error):
         # SP-01.15 -- we know exactly what is wrong here, so say it instead of "cause not established".
         logger.error(
@@ -1494,7 +1556,34 @@ async def store_data_in_vector_db(
             str(e),
             traceback.format_exc(),
         )
-        return {"message": "An error occurred while adding documents.", "error": str(e)}
+        # FILES-01 F3 -- PROPAGATE, so the caller can attribute the failure.
+        #
+        # This used to return {"message": "An error occurred...", "error": str(e)}. Both that and the
+        # success value are truthy dicts, so the four callers each invented their own way to read it
+        # and only one was right:
+        #     /summarize     `if not result or "error" in result:`  correct
+        #     /local/embed   `if result:`                           ALWAYS true -> 200 {"status": true}
+        #     /embed-upload  `if not result:`                       NEVER true  -> 200 {"status": true}
+        #     /embed         has an `if "error" in result` check, but sets response_message = the RAW
+        #                    exception and falls through to the 200 success return
+        # A vector-store outage was therefore reported to the uploader and to Core as a successful
+        # ingest with zero rows written -- and on /embed it also handed the caller str(e).
+        #
+        # My first fix returned None. That killed the fake success, but an independent review showed it
+        # traded one harm for another: swallowing the exception left every store failure indistinguishable,
+        # so an outage and a PERMANENT content fault both became a flat 500. `describe_failure` classifies
+        # a psycopg2/sqlalchemy DataError as content (`_CONTENT_FAULT_TYPE_NAMES`) precisely because the
+        # value being written is text extracted from the upload -- a NUL byte in a non-PDF extraction
+        # reaches pgvector unmodified, since `clean_text` only runs when clean_content is True. Under the
+        # None fix that permanent fault was answered 5xx, so a listener keying retry on 5xx would retry
+        # forever a file that can never store. I introduced that; this corrects it.
+        #
+        # Raising is also the fix that cannot be misread: there is no sentinel value for a caller to
+        # interpret, so `if result:` / `if not result:` / `"error" in result` are all moot. Every caller
+        # already has `except Exception -> describe_failure`, the same seam the loader path uses, so an
+        # outage becomes a retryable 503 that exonerates the file and a content fault stays a permanent
+        # 400. The exception and traceback are logged here, where they happen, before it leaves.
+        raise
 
 
 @router.post("/local/embed")
@@ -1558,9 +1647,13 @@ async def embed_local_file(
                 "extraction": extraction_receipt,
             }
         else:
+            # Defensive only: `store_data_in_vector_db` now raises rather than returning a falsy
+            # sentinel, so a store failure cannot reach here. Kept as a guard, and given the same
+            # message its sibling routes use instead of the generic "Something went wrong :/" --
+            # a string this lane's own tests forbid on the attributed path.
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=ERROR_MESSAGES.DEFAULT(),
+                detail="Failed to process/store the file data.",
             )
     except HTTPException as http_exc:
         logger.error(
@@ -1570,17 +1663,30 @@ async def embed_local_file(
         )
         raise http_exc
     except Exception as e:
-        logger.error(e)
-        if "No pandoc was found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT(e),
-            )
+        # FILES-01 F3 (re-review NOTE-2) -- the last raw `str(e)` on the intake surface.
+        #
+        # This handler carried BOTH of the defects already fixed on /text:
+        #   * `ERROR_MESSAGES.DEFAULT(e)` interpolates the exception verbatim
+        #     (`constants.py`: f"Something went wrong :/\n{err}"), so any failure reaching here
+        #     handed the caller our internal text -- and at 400, telling Core's listener that a
+        #     fault which may well be ours is the uploader's file and must not be retried.
+        #   * the `"No pandoc was found" in str(e)` branch was DEAD (the loader failure it targets
+        #     is converted to an HTTPException upstream and re-raised by the handler above) AND was
+        #     the caller-influenceable substring match that an independent review broke on /text: a
+        #     save-path OSError embeds our temp path, which is built from the uploader's filename.
+        #
+        # Both are now the shared, reviewed `describe_failure`: pandoc keeps its actionable operator
+        # message via a match pinned to type and position, a service fault becomes a retryable 503
+        # that exonerates the file, and anything unclassified keeps 400 without the raw text. The
+        # exception and traceback stay in the log under the reference the caller is given.
+        logger.error(
+            "Error in embed_local_file | File: %s | Error: %s | Traceback: %s",
+            document.filename,
+            str(e),
+            traceback.format_exc(),
+        )
+        status_code, message = describe_failure(e, document.filename)
+        raise HTTPException(status_code=status_code, detail=message) from e
 
 
 async def _generate_summary_background(
@@ -1988,22 +2094,34 @@ async def extract_text_from_file(
         )
         raise http_exc
     except Exception as e:
+        # FILES-01 F2 -- the last caller-facing `str(e)` on the /text intake path. (NOT the last in the
+        # file: /local/embed's else-branch still returns ERROR_MESSAGES.DEFAULT(e), which interpolates
+        # str(e) verbatim. That route is outside this increment; recorded, not silently absorbed.)
+        #
+        # `save_upload_file_async` (SP-01.13) and `load_file_content` (SP-01.10) now raise
+        # `HTTPException` and are re-raised untouched above. Two calls in the `try` are behind neither
+        # seam: `os.makedirs`, whose `PermissionError`/`OSError` carries OUR temp directory in `str(e)`,
+        # and `extract_text_from_documents`. Both landed here and were echoed to the caller verbatim --
+        # proven at route level, with an injected marker that reached the response body.
+        #
+        # Worse than the disclosure: every one of them was answered 400, telling the caller their file is
+        # bad and telling Core's listener not to retry, for faults that are ours. `describe_failure`
+        # attributes it instead -- a service fault becomes a retryable 503 that exonerates the file, a
+        # missing pandoc keeps its actionable operator message, and anything unclassified keeps its 400
+        # but says the cause is not established rather than guessing. The exception and traceback stay in
+        # the log, under the reference the caller is given.
+        #
+        # The `"No pandoc was found"` branch that stood here is gone deliberately, not dropped: it could
+        # no longer execute (the loader failure it targets is converted to an `HTTPException` upstream),
+        # and the answer it produced now comes from `describe_failure` where it is reachable again.
         logger.error(
             "Error during text extraction | File: %s | Error: %s | Traceback: %s",
             file.filename,
             str(e),
             traceback.format_exc(),
         )
-        if "No pandoc was found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error during text extraction: {str(e)}",
-            )
+        status_code, message = describe_failure(e, file.filename)
+        raise HTTPException(status_code=status_code, detail=message) from e
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
 
@@ -2158,4 +2276,15 @@ async def summarize_entity_files(
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        # FILES-01 F3 -- this handler became REACHABLE for store failures when
+        # `store_data_in_vector_db` started propagating instead of swallowing, so leaving `str(e)` here
+        # would have turned a fix into a new leak on a route that previously never saw those exceptions.
+        # Same reviewed contract as every other intake path: attribution by status code, a sentence plus
+        # a reference to the caller, the exception and traceback to the log.
+        #
+        # `None`, not `file_id`: this route has no filename in scope, and passing the id put an
+        # internal identifier where the sentence says "filename" -- which would have told a user to
+        # "shorten the file name" of something that is not a name they chose. `describe_failure`
+        # falls back to "the uploaded file": vaguer, but not wrong.
+        status_code, message = describe_failure(e, None)
+        raise HTTPException(status_code=status_code, detail=message) from e

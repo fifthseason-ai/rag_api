@@ -7,6 +7,7 @@ import zipfile
 
 from typing import Iterator, List, Optional
 import chardet
+from pypdf import PdfReader
 
 from langchain_core.documents import Document
 
@@ -510,8 +511,61 @@ class SafePyPDFLoader:
         self.extract_images = extract_images
         self._temp_filepath = None  # For compatibility with cleanup function
 
+    #: A PDF can be "encrypted" in two very different ways and only ONE of them is a refusal.
+    #: Measured with pypdf in the shipped image, not assumed:
+    #:
+    #:   user password       is_encrypted=True, decrypt("") -> 0 (NOT_DECRYPTED), pages UNREADABLE
+    #:   owner password ONLY is_encrypted=True, decrypt("") -> 1, pages READ PERFECTLY WELL
+    #:
+    #: Owner-password PDFs carry only usage restrictions (no printing, no copying) and extract
+    #: today. Refusing on `is_encrypted` alone would reject a whole class of files that currently
+    #: work -- which is why the test is "the empty password does not unlock it", not "it is
+    #: encrypted".
+    def _refuse_if_locked(self) -> None:
+        """Give a password-protected PDF the same actionable verdict a workbook already gets.
+
+        FILES-01, approved as a small maintenance change: a locked PDF used to answer the generic
+        400 "the cause is not established" while an encrypted .xlsx answered 422 `encrypted` with
+        an instruction the uploader can act on. Same condition, same contract now.
+
+        Deliberately NOT done, and not wanted: storing passwords, prompting for them, or trying to
+        break them. This only names what is wrong.
+        """
+        try:
+            reader = PdfReader(self.filepath)
+            if not reader.is_encrypted:
+                return
+            unlocked = reader.decrypt("")
+        except Exception as probe_error:
+            # The check itself failed. Say nothing rather than invent a verdict from a probe that
+            # did not work -- the parser below produces its own honest answer, i.e. we degrade to the
+            # behaviour that shipped before this check existed.
+            #
+            # No `except DocumentVerdictError: raise` guard here: review showed it was unreachable.
+            # Nothing inside this `try` raises one, and the EncryptedDocumentError below is raised
+            # OUTSIDE it, so it can never be swallowed. An uncovered guard that implies a tested path
+            # is worse than no guard.
+            #
+            # `info`, not `debug`, to match SheetExcelLoader._precheck_container: an inconclusive
+            # pre-check means the caller may get a vaguer message than we could have given, which an
+            # operator should be able to see.
+            logger.info(
+                "PDF encryption pre-check inconclusive for %s: %s", self.filepath, probe_error
+            )
+            return
+
+        if not unlocked:
+            raise EncryptedDocumentError(
+                "The PDF is password-protected, so its contents cannot be read. "
+                "Upload a copy saved without a password.",
+                filename=os.path.basename(self.filepath),
+            )
+
     def lazy_load(self) -> Iterator[Document]:
         """Lazy load PDF documents with automatic fallback on image extraction errors."""
+        # Decide the encrypted verdict BEFORE parsing, the same way SheetExcelLoader decides
+        # encrypted-vs-corrupt from the container first.
+        self._refuse_if_locked()
         loader = PyPDFLoader(self.filepath, extract_images=self.extract_images)
 
         if not self.extract_images:
