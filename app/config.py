@@ -91,6 +91,57 @@ EMBEDDING_MAX_QUEUE_SIZE = int(get_env_variable("EMBEDDING_MAX_QUEUE_SIZE", "3")
 env_value = get_env_variable("PDF_EXTRACT_IMAGES", "False").lower()
 PDF_EXTRACT_IMAGES = True if env_value == "true" else False
 
+# --- Local-first OCR for scanned PDF pages (FILES-01, FS-CONTINUE-R3) ---
+#
+# A scanned PDF has no text layer, so pypdf extracts nothing from it. Richard approved
+# reading native text first and then applying BOUNDED local OCR to the pages that need
+# it, with escalation to the already-approved AWS route when local OCR is not good
+# enough. Nothing here calls an external provider or spends money.
+#
+# PDF_EXTRACT_IMAGES above is a DIFFERENT, pre-existing switch (langchain's own image
+# wiring) and is NOT the OCR control: measured in the shipped image it returns 0
+# characters on a genuine scan even with an OCR image parser attached.
+#
+# Every default below is a measured number, not a guess (deployed lite image, network
+# disabled) -- see app/utils/ocr.py for the measurement note behind each one.
+PDF_OCR_ENABLED = get_env_variable("PDF_OCR_ENABLED", "True").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+    "t",
+)
+# ~0.9 s/page steady state, so 50 pages is ~45 s of OCR -- inside the time budget
+# below. Whichever bound is reached first stops the work and records which one it was.
+PDF_OCR_MAX_PAGES = int(get_env_variable("PDF_OCR_MAX_PAGES", "50"))
+# Half of Core's 120 s /embed client timeout, leaving the other half for parsing,
+# chunking and embedding. A document needing more OCR than this is reported partial
+# with stopped_reason=time_limit -- never silently truncated.
+PDF_OCR_TIME_BUDGET_SECONDS = float(get_env_variable("PDF_OCR_TIME_BUDGET_SECONDS", "60"))
+# Bounds page expansion: a page carrying dozens of small images is a figure-heavy page,
+# not a scan, and OCR-ing all of them buys nothing.
+PDF_OCR_MAX_IMAGES_PER_PAGE = int(get_env_variable("PDF_OCR_MAX_IMAGES_PER_PAGE", "8"))
+# Character recall is flat from 3.7 MP to 33.7 MP but peak RSS is not (764 MB -> 1.0 GB),
+# so an oversized image is downscaled to this cap before OCR. 16 MP is ~2x a 300 dpi A4
+# scan: comfortably above the resolution where quality stops improving.
+PDF_OCR_MAX_PIXELS = int(get_env_variable("PDF_OCR_MAX_PIXELS", "16000000"))
+# REPORTING thresholds, not discard thresholds. Text below them is still extracted and
+# still stored -- the page is simply reported as weak so Core can escalate it, because
+# judging whether a document is well enough covered is Core's call, not this service's.
+# Measured: a good upright scan returns hundreds of characters at confidence 0.95-0.97,
+# while a page the engine cannot read returns 0 characters at confidence 0.00, and
+# nothing in the fixture corpus landed between.
+PDF_OCR_MIN_CHARS = int(get_env_variable("PDF_OCR_MIN_CHARS", "24"))
+PDF_OCR_LOW_CONFIDENCE_BELOW = float(
+    get_env_variable("PDF_OCR_LOW_CONFIDENCE_BELOW", "0.5")
+)
+# A page is reported as probably sideways when this share of its detected text boxes
+# are taller than they are wide. Measured on the fixture corpus: 0.00 on every upright
+# page, 1.00 on a sideways one -- so 0.6 sits in a very wide empty margin rather than
+# being tuned. This matters because a sideways scan loses ~60% of its characters while
+# mean confidence stays at 0.89: confidence alone cannot see it.
+PDF_OCR_SIDEWAYS_BOX_RATIO = float(get_env_variable("PDF_OCR_SIDEWAYS_BOX_RATIO", "0.6"))
+
 # --- Hybrid retrieval (VI-436) ---
 # Enable BM25/keyword full-text search alongside the dense vector search and
 # fuse the two result sets. When disabled, retrieval behaves exactly as before
