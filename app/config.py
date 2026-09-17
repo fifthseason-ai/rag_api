@@ -111,12 +111,19 @@ PDF_OCR_ENABLED = get_env_variable("PDF_OCR_ENABLED", "True").lower() in (
     "y",
     "t",
 )
-# ~0.9 s/page steady state, so 50 pages is ~45 s of OCR -- inside the time budget
-# below. Whichever bound is reached first stops the work and records which one it was.
+# A BACKSTOP, not the bound that actually binds. The engine alone reads a page in ~0.9 s,
+# but through the real route in a 4 GB container it is ~1.9 s/page, so the time budget
+# below runs out first -- measured at 32 of 50 pages, and 33 of 120.
+# (An earlier version of this comment justified 50 as "~45 s of OCR" from the 0.9 s
+# figure. That was the isolated engine measurement used to PREDICT the deployed path
+# instead of measuring it, and the deployed path is twice as slow. The defaults were
+# safe either way, because the tighter bound wins; the reasoning was not.)
 PDF_OCR_MAX_PAGES = int(get_env_variable("PDF_OCR_MAX_PAGES", "50"))
-# Half of Core's 120 s /embed client timeout, leaving the other half for parsing,
-# chunking and embedding. A document needing more OCR than this is reported partial
-# with stopped_reason=time_limit -- never silently truncated.
+# THE effective bound. Half of Core's 120 s /embed client timeout, leaving the other half
+# for parsing, chunking and embedding. Measured: total request time is capped at ~62 s
+# whatever the document size -- a 120-page scan takes the same ~62 s as a 50-page one and
+# reports the remaining 87 pages as not attempted. A document needing more OCR than this
+# is reported partial with stopped_reason=time_limit, never silently truncated.
 PDF_OCR_TIME_BUDGET_SECONDS = float(get_env_variable("PDF_OCR_TIME_BUDGET_SECONDS", "60"))
 # Bounds page expansion: a page carrying dozens of small images is a figure-heavy page,
 # not a scan, and OCR-ing all of them buys nothing.

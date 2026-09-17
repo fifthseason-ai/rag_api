@@ -19,7 +19,12 @@ WHAT WAS MEASURED BEFORE IT WAS WRITTEN (deployed lite image, network disabled)
   here explicitly rather than by flipping PDF_EXTRACT_IMAGES.
 * rapidocr-onnxruntime==1.4.4 ships in BOTH requirements files, initialises in
   ~0.35 s from bundled models with no network, and reads a 3.7 MP page in ~0.9 s
-  (first page ~2.5 s, warm-up).
+  (first page ~2.5 s, warm-up). Through the REAL ROUTE in a 4 GB container it is
+  ~1.9 s/page: the isolated engine figure is not the deployed one, and the bounds are
+  sized on the deployed measurement rather than on the engine benchmark.
+* End to end, total request time is CAPPED by the time budget at ~62 s whatever the
+  document size -- a 120-page scan takes the same ~62 s as a 50-page one and reports
+  the remaining 87 pages as not attempted. Peak RSS tops out around 1.0 GB.
 * Character recall against known ground truth on upright scans: **0.96-1.00**.
   (An earlier word-level metric said 0.63 -- that metric was wrong, not the engine:
   it scored "quarterlycapacity" as two misses when every character was recovered.)
