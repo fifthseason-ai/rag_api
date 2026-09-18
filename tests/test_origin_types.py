@@ -80,7 +80,7 @@ def _simulated_store(monkeypatch):
 
     async def dummy_delete(
         self, ids=None, collection_only=False, user_id=None,
-        document_origin_type=None, subscription_id=None, executor=None
+        document_origin_type=None, subscription_id=None, executor=None, **_
     ):
         return None
 
@@ -220,7 +220,7 @@ def test_delete_is_origin_scoped_only_that_origin_removed(monkeypatch):
 
     async def fake_delete(
         self, ids=None, collection_only=False, user_id=None,
-        document_origin_type=None, subscription_id=None, executor=None
+        document_origin_type=None, subscription_id=None, executor=None, **_
     ):
         seen["origin"] = document_origin_type
         rows[:] = [r for r in rows if not _matches(r, ids, document_origin_type)]

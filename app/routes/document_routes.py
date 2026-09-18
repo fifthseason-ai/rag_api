@@ -660,6 +660,12 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+#: The producers a delete may be narrowed to. These are the exact values the PDF loader
+#: writes into `text_source` on every stored chunk; they are a CONTRACT SURFACE that Core
+#: reads at retrieval time, so renaming one silently breaks a consumer.
+_DELETABLE_TEXT_SOURCES = frozenset({"native", "ocr"})
+
+
 @router.delete("/documents")
 async def delete_documents(
     body: DeleteDocumentsBody,
@@ -669,6 +675,22 @@ async def delete_documents(
     user_id = body.entity_id
     document_origin_type = body.document_origin_type
     subscription_id = body.subscription_id
+    # FILES-01: when set, only the rows written by this producer are removed and the
+    # file itself survives. Validated against a closed set rather than passed through,
+    # because every filter in the delete path NARROWS: a value that reached the SQL
+    # unmatched would delete nothing, but a value that got DROPPED on the way would
+    # delete the whole file. A typo must be a refusal, never a wider delete.
+    text_source = body.text_source
+    if text_source is not None and text_source not in _DELETABLE_TEXT_SOURCES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": (
+                    f"Unknown text_source '{text_source}'. Expected one of: "
+                    f"{', '.join(sorted(_DELETABLE_TEXT_SOURCES))}. Nothing was deleted."
+                )
+            },
+        )
 
     # Entitlement (D-KSPT-1): delete is scoped to an authorized entity. The
     # caller-supplied entity_id is only a filter; it must be within the token
@@ -699,10 +721,24 @@ async def delete_documents(
                 user_id=user_id,
                 document_origin_type=origin_type_value,
                 subscription_id=subscription_id,
+                text_source=text_source,
                 executor=request.app.state.thread_pool,
             )
         else:
             existing_ids = vector_store.get_filtered_ids(document_ids)
+            if text_source is not None:
+                # Only the pgvector store can narrow a delete by producer. Refusing is
+                # the only honest answer for the others: silently deleting the whole
+                # file would destroy exactly the text the caller asked to keep.
+                raise HTTPException(
+                    status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                    detail={
+                        "message": (
+                            "Deleting by text_source is only supported on the pgvector "
+                            "store. Nothing was deleted."
+                        )
+                    },
+                )
             vector_store.delete(ids=document_ids)
 
         if document_ids:
@@ -716,7 +752,10 @@ async def delete_documents(
             len(existing_ids), len(document_ids),
         )
 
-        # Delete cached summaries for the removed files
+        # Delete cached summaries for the removed files. This runs for a text_source
+        # delete too, and deliberately: a summary built from text that has just been
+        # superseded is stale, and a stale summary presented as current is worse than
+        # no summary. It is regenerated on next use.
         if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
             try:
                 await delete_summaries_by_file_ids(document_ids, user_id=user_id)
@@ -728,6 +767,19 @@ async def delete_documents(
                 )
 
         file_count = len(document_ids)
+        if text_source is not None:
+            # NOT "deleted successfully": the file still exists and still has its other
+            # rows. Saying otherwise would be the same shape of dishonest success this
+            # service has spent the whole lane removing.
+            return {
+                "message": (
+                    f"Removed the '{text_source}' rows for {file_count} "
+                    f"file{'s' if file_count > 1 else ''}. The file"
+                    f"{'s' if file_count > 1 else ''} and any rows from other sources "
+                    f"remain."
+                ),
+                "text_source": text_source,
+            }
         return {
             "message": f"Documents for {file_count} file{'s' if file_count > 1 else ''} deleted successfully"
         }

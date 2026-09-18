@@ -81,3 +81,13 @@ class DeleteDocumentsBody(BaseModel):
     file_ids: List[str] = []
     document_origin_type: Optional[DocumentOriginType] = None
     subscription_id: Optional[str] = None
+    #: Delete only the rows a particular producer wrote (FILES-01): `native` for text
+    #: taken from the document's own text layer, `ocr` for text a machine read off a
+    #: page image. Omitted, nothing changes and every matching row is deleted.
+    #:
+    #: This exists so an escalation can SUPERSEDE rather than supplement: Core embeds
+    #: the better text first, then deletes only the superseded local-OCR rows. The
+    #: other ordering -- delete, then embed -- can leave a document with ZERO rows if
+    #: the second step fails, which is the one outcome an escalation must never be able
+    #: to produce.
+    text_source: Optional[str] = None

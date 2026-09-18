@@ -150,7 +150,7 @@ def override_vector_store(monkeypatch):
         user_id=None,
         document_origin_type=None,
         subscription_id=None,
-        executor=None,
+        executor=None, **_
     ):
         return None
 
