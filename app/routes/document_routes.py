@@ -25,6 +25,7 @@ from fastapi import (
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import asyncio
+import threading
 
 if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
@@ -73,6 +74,7 @@ from app.utils.document_loader import (
     cleanup_temp_encoding_file,
     DocumentVerdictError,
 )
+from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget
 from app.utils.health import is_health_ok
 
 router = APIRouter()
@@ -476,10 +478,29 @@ async def load_file_content(
     during loading, before any `add_documents` call, so nothing is stored.
     """
     loader = None
+    # Bounded local OCR for scanned PDF pages (FILES-01). `stop` is the cancellation
+    # half: `run_in_executor` cancels the FUTURE when the caller goes away, but the
+    # worker THREAD keeps running -- so without this a disconnected client leaves a
+    # 50-page OCR burning CPU for nobody. The loader checks this flag between pages.
+    #
+    # There is deliberately NO `except OcrCancelled` handler here. The flag is set only
+    # inside the `except asyncio.CancelledError` below, which re-raises immediately, so
+    # by the time the worker thread raises `OcrCancelled` nobody is awaiting that future
+    # and the exception is discarded -- which is the correct outcome, because a cancelled
+    # request has no caller left to answer. The first version answered 503 there; review
+    # showed it was unreachable, and an uncovered handler that implies a tested path is
+    # worse than no handler (the same call made for the dead verdict guard in #29).
+    stop = threading.Event()
     try:
-        loader, known_type, file_ext = get_loader(filename, content_type, file_path)
+        loader, known_type, file_ext = get_loader(
+            filename, content_type, file_path, ocr_budget=OcrBudget(should_stop=stop.is_set)
+        )
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
+        try:
+            data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
+        except asyncio.CancelledError:
+            stop.set()
+            raise
         return data, known_type, file_ext
     except DocumentVerdictError as verdict_error:
         logger.warning(
@@ -1310,6 +1331,52 @@ _UNIT_LOCATOR_KEYS = (
 )
 
 
+#: How one page's local-OCR outcome becomes the receipt's unit reason (FILES-01).
+#:
+#: `no_page_image` and `disabled` deliberately map to nothing, so those pages keep the
+#: plain `empty` they reported before OCR existed: a page with no embedded image is
+#: indistinguishable HERE from a blank page, and claiming it needs escalation would be
+#: inventing a fact. Everything else names what went wrong specifically.
+#:
+#: `ocr_no_text` and `page_limit`/`time_limit`/`cancelled` map to DIFFERENT reasons on
+#: purpose. "We read the page and got nothing" and "we never looked at the page" are
+#: the pair Core called out as the one that gets collapsed by accident.
+_OCR_REASON_TO_UNIT_REASON = {
+    "ocr_no_text": "ocr_no_text",
+    "ocr_low_confidence": "ocr_low_confidence",
+    "ocr_orientation_suspect": "ocr_orientation_suspect",
+    "engine_unavailable": "ocr_unavailable",
+    "page_limit": "ocr_not_attempted",
+    "time_limit": "ocr_not_attempted",
+    "cancelled": "ocr_not_attempted",
+    "budget_exhausted": "ocr_not_attempted",
+}
+
+#: Outcomes where a better reader might succeed -- the ONLY ones that set
+#: `escalation.recommended`. `ocr_low_confidence` belongs here even though such a page
+#: DID yield stored text: it is the "nonempty text is not success" case.
+_ESCALATABLE_OCR_REASONS = frozenset(
+    {"ocr_no_text", "ocr_low_confidence", "ocr_orientation_suspect", "engine_unavailable",
+     "page_limit", "time_limit", "cancelled", "budget_exhausted"}
+)
+
+#: Outcomes where OCR DID produce stored text that should not read as clean success.
+#: Deliberately NOT used for any per-reason count: each weak page is counted under its own
+#: reason exactly once, so the buckets stay addable.
+#:
+#: Review caught the first version counting an orientation-suspect page under BOTH
+#: `pages_low_confidence` and `pages_orientation_suspect` -- one weak page, two increments.
+#: The label was false as well as duplicated: a sideways page comes back at HIGH
+#: confidence (~0.96 measured), which is the entire reason the geometric signal exists, so
+#: reporting it as low confidence contradicted the data and this module's own docstring.
+_OCR_WEAK_REASONS = frozenset({"ocr_low_confidence", "ocr_orientation_suspect"})
+
+#: Page-level outcomes that mean a BOUND stopped the work rather than the page itself
+#: being unreadable. Surfaced as `ocr.stopped_reason` so a truncated run is never
+#: mistaken for a complete one.
+_OCR_STOP_REASONS = frozenset({"page_limit", "time_limit", "cancelled", "budget_exhausted"})
+
+
 def _extraction_receipt(data: Iterable[Document]) -> dict:
     """Build the additive extraction receipt for the /embed response (KI-02 WP-G1).
 
@@ -1327,7 +1394,12 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     Shape:
       status:         'complete' (every unit extracted) | 'partial' (>=1 extracted
                       AND >=1 empty/image-only unit) | 'empty' (0 extracted units;
-                      this is the 422 path)
+                      this is the 422 path).
+                      ALSO forced to 'partial' when `escalation.recommended` is true,
+                      so a document with pages that still need a better reader can
+                      never read as `complete` on the field consumers already check --
+                      including when every page yielded some text the engine does not
+                      vouch for. Nonempty text is not success.
       locator_kind:   'page' | 'slide' | 'sheet' | 'none'
       units_total / units_extracted / units_empty / units_image_only
       empty_locators: sorted locators (page ints / slide ints / sheet names) of
@@ -1335,6 +1407,26 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       units only)
       reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
                       locator-bearing unit
+      ocr:            PRESENT ONLY when local OCR ran on at least one unit (FILES-01) —
+                      {engine,
+                       pages_attempted,      pages the engine actually looked at
+                       pages_recovered,      pages whose stored text came from OCR
+                       pages_no_text,        attempted, engine returned nothing
+                       pages_not_attempted,  skipped because a bound was already spent
+                       pages_low_confidence, recovered but the engine does not vouch
+                       mean_confidence,      over recovered pages, or null
+                       stopped_reason}       'page_limit'|'time_limit'|'cancelled'|null
+                      `pages_attempted` and `pages_not_attempted` are deliberately
+                      separate: "read it and got nothing" and "never looked" are
+                      different facts about coverage.
+      escalation:     PRESENT with `ocr`. The typed outcome for a controlled fallback
+                      to the approved AWS document route — {recommended, reason,
+                      locators}. rag_api states what it could not read well; it never
+                      calls, chooses or pays for the fallback and owns no policy about
+                      whether escalating is worth it.
+      text_sources:   Per-page provenance grouped by producer —
+                      {'native': [...], 'ocr': [...], 'none': [...]} — so a citation
+                      can say WHICH pages came from the text layer and which from OCR.
       formulas:       PRESENT ONLY for formats that report a formula scan
                       (spreadsheets; KI-02 SP-01.5) —
                       {scan: 'complete' | 'unavailable',
@@ -1373,13 +1465,27 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
         meta = getattr(d, "metadata", None) or {}
         loc = meta.get(meta_key) if meta_key is not None else None
         if loc not in units:
-            units[loc] = {"content": False, "image_only": False}
+            units[loc] = {
+                "content": False,
+                "image_only": False,
+                "ocr": None,
+                "source": None,
+                "attempted": False,
+            }
             order.append(loc)
         pc = getattr(d, "page_content", None)
         if pc and clean_text(pc).strip():
             units[loc]["content"] = True
         if meta.get("image_only") is True:
             units[loc]["image_only"] = True
+        if meta.get("ocr_reason") is not None:
+            units[loc]["ocr"] = meta["ocr_reason"]
+            if meta.get("ocr_attempted"):
+                units[loc]["attempted"] = True
+            if meta.get("ocr_confidence") is not None:
+                units[loc]["ocr_confidence"] = meta["ocr_confidence"]
+        if meta.get("text_source") is not None:
+            units[loc]["source"] = meta["text_source"]
         if meta.get("formula_scan") is not None:
             formula_scan = meta["formula_scan"]
         cells = meta.get("formula_uncached_cells")
@@ -1414,6 +1520,18 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     reason_by_loc = {loc: "image_only" for loc in image_only}
     reason_by_loc.update({loc: "empty" for loc in empty})
 
+    # --- local OCR outcome, and the typed escalation signal Core acts on -------------
+    #
+    # Every value here is derived from what the loader actually did to each page; none
+    # of it decides anything about cost or providers. A page whose OCR fell short keeps
+    # the honest `empty` family it already had, but gains a SPECIFIC reason, because
+    # "this page is a scan we could not read well enough" and "this page is blank" are
+    # different facts and only one of them is worth escalating.
+    for loc in non_extracted:
+        mapped = _OCR_REASON_TO_UNIT_REASON.get(units[loc]["ocr"])
+        if mapped:
+            reason_by_loc[loc] = mapped
+
     receipt = {
         "status": status_str,
         "locator_kind": locator_kind,
@@ -1430,6 +1548,91 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             if loc is not None
         ],
     }
+
+    # Present ONLY when OCR actually ran on at least one unit, so every receipt for a
+    # native PDF, a workbook or a deck keeps its exact previous shape.
+    ocr_locs = [loc for loc in order if units[loc]["ocr"] is not None]
+    if ocr_locs:
+        recovered = [loc for loc in ocr_locs if units[loc]["source"] == "ocr"]
+        weak = [loc for loc in recovered if units[loc]["ocr"] == "ocr_low_confidence"]
+        suspect = [loc for loc in recovered if units[loc]["ocr"] == "ocr_orientation_suspect"]
+        attempted = [loc for loc in ocr_locs if units[loc]["attempted"]]
+        not_attempted = [
+            loc for loc in ocr_locs
+            if _OCR_REASON_TO_UNIT_REASON.get(units[loc]["ocr"]) == "ocr_not_attempted"
+        ]
+        no_text = [loc for loc in ocr_locs if units[loc]["ocr"] == "ocr_no_text"]
+        confidences = [
+            units[loc]["ocr_confidence"]
+            for loc in recovered
+            if units[loc].get("ocr_confidence") is not None
+        ]
+        escalate = sorted(
+            (loc for loc in ocr_locs if units[loc]["ocr"] in _ESCALATABLE_OCR_REASONS),
+            key=_sort_key,
+        )
+        stopped = next(
+            (units[loc]["ocr"] for loc in ocr_locs if units[loc]["ocr"] in _OCR_STOP_REASONS),
+            None,
+        )
+        receipt["ocr"] = {
+            "engine": OCR_ENGINE_NAME,
+            # COVERAGE, in three separable counts. `pages_attempted` counts only pages
+            # the engine actually looked at; a page skipped because a bound was already
+            # spent is in `pages_not_attempted`, never folded into "attempted, nothing".
+            "pages_attempted": len(attempted),
+            "pages_recovered": len(recovered),
+            "pages_no_text": len(no_text),
+            "pages_not_attempted": len(not_attempted),
+            # Recovered but weak. Separated from `pages_recovered` so nonempty text can
+            # never read as clean success.
+            "pages_low_confidence": len(weak),
+            # Pages whose detected text runs vertically: read, but almost certainly
+            # sideways, so most of the page was missed. Counted separately AND
+            # exclusively -- it is a DIFFERENT fact from low confidence, because these
+            # pages come back confident and wrong. A page is never in both buckets.
+            "pages_orientation_suspect": len(suspect),
+            "mean_confidence": (
+                round(sum(confidences) / len(confidences), 4) if confidences else None
+            ),
+            # Which bound ended the work, or null when the whole document was read.
+            "stopped_reason": stopped,
+        }
+        # The typed outcome Core escalates on. rag_api states WHAT it could not read
+        # well; it does not call, choose or pay for the fallback, and it owns no policy
+        # about whether escalating is worth it.
+        receipt["escalation"] = {
+            "recommended": bool(escalate),
+            "reason": (
+                _OCR_REASON_TO_UNIT_REASON.get(units[escalate[0]]["ocr"], units[escalate[0]]["ocr"])
+                if escalate
+                else None
+            ),
+            "locators": [loc for loc in escalate if loc is not None],
+        }
+        # THE LOAD-BEARING ONE. A document with pages still needing a better reader must
+        # never present as `complete` on the field consumers already read -- including
+        # the case where every page yielded SOME text but the engine does not vouch for
+        # it. Nonempty text is not success. `empty` is left alone: that is the 422 path
+        # and is already the strongest possible statement of failure.
+        if escalate and receipt["status"] == "complete":
+            receipt["status"] = "partial"
+
+    # PER-PAGE PROVENANCE: which engine produced which page's text. Core needs this at
+    # page granularity, not as one document-level label, because a citation has to be
+    # able to say that page 3 came from OCR and page 4 from the native text layer.
+    # Grouped rather than one object per page so a long document stays compact.
+    if ocr_locs or any(units[loc]["source"] for loc in order):
+        sources: dict = {}
+        for loc in order:
+            source = units[loc]["source"]
+            if source is None:
+                source = "native" if units[loc]["content"] else "none"
+            sources.setdefault(source, []).append(loc)
+        receipt["text_sources"] = {
+            name: sorted((l for l in locs if l is not None), key=_sort_key)
+            for name, locs in sorted(sources.items())
+        }
 
     # Present ONLY for formats that report a formula scan (spreadsheets today), so
     # every existing receipt keeps its exact shape.

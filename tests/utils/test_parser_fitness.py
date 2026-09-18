@@ -791,7 +791,9 @@ def test_embed_nul_only_content_rejected_no_rows(guard_client, monkeypatch):
     monkeypatch.setattr(
         document_routes,
         "get_loader",
-        lambda filename, content_type, filepath: (_NulLoader(), True, "pdf"),
+        # ** absorbs ocr_budget (FILES-01): this stub cares only that the route
+        # gets a loader, not how the real one is configured.
+        lambda filename, content_type, filepath, **_: (_NulLoader(), True, "pdf"),
     )
     r = _embed(guard_client, "junk.pdf", b"%PDF-1.4 not really a pdf", "application/pdf")
     assert r.status_code == 422, r.text
