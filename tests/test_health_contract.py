@@ -114,7 +114,14 @@ def test_exception_detail_is_not_disclosed(client, health):
     text = response.text
     for secret in secrets:
         assert secret not in text, "%r reached an unauthenticated response" % secret
-    assert response.json() == {"status": "DOWN"}
+    body = response.json()
+    assert body["status"] == "DOWN"
+    # Deliberately NOT `body == {"status": "DOWN"}`. That equality would redden on any additive,
+    # harmless field -- and #32 adds exactly one (`build`) to this route -- which makes it a change
+    # detector for the wrong property. What must hold is that no field CARRIES THE DETAIL: assert
+    # the absence of the keys an exception would leak through, not the absence of all keys.
+    for leaky in ("error", "detail", "message", "traceback", "exception"):
+        assert leaky not in body, "%r is how the exception text came back before" % leaky
 
 
 def test_health_takes_no_token(client, health):
