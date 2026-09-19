@@ -243,7 +243,15 @@ def test_dockerfiles_accept_and_record_the_stamp(dockerfile):
             "%s must DEFAULT the arg, or a plain `docker build .` breaks for developers"
             % dockerfile
         )
-        assert "ENV" in text and "${%s}" % arg in text, dockerfile
+        # NOT `"ENV" in text and "${ARG}" in text`. That pair is satisfied without the stamp
+        # existing at all -- the base images already carry `ENV SCARF_NO_ANALYTICS=true`, and
+        # `${BUILD_REVISION}` also appears on the LABEL line. Deleting the whole ENV block from
+        # both Dockerfiles left this file 15/15 green, and that block is the half of the PR that
+        # puts the stamp ON THE WIRE. The assertion now names the assignment itself.
+        assert "%s=${%s}" % (arg, arg) in text, (
+            "%s must ENV the arg, or the build identity never reaches a response header"
+            % dockerfile
+        )
     assert 'org.opencontainers.image.revision="${BUILD_REVISION}"' in text, (
         "%s must label the image, because a deployed digest can only be resolved from the "
         "registry -- not from the wire" % dockerfile
@@ -298,9 +306,18 @@ def test_dirty_refusal_actually_exits_and_the_override_actually_passes():
     # Everything the script reaches for is stubbed, so this test runs anywhere -- including
     # INSIDE the shipped runtime image, which has no git and no AWS credentials. `docker` echoes
     # its arguments so a build that should not have happened is visible in the output.
+    # `cat >/dev/null` is not decoration. The script runs
+    # `aws ecr get-login-password | docker login --password-stdin`, so a `docker` stub that exits
+    # without draining stdin kills `aws` with SIGPIPE; `set -o pipefail` then aborts the script
+    # with 141 and the run fails for a reason that has nothing to do with the guard under test.
+    # It reproduced at roughly 3-4%, and the assertion it flaked was the NEGATIVE CONTROL -- the
+    # one thing standing between this test and a script that refuses every build.
     for tool in ("aws", "docker"):
         write_stub(
-            tool, ["echo STUB-%s %s$@%s" % (tool.upper(), QUOTE, QUOTE), "exit 0"]
+            tool,
+            ["cat >/dev/null 2>&1 || true",
+             "echo STUB-%s %s$@%s" % (tool.upper(), QUOTE, QUOTE),
+             "exit 0"],
         )
     # The `git` stub is what makes the tree dirty or clean, deterministically and without needing
     # a real repository: `porcelain` output is exactly the signal the script keys on.
@@ -310,7 +327,12 @@ def test_dirty_refusal_actually_exits_and_the_override_actually_passes():
             'case "$*" in',
             '  "rev-parse HEAD") echo 1111111111111111111111111111111111111111 ;;',
             '  "rev-parse --git-dir") echo .git ;;',
-            '  "status --porcelain") [ "${STUB_DIRTY:-1}" = "1" ] && echo " M dirt.txt" ;;',
+            # STUB_DIRTY=fail is the case that was missing and that the script read as CLEAN:
+            # a `git status` that FAILS prints nothing, exactly like a clean tree.
+            '  "status --porcelain")',
+            '    [ "${STUB_DIRTY:-1}" = "fail" ] && exit 128',
+            '    [ "${STUB_DIRTY:-1}" = "1" ] && echo " M dirt.txt"',
+            "    ;;",
             "esac",
             "exit 0",
         ],
@@ -354,3 +376,33 @@ def test_dirty_refusal_actually_exits_and_the_override_actually_passes():
     assert "REFUSED" not in clean.stderr, "a clean tree must not be refused"
     assert "STUB-DOCKER build" in clean.stdout
     assert "BUILD_DIRTY=false" in clean.stdout, "and it must be stamped clean, not merely allowed"
+
+    # AN UNMEASURABLE TREE IS NOT A CLEAN ONE. `git status --porcelain` prints nothing when it
+    # fails and nothing when the tree is clean, and the script used to read those as the same
+    # thing: it built the image, stamped `ai.fifthseason.build.dirty=false`, served
+    # `X-Build-Tree: clean`, and printed `build tree dirty=false` into the receipt -- a measured-
+    # sounding claim nobody had measured. Reachable in ordinary life: `git rev-parse HEAD` does
+    # not touch the index and `git status` does, so a stale `.git/index.lock` fails the second
+    # while the first still answers.
+    env["STUB_DIRTY"] = "fail"
+    unmeasurable = subprocess.run(
+        ["bash", os.path.join(repo, "deploy", "push.sh")],
+        cwd=repo, env=env, capture_output=True, text=True,
+    )
+    assert unmeasurable.returncode == 1, unmeasurable.stdout + unmeasurable.stderr
+    assert "could NOT BE MEASURED" in unmeasurable.stderr
+    assert "STUB-DOCKER build" not in unmeasurable.stdout, "it must refuse BEFORE building"
+    assert "BUILD_DIRTY=false" not in unmeasurable.stdout, (
+        "a failed measurement must never be reported as a clean tree"
+    )
+
+    # ...and the same case goes through on the same deliberate hatch, still honestly stamped.
+    env["PUSH_ALLOW_DIRTY"] = "1"
+    forced = subprocess.run(
+        ["bash", os.path.join(repo, "deploy", "push.sh")],
+        cwd=repo, env=env, capture_output=True, text=True,
+    )
+    assert "STUB-DOCKER build" in forced.stdout, "the override must let the build proceed"
+    assert "BUILD_DIRTY=unknown" in forced.stdout, (
+        "and the image must be stamped unknown -- not clean, not dirty"
+    )
