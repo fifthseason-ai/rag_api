@@ -259,6 +259,42 @@ def test_dockerfiles_accept_and_record_the_stamp(dockerfile):
     assert 'ai.fifthseason.build.dirty="${BUILD_DIRTY}"' in text, dockerfile
 
 
+#: `.dockerignore` excludes `deploy/` on purpose -- a deploy script has no business inside the
+#: image it deploys. The CI job that runs this suite INSIDE the shipped runtime therefore cannot
+#: see `push.sh`, and three tests below read it. That job found this before any human did, which is
+#: the job working: a source-reading test asserts something about the REPOSITORY, and the shipped
+#: image is not the repository.
+#:
+#: The skip is narrow on purpose. "deploy/ is absent" is also what a DELETED deploy directory looks
+#: like, so the skip alone would vanish exactly when someone removed the thing it guards. The test
+#: immediately below closes that: wherever a checkout is identifiable (`.git` present), the script's
+#: existence is asserted rather than assumed.
+DEPLOY_DIR = os.path.join(ROOT, "deploy")
+IN_A_TREE_WITHOUT_DEPLOY = not os.path.isdir(DEPLOY_DIR)
+needs_deploy_dir = pytest.mark.skipif(
+    IN_A_TREE_WITHOUT_DEPLOY,
+    reason="deploy/ is excluded from the shipped image by .dockerignore, so a test that READS "
+    "deploy/push.sh has nothing to read here; its subject is the repository, not the runtime",
+)
+
+
+@pytest.mark.skipif(
+    not os.path.exists(os.path.join(ROOT, ".git")),
+    # EXISTS, not ISDIR. In a git WORKTREE -- which is how every lane in this program checks code
+    # out -- `.git` is a FILE pointing at the real directory, so an isdir() test skips exactly
+    # where this guard is most needed and passes only on a plain clone. Caught by running it.
+    reason="not a checkout -- cannot distinguish 'not shipped' from 'deleted' without git metadata",
+)
+def test_the_deploy_script_is_present_in_a_checkout():
+    """The other half of the skip above. In any tree identifiable as a checkout, `deploy/push.sh`
+    must EXIST -- otherwise deleting it would silently turn three guards into three skips."""
+    assert os.path.isfile(os.path.join(DEPLOY_DIR, "push.sh")), (
+        "deploy/push.sh is missing from a checkout: the provenance guards below would skip, not "
+        "fail, and the dirty-tree refusal would be unprotected"
+    )
+
+
+@needs_deploy_dir
 def test_push_script_derives_and_passes_the_stamp_and_prints_the_pairing():
     text = open(os.path.join(ROOT, "deploy", "push.sh"), encoding="utf-8").read()
     assert "git rev-parse HEAD" in text
@@ -271,6 +307,7 @@ def test_push_script_derives_and_passes_the_stamp_and_prints_the_pairing():
     assert "image digest" in text and "source revision" in text
 
 
+@needs_deploy_dir
 def test_push_script_refuses_a_production_build_from_a_dirty_tree():
     """A production image must be rebuildable from the revision it names, so a dirty tree is a
     REFUSAL here rather than a warning -- with one deliberate, explicit way through, because an
@@ -282,6 +319,7 @@ def test_push_script_refuses_a_production_build_from_a_dirty_tree():
     assert "PUSH_ALLOW_DIRTY" in text, "an emergency needs a documented way through"
 
 
+@needs_deploy_dir
 def test_dirty_refusal_actually_exits_and_the_override_actually_passes():
     """EXECUTED, not read. The script is run with its side effects stubbed out, in a dirty git
     repo, so the refusal and the override are observed rather than inferred from source text --
