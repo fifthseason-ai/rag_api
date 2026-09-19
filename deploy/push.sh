@@ -18,8 +18,35 @@ echo "==> Logging in to ECR..."
 aws ecr get-login-password --region "${AWS_REGION}" \
   | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
+# Derive what this image is being built FROM, because the build uses the working tree rather than
+# a git ref: without this, the only record of a deployed image's source is whatever the operator
+# happened to keep from this terminal. `git` may legitimately be absent (a tarball build), so a
+# missing value is reported as `unknown` and never guessed.
+BUILD_REVISION=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then BUILD_DIRTY=true; else BUILD_DIRTY=false; fi
+else
+  BUILD_DIRTY=unknown
+fi
+BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+if [ "${BUILD_DIRTY}" = "true" ]; then
+  # Not a refusal: shipping from a dirty tree is sometimes deliberate, and blocking it here would
+  # only teach people to bypass this script. But the image must not claim a revision whose
+  # contents it does not actually contain, so it is stamped dirty and the operator is told now
+  # rather than discovering it from a digest that matches nothing reproducible.
+  echo "!!! The build tree has UNCOMMITTED CHANGES."
+  echo "!!! This image will be stamped ${BUILD_REVISION} with tree=dirty."
+  echo "!!! It cannot be rebuilt from that revision alone. Commit first if that matters."
+fi
+
 echo "==> Building image with Dockerfile.lite (linux/amd64 for ECS X86_64)..."
-docker build --platform linux/amd64 -t "${ECR_REPO}:${IMAGE_TAG}" -f Dockerfile.lite .
+echo "    revision ${BUILD_REVISION} (tree dirty=${BUILD_DIRTY})"
+docker build --platform linux/amd64 -t "${ECR_REPO}:${IMAGE_TAG}" -f Dockerfile.lite \
+  --build-arg "BUILD_REVISION=${BUILD_REVISION}" \
+  --build-arg "BUILD_DIRTY=${BUILD_DIRTY}" \
+  --build-arg "BUILD_TIME=${BUILD_TIME}" \
+  .
 
 echo "==> Tagging image..."
 docker tag "${ECR_REPO}:${IMAGE_TAG}" "${ECR_URI}:${IMAGE_TAG}"
@@ -78,3 +105,21 @@ echo "==> Waiting for the service to stabilize..."
 aws ecs wait services-stable --region "${AWS_REGION}" --cluster "${CLUSTER}" --services "${SERVICE}"
 
 echo "==> Done. ${SERVICE} now runs ${IMAGE}"
+
+# THE RECORD. A digest identifies the artifact; a revision identifies the source; only this pairing
+# connects them, and until an image carries the stamp above, nothing else can reconstruct it. Paste
+# these four lines into the deployment receipt -- they are what makes a later "which build is this?"
+# answerable by someone who was not in this terminal.
+cat <<RECEIPT
+
+================ RECORD THIS WITH THE DEPLOYMENT ================
+  service          ${SERVICE}
+  task definition  ${NEW_TD}
+  image digest     ${IMAGE}
+  source revision  ${BUILD_REVISION}
+  build tree       dirty=${BUILD_DIRTY}
+  built at         ${BUILD_TIME}
+  verify on the wire:  curl -sI <service-url>/health | grep -i x-build-
+  verify from ECR:     docker buildx imagetools inspect ${IMAGE} | grep -i revision
+=================================================================
+RECEIPT

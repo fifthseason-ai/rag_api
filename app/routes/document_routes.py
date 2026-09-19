@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
     from langchain_community.vectorstores.pgvector import PGVector as PgVector
 
+from app.build_info import build_summary
 from app.config import (
     logger,
     vector_store,
@@ -602,7 +603,11 @@ async def get_all_ids(request: Request):
 async def health_check():
     try:
         if await is_health_ok():
-            return {"status": "UP"}
+            # `build` is additive: `status` keeps its exact existing value and meaning, so a
+            # caller that only reads `status` is unaffected. It is here because this is the route
+            # that actually answers in the deployed app, and a health check that cannot say WHICH
+            # build is healthy leaves the only question a deployment receipt needs unanswerable.
+            return {"status": "UP", "build": build_summary()}
         else:
             logger.error("Health check failed")
             return {"status": "DOWN"}, 503
