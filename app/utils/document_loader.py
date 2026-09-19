@@ -13,7 +13,7 @@ from langchain_core.documents import Document
 
 from app.utils.extraction_budget import (
     ATTEMPTED_KEY,
-    NOT_ATTEMPTED_KEY,
+    NOT_INCLUDED_KEY,
     STOPPED_KEY,
 )
 from app.config import (
@@ -626,19 +626,34 @@ class SafePyPDFLoader:
         # extract_images=True: must collect eagerly so that a mid-stream
         # KeyError doesn't leave already-yielded pages duplicated by the
         # fallback (yield from + try/except would deliver partial + full).
+        #
+        # THE BOUND WRAPS THE PRODUCER, NOT THE RESULT. Applying it to an already-materialised
+        # list -- which is what this did before review -- costs the full parse of every page and
+        # then throws the surplus away: measured at 10 pages parsed for a 3-page bound with
+        # `extract_images=True`, i.e. the exact exhaustion this exists to prevent, plus seven
+        # pages of data loss for nothing. Wrapping the generator means the pages past the bound
+        # are never produced.
         try:
-            pages = list(loader.lazy_load())
+            pages = list(self._within_budget(loader.lazy_load()))
         except KeyError as e:
             if "/Filter" in str(e):
                 logger.warning(
                     f"PDF image extraction failed for {self.filepath}, falling back to text-only: {e}"
                 )
                 fallback_loader = PyPDFLoader(self.filepath, extract_images=False)
-                pages = list(fallback_loader.lazy_load())
+                # A FRESH budget. The first attempt spent the original one, and a spent budget
+                # yields nothing at all -- which would turn a recoverable image-extraction failure
+                # into an empty document. The fallback is a retry of the same work, so it gets the
+                # same allowance, not the remains of the allowance the failed attempt consumed.
+                pages = list(
+                    self._within_budget(
+                        fallback_loader.lazy_load(), budget=self._fresh_budget()
+                    )
+                )
             else:
                 # Re-raise if it's a different error
                 raise
-        yield from self._with_ocr(self._within_budget(iter(pages)))
+        yield from self._with_ocr(iter(pages))
 
     # -- bounded reading of a native PDF (FILES-01) ---------------------------------
     #
@@ -668,9 +683,24 @@ class SafePyPDFLoader:
             return None
         return max(0, total - pages_read)
 
-    def _within_budget(self, pages: Iterator[Document]) -> Iterator[Document]:
-        """Yield pages while the read budget allows, stamping the last one when it does not."""
+    def _fresh_budget(self):
+        """A new budget with the same limits and none of the spending.
+
+        Only the retry path needs this: a budget counts pages for ONE pass over ONE document, and
+        handing a second pass the remains of the first makes the retry read less than the operator
+        configured -- or, once the first pass has used the whole allowance, nothing at all.
+        """
         budget = self.extraction_budget
+        if budget is None:
+            return None
+        return ExtractionBudget(
+            max_pages=budget.max_pages,
+            time_budget_seconds=budget.time_budget_seconds,
+        )
+
+    def _within_budget(self, pages: Iterator[Document], budget=None) -> Iterator[Document]:
+        """Yield pages while the read budget allows, stamping the last one when it does not."""
+        budget = budget if budget is not None else self.extraction_budget
         if budget is None or not budget.enabled:
             yield from pages
             return
@@ -685,20 +715,38 @@ class SafePyPDFLoader:
                 yield held
             held = page
 
+        if held is None and stopped:
+            # A budget that was already spent before the first page: nothing to yield, and -- far
+            # worse -- nothing to STAMP, so the receipt would say `empty` with no `extraction_bound`
+            # at all and the caller would be told their readable file has no text. Unreachable on
+            # the live path (each load builds its own budget, and the retry above takes a fresh
+            # one), which is exactly why it must be loud rather than silent: the day it becomes
+            # reachable, a crash naming the cause is honest and an empty receipt is not.
+            raise RuntimeError(
+                "extraction budget was already spent before this pass began "
+                "(stopped_reason=%s, pages_read=%d): a budget counts one pass over one "
+                "document -- build a fresh ExtractionBudget per load."
+                % (budget.stopped_reason, budget.pages_read)
+            )
+
         if held is not None:
             if stopped:
                 # Stamped on the last page actually read, so the receipt can find it without
                 # the loader having to invent a synthetic page for the ones it never opened.
-                not_attempted = self._remaining_page_count(budget.pages_read)
+                not_included = self._remaining_page_count(budget.pages_read)
                 held.metadata[STOPPED_KEY] = budget.stopped_reason
                 held.metadata[ATTEMPTED_KEY] = budget.pages_read
-                held.metadata[NOT_ATTEMPTED_KEY] = not_attempted
+                held.metadata[NOT_INCLUDED_KEY] = not_included
+                # "not included", not "not opened": the generator holds a page back so it can stamp
+                # the last one it keeps, so one page beyond the bound was pulled from the producer
+                # and discarded. The count is right for "absent from this receipt" and was wrong by
+                # one for "never opened", which is what the sentence used to say.
                 logger.warning(
-                    "Stopped reading %s after %d page(s): %s (%s page(s) not opened)",
+                    "Stopped reading %s after %d page(s): %s (%s page(s) not included)",
                     self.filepath,
                     budget.pages_read,
                     budget.stopped_reason,
-                    "unknown" if not_attempted is None else not_attempted,
+                    "unknown" if not_included is None else not_included,
                 )
             yield held
 

@@ -19,10 +19,20 @@ TWO THINGS THIS DELIBERATELY DOES NOT DO.
    byte-identical to before until an operator sets them. A safe number depends on facts this lane
    cannot read -- the task's memory limit, the load balancer's idle timeout, the ingress body cap --
    and a number chosen without them would be a prediction dressed as a measurement.
-2. **It never turns a truncation into an empty document or a fake success.** A stopped extraction
-   keeps every page it did read, marks WHICH bound stopped it, and the receipt reports `partial`.
-   A configured limit below one page is raised to one page for the same reason: zero pages would be
-   reported as an empty document, which is a different (and false) statement about the file.
+2. **A stopped extraction is never a fake success.** It keeps every page it did read, marks WHICH
+   bound stopped it, and the receipt reports `partial`. A configured limit below one page is raised
+   to one page for the same reason: zero pages would make a bounded document indistinguishable from
+   one with no text at all.
+
+   **CORRECTED after review, because the original wording promised more than the code delivers.**
+   This said a truncation is *never* turned into an empty document. It can be: if the pages inside
+   the bound happen to carry no text -- a title page, a cover sheet, a blank scan in front of nine
+   readable pages -- then `units_extracted` is 0, and the empty-extraction guard refuses the upload
+   with 422 exactly as it would for a genuinely empty file. **No page floor can prevent that**, only
+   a bound high enough to reach the text. What IS guaranteed: the receipt carries `extraction_bound`
+   so the cause is never ambiguous, and the refusal message names the bound instead of blaming the
+   file. That is a real operational consequence of setting a low page limit and it belongs in the
+   rollout decision, not in a docstring that promises it away.
 """
 
 import time
@@ -31,10 +41,14 @@ from typing import Optional
 
 from app.config import PDF_EXTRACT_MAX_PAGES, PDF_EXTRACT_TIME_BUDGET_SECONDS
 
-#: Metadata keys the loader stamps on the last page it read when a bound stopped it. The receipt
-#: reads them; they are a CONTRACT SURFACE the same way `text_source` is.
+#: Metadata keys the loader stamps on the last page it read when a bound stopped it, and which the
+#: receipt turns into `extraction_bound`. No consumer outside this repo reads them yet.
 STOPPED_KEY = "extraction_stopped"
-NOT_ATTEMPTED_KEY = "extraction_pages_not_attempted"
+#: NOT "not attempted". One page beyond the bound IS pulled from the producer and then discarded --
+#: the generator holds a page back so it can stamp the last one it keeps -- so a count of pages the
+#: reader never opened would be off by one. This counts pages ABSENT FROM THIS RECEIPT, which is
+#: both true and the thing a caller actually needs to know.
+NOT_INCLUDED_KEY = "extraction_pages_not_included"
 ATTEMPTED_KEY = "extraction_pages_read"
 
 UNLIMITED = 0
@@ -44,10 +58,16 @@ UNLIMITED = 0
 class ExtractionBudget:
     """One document's allowance for READING pages, shared across its pages.
 
-    Values are read when a budget is made, not when the class is defined: a default evaluated at
-    class-definition time froze the configured limits and made them unreachable to anything that
-    reconfigures at runtime -- including a test that wants to exercise the bound. That mistake was
-    made once already in `OcrBudget` and corrected there.
+    Values are read when a budget is MADE, not when the class is defined: a default evaluated at
+    class-definition time froze the configured limits into the signature. That mistake was made
+    once already in `OcrBudget` and corrected there.
+
+    Scope of that, stated precisely after review, because the earlier wording overclaimed: the
+    factory closes over THIS module's globals, which are bound at import from the environment.
+    Reassigning `app.config.PDF_EXTRACT_MAX_PAGES` at runtime therefore does NOT reach it -- a test
+    that wants to exercise the bound passes the limits to the constructor (as every test here does)
+    or patches this module's own names. Production is unaffected: the environment is read at import
+    and never changes afterwards.
     """
 
     max_pages: int = field(default_factory=lambda: PDF_EXTRACT_MAX_PAGES)

@@ -20,7 +20,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from app.utils.document_loader import SafePyPDFLoader
 from app.utils.extraction_budget import (
     ATTEMPTED_KEY,
-    NOT_ATTEMPTED_KEY,
+    NOT_INCLUDED_KEY,
     STOPPED_KEY,
     ExtractionBudget,
 )
@@ -103,7 +103,7 @@ def test_the_stop_is_recorded_with_what_was_not_opened(pdf_of_10_pages):
 
     assert marker[STOPPED_KEY] == "page_limit"
     assert marker[ATTEMPTED_KEY] == 4
-    assert marker[NOT_ATTEMPTED_KEY] == 6, (
+    assert marker[NOT_INCLUDED_KEY] == 6, (
         "the pages never opened have no locators of their own -- if this count is wrong or "
         "missing, nothing else in the receipt shows they exist"
     )
@@ -149,7 +149,7 @@ def test_a_document_inside_its_bounds_is_not_marked_stopped(pdf_of_10_pages):
 
 
 def test_page_count_that_cannot_be_established_is_reported_as_unknown(pdf_of_10_pages):
-    """`pages_not_attempted` is None, never 0, when the file's own page count cannot be read.
+    """`pages_not_included` is None, never 0, when the file's own page count cannot be read.
     Zero would say "there was nothing more", which is a claim this service cannot make here.
 
     The failure is made REAL rather than patched in: the file is unlinked while the already-open
@@ -168,7 +168,7 @@ def test_page_count_that_cannot_be_established_is_reported_as_unknown(pdf_of_10_
         docs.append(doc)
 
     assert budget.stopped_reason == "page_limit"
-    assert docs[-1].metadata[NOT_ATTEMPTED_KEY] is None, (
+    assert docs[-1].metadata[NOT_INCLUDED_KEY] is None, (
         "the count could not be established, and unknown is not zero"
     )
 
@@ -194,7 +194,7 @@ def test_a_stopped_read_is_reported_partial_never_complete(pdf_of_10_pages):
     assert receipt["extraction_bound"] == {
         "stopped_reason": "page_limit",
         "pages_read": 4,
-        "pages_not_attempted": 6,
+        "pages_not_included": 6,
     }
 
 
@@ -218,7 +218,7 @@ def test_the_marker_is_found_wherever_it_sits(pdf_of_10_pages):
                 "page": 1,
                 STOPPED_KEY: "time_limit",
                 ATTEMPTED_KEY: 2,
-                NOT_ATTEMPTED_KEY: 97,
+                NOT_INCLUDED_KEY: 97,
             },
         ),
         Document(page_content="page three", metadata={"page": 2}),
@@ -226,4 +226,162 @@ def test_the_marker_is_found_wherever_it_sits(pdf_of_10_pages):
     receipt = _receipt(docs)
     assert receipt["status"] == "partial"
     assert receipt["extraction_bound"]["stopped_reason"] == "time_limit"
-    assert receipt["extraction_bound"]["pages_not_attempted"] == 97
+    assert receipt["extraction_bound"]["pages_not_included"] == 97
+
+
+# =====================================================================================
+# The four findings an independent review returned against the first version of this
+# feature. Each test below fails against that version; three of them describe a way the
+# bound could make a FALSE STATEMENT, which is the one thing this mechanism must not do.
+# =====================================================================================
+
+
+@pytest.fixture
+def pdf_with_a_blank_cover(tmp_path):
+    """Nine readable pages behind one page with no text layer -- a cover sheet, a title page,
+    a blank leading scan. Utterly ordinary, and the case that breaks a naive page bound."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    for i in range(9):
+        _text_page(writer, "Page %d marker" % (i + 2))
+    path = os.path.join(str(tmp_path), "cover.pdf")
+    with open(path, "wb") as fh:
+        writer.write(fh)
+    return path
+
+
+def test_a_bound_that_reads_only_blank_pages_blames_the_bound_not_the_file(
+    pdf_with_a_blank_cover,
+):
+    """F1. The refusal is right; the REASON was a fabrication.
+
+    With the bound set to one page and that page blank, nothing is extracted, so the
+    empty-extraction guard refuses -- correctly, since there is nothing to store and a 200
+    would be the fake success it exists to prevent. But it refused with "the file may be
+    empty, image-only/scanned, corrupted, or password-protected": four accusations about a
+    perfectly readable nine-page document, none of them true, and the real cause was our own
+    setting. The control at the end of this test extracts those nine pages fine.
+    """
+    from fastapi import HTTPException
+
+    from app.routes.document_routes import _assert_extractable_content
+
+    docs = list(
+        SafePyPDFLoader(
+            pdf_with_a_blank_cover,
+            extraction_budget=ExtractionBudget(max_pages=1, time_budget_seconds=0),
+        ).lazy_load()
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        _assert_extractable_content(docs, "cover.pdf")
+
+    detail = raised.value.detail
+    message = detail["message"]
+    assert raised.value.status_code == 422, "nothing was extracted, so nothing may be stored"
+    assert detail["extraction"].get("extraction_bound") is not None, (
+        "the cause must be machine-readable, not only in prose"
+    )
+    for accusation in ("corrupted", "password-protected", "image-only"):
+        assert accusation not in message, (
+            "the file is not what went wrong: %r" % message
+        )
+    assert "read bound" in message and "PDF_EXTRACT_MAX_PAGES" in message, (
+        "the message must name the limit and the knob that moves it: %r" % message
+    )
+
+    # THE CONTROL. Without it this test would pass against a bound that broke the file.
+    unbounded = list(SafePyPDFLoader(pdf_with_a_blank_cover).lazy_load())
+    receipt = _assert_extractable_content(unbounded, "cover.pdf")
+    assert receipt["units_extracted"] == 9, (
+        "the same document extracts nine pages unbounded -- which is what makes the bounded "
+        "refusal a statement about US, not about it"
+    )
+
+
+def test_the_bound_stops_the_producer_not_just_the_result(pdf_of_10_pages, monkeypatch):
+    """F2. With image extraction on, the bound used to be applied to an already-materialised
+    list: every page was parsed and allocated -- the exact exhaustion this exists to prevent --
+    and the surplus was then thrown away. Measured: 10 pages parsed for a 3-page bound.
+
+    Counted at the PRODUCER, because that is where the cost is. Asserting on the pages that come
+    OUT cannot tell the two implementations apart -- both yield three.
+    """
+    import app.utils.document_loader as loader_module
+
+    produced = []
+    real_lazy_load = loader_module.PyPDFLoader.lazy_load
+
+    def counting_lazy_load(self):
+        for index, page in enumerate(real_lazy_load(self)):
+            produced.append(index)
+            yield page
+
+    monkeypatch.setattr(loader_module.PyPDFLoader, "lazy_load", counting_lazy_load)
+
+    loader = SafePyPDFLoader(
+        pdf_of_10_pages,
+        extract_images=True,
+        extraction_budget=ExtractionBudget(max_pages=3, time_budget_seconds=0),
+    )
+    docs = list(loader.lazy_load())
+
+    assert len(docs) == 3
+    assert len(produced) <= 4, (
+        "the producer parsed %d pages for a 3-page bound; the bound must wrap the generator, "
+        "not filter its output" % len(produced)
+    )
+
+
+def test_a_spent_budget_fails_loudly_instead_of_reporting_an_empty_document(pdf_of_10_pages):
+    """F7. A budget with nothing left yields no pages AND stamps nothing, so the receipt says
+    `empty` with no `extraction_bound` at all -- the caller is told their readable file has no
+    text, and nothing records that a limit did it. Unreachable on the live path, which is
+    exactly why it has to be loud: the day it becomes reachable, a crash naming the cause is
+    honest and a silent empty receipt is not.
+    """
+    budget = ExtractionBudget(max_pages=3, time_budget_seconds=0)
+    loader = SafePyPDFLoader(pdf_of_10_pages, extraction_budget=budget)
+
+    first = list(loader.lazy_load())
+    assert len(first) == 3, "the first pass spends the budget"
+
+    with pytest.raises(RuntimeError) as raised:
+        list(loader.lazy_load())
+    assert "already spent" in str(raised.value)
+    assert "fresh ExtractionBudget" in str(raised.value), (
+        "the error must say what to do, not only that something is wrong"
+    )
+
+
+def test_the_route_path_really_builds_a_bounded_loader(pdf_of_10_pages, monkeypatch):
+    """F4. Every other test here constructs the budget by hand and drives the loader directly.
+    Deleting the one line that wires the feature into `load_file_content` left the whole suite
+    green -- 466 passed -- so nothing proved a real request ever got a bounded loader.
+
+    This drives the function the embed routes actually call. It also exercises the only
+    supported way to reconfigure at runtime (patching this module's own global), which is the
+    narrower claim the budget's docstring now makes.
+    """
+    import asyncio
+
+    import app.utils.extraction_budget as budget_module
+    from app.routes.document_routes import load_file_content
+
+    monkeypatch.setattr(budget_module, "PDF_EXTRACT_MAX_PAGES", 2)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        loaded = asyncio.run(
+            load_file_content("ledger.pdf", "application/pdf", pdf_of_10_pages, executor)
+        )
+    docs = loaded[0]
+
+    assert len(docs) == 2, (
+        "the route path must build the loader WITH the configured budget; got %d pages"
+        % len(docs)
+    )
+    marker = [d for d in docs if STOPPED_KEY in (d.metadata or {})]
+    assert marker, "and the stop must be stamped, or the receipt cannot report it"
+    assert marker[0].metadata[STOPPED_KEY] == "page_limit"

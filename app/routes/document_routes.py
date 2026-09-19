@@ -77,7 +77,7 @@ from app.utils.document_loader import (
 )
 from app.utils.extraction_budget import (
     ATTEMPTED_KEY,
-    NOT_ATTEMPTED_KEY,
+    NOT_INCLUDED_KEY,
     STOPPED_KEY,
     ExtractionBudget,
 )
@@ -1497,8 +1497,11 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       before the end of the document (FILES-01) —
                       {stopped_reason: 'page_limit' | 'time_limit',
                        pages_read: int,
-                       pages_not_attempted: int | null   (null = the file's own page
-                                                          count could not be established)}
+                       pages_not_included: int | null    (null = the file's own page
+                                                          count could not be established).
+                                                          NOT "not opened": one page beyond the
+                                                          bound is pulled and discarded, so this
+                                                          counts pages ABSENT FROM THIS RECEIPT}
                       `status` is forced to `partial` whenever this is present: a
                       stopped read is never a finished one. The pages that were never
                       opened have no locators, so they cannot appear in
@@ -1576,7 +1579,7 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             extraction_stop = {
                 "stopped_reason": meta[STOPPED_KEY],
                 "pages_read": meta.get(ATTEMPTED_KEY),
-                "pages_not_attempted": meta.get(NOT_ATTEMPTED_KEY),
+                "pages_not_included": meta.get(NOT_INCLUDED_KEY),
             }
         if meta.get("formula_scan") is not None:
             formula_scan = meta["formula_scan"]
@@ -1725,7 +1728,7 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             # None means the file's own page count could not be established. Reported as
             # unknown rather than zero: "we did not open any more" and "there were no more"
             # are different claims.
-            "pages_not_attempted": extraction_stop["pages_not_attempted"],
+            "pages_not_included": extraction_stop["pages_not_included"],
         }
         if receipt["status"] == "complete":
             receipt["status"] = "partial"
@@ -1795,16 +1798,35 @@ def _assert_extractable_content(
     receipt = _extraction_receipt(data)
     if receipt["units_extracted"] == 0:
         name = filename or "uploaded file"
+        bound = receipt.get("extraction_bound")
+        if bound is not None:
+            # A CONFIGURED LIMIT STOPPED THE READ, so the file is not the thing that went wrong
+            # and must not be described as though it were. Measured in review: a ten-page document
+            # whose first page is a cover sheet, with PDF_EXTRACT_MAX_PAGES=1, was refused with
+            # "the file may be empty, image-only/scanned, corrupted, or password-protected" --
+            # four accusations about a perfectly readable file, none of them true, and the real
+            # cause was our own setting. The same nine pages extract fine unbounded.
+            #
+            # The refusal itself stands: nothing was extracted, so there is nothing to store and
+            # a 200 would be the fake success this guard exists to prevent. What changes is that
+            # it says WHOSE limit stopped it and which knob moves it.
+            message = (
+                f"No text was extracted from '{name}' before a configured read bound stopped "
+                f"the service after {bound['pages_read']} page(s) "
+                f"({bound['stopped_reason']}). This is a limit on THIS SERVICE, not a verdict "
+                f"on the file: pages beyond the bound were never read and may well contain "
+                f"text. Raise PDF_EXTRACT_MAX_PAGES / PDF_EXTRACT_TIME_BUDGET_SECONDS, or "
+                f"split the document. Nothing was stored."
+            )
+        else:
+            message = (
+                f"No extractable text found in '{name}'. The file may be empty, "
+                f"image-only/scanned, corrupted, or password-protected. Nothing "
+                f"was stored."
+            )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": (
-                    f"No extractable text found in '{name}'. The file may be empty, "
-                    f"image-only/scanned, corrupted, or password-protected. Nothing "
-                    f"was stored."
-                ),
-                "extraction": receipt,
-            },
+            detail={"message": message, "extraction": receipt},
         )
     return receipt
 
