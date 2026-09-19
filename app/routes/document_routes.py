@@ -22,6 +22,7 @@ from fastapi import (
     Query,
     status,
 )
+from fastapi.responses import JSONResponse
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import asyncio
@@ -613,6 +614,20 @@ async def get_all_ids(request: Request):
 
 @router.get("/health")
 async def health_check():
+    # A FastAPI route that RETURNS a (body, status) tuple does not send that status. The tuple is
+    # serialised as the body, so the caller receives `200 [{"status":"DOWN"},503]` -- a JSON ARRAY,
+    # HTTP 200, on the path that exists to say the service is unwell. Measured on the wire at
+    # 36d4fb6, not inferred: every DOWN answer this service has ever given has been an HTTP 200.
+    #
+    # Two things fail at once and both matter:
+    #   - anything reading the STATUS CODE (a load balancer, an orchestrator, a probe) is told the
+    #     service is healthy while its vector store is unreachable -- failure wearing success's
+    #     clothes, which is the one shape this lane exists to remove;
+    #   - anything reading the BODY gets an array, so `body.status` is undefined and a consumer's
+    #     own "is it up" check silently answers no-to-everything.
+    #
+    # `JSONResponse` sends the status. The body stays an object with the same `status` key and the
+    # same two values, so a caller that was reading `status` correctly on the UP path is unaffected.
     try:
         if await is_health_ok():
             # `build` is additive: `status` keeps its exact existing value and meaning, so a
@@ -620,16 +635,31 @@ async def health_check():
             # that actually answers in the deployed app, and a health check that cannot say WHICH
             # build is healthy leaves the only question a deployment receipt needs unanswerable.
             return {"status": "UP", "build": build_summary()}
-        else:
-            logger.error("Health check failed")
-            return {"status": "DOWN"}, 503
+        logger.error("Health check failed")
+        # DOWN carries `build` too, and it matters MORE here than on the UP path: "which build is
+        # unwell" is the question an operator asks during an incident, and `build_summary()` reads
+        # environment variables only -- no store, no I/O -- so it cannot fail for the same reason
+        # the health check just did.
+        return JSONResponse(
+            status_code=503, content={"status": "DOWN", "build": build_summary()}
+        )
     except Exception as e:
         logger.error(
             "Error during health check | Error: %s | Traceback: %s",
             str(e),
             traceback.format_exc(),
         )
-        return {"status": "DOWN", "error": str(e)}, 503
+        # `str(e)` is NOT echoed. /health is reachable WITHOUT a token -- the fail-closed identity
+        # middleware exempts it -- so whatever this returns is unauthenticated output, and asyncpg
+        # exceptions carry host names, ports and database names. The operator already has the whole
+        # exception and its traceback in the log line above; the wire gets the verdict only. Same
+        # fix this lane already made on /text (#26), applied to the one route that has no token in
+        # front of it.
+        # Same reasoning, and this is the branch that fires when the store RAISES rather than
+        # answers -- an incident is exactly when "which build" matters (review F11).
+        return JSONResponse(
+            status_code=503, content={"status": "DOWN", "build": build_summary()}
+        )
 
 
 @router.get("/documents", response_model=list[DocumentResponse])
