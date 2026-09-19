@@ -11,6 +11,11 @@ from pypdf import PdfReader
 
 from langchain_core.documents import Document
 
+from app.utils.extraction_budget import (
+    ATTEMPTED_KEY,
+    NOT_ATTEMPTED_KEY,
+    STOPPED_KEY,
+)
 from app.config import (
     known_source_ext,
     PDF_EXTRACT_IMAGES,
@@ -326,12 +331,22 @@ def cleanup_temp_encoding_file(loader) -> None:
             logger.warning(f"Failed to remove temporary UTF-8 file: {e}")
 
 
-def get_loader(filename: str, file_content_type: str, filepath: str, ocr_budget=None):
+def get_loader(
+    filename: str,
+    file_content_type: str,
+    filepath: str,
+    ocr_budget=None,
+    extraction_budget=None,
+):
     """Get the appropriate document loader based on file type and\or content type.
 
     `ocr_budget` is the caller's bounded allowance for reading SCANNED PDF pages
     locally (FILES-01). It is optional and PDF-only: omitting it leaves every loader
     behaving exactly as it did before OCR existed.
+
+    `extraction_budget` bounds how much of a NATIVE PDF is read at all (FILES-01). Also
+    optional, also PDF-only, and OFF unless an operator configures a limit -- so omitting
+    it, or passing an unconfigured budget, changes nothing about cost or behaviour.
     """
     file_ext = filename.split(".")[-1].lower()
     known_type = True
@@ -340,7 +355,10 @@ def get_loader(filename: str, file_content_type: str, filepath: str, ocr_budget=
     # ref.: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types/Common_types
     if file_ext == "pdf" or file_content_type == "application/pdf":
         loader = SafePyPDFLoader(
-            filepath, extract_images=PDF_EXTRACT_IMAGES, ocr_budget=ocr_budget
+            filepath,
+            extract_images=PDF_EXTRACT_IMAGES,
+            ocr_budget=ocr_budget,
+            extraction_budget=extraction_budget,
         )
     elif file_ext == "csv" or file_content_type == "text/csv":
         # Detect encoding for CSV files
@@ -519,10 +537,21 @@ class SafePyPDFLoader:
     ref.: https://github.com/langchain-ai/langchain/issues/26652
     """
 
-    def __init__(self, filepath: str, extract_images: bool = False, ocr_budget=None):
+    def __init__(
+        self,
+        filepath: str,
+        extract_images: bool = False,
+        ocr_budget=None,
+        extraction_budget=None,
+    ):
         self.filepath = filepath
         self.extract_images = extract_images
         self._temp_filepath = None  # For compatibility with cleanup function
+        #: How much of this document may be READ at all (FILES-01). Separate from the OCR
+        #: allowance on purpose: that one caps work we choose to do on a page, this one caps
+        #: how far into the file we go. `None`, or a budget with neither bound configured,
+        #: leaves the previous behaviour and cost exactly unchanged.
+        self.extraction_budget = extraction_budget
         #: One document's OCR allowance, supplied by the route. `None` means "do not
         #: OCR at all" -- so every existing direct construction of this loader keeps
         #: exactly its previous behaviour and cost.
@@ -588,8 +617,10 @@ class SafePyPDFLoader:
         loader = PyPDFLoader(self.filepath, extract_images=self.extract_images)
 
         if not self.extract_images:
-            # No image extraction: no fallback needed, stream directly
-            yield from self._with_ocr(loader.lazy_load())
+            # No image extraction: no fallback needed, stream directly.
+            # The read bound is applied BEFORE OCR so a page that will be dropped is never
+            # OCR'd -- otherwise the expensive work would happen and then be thrown away.
+            yield from self._with_ocr(self._within_budget(loader.lazy_load()))
             return
 
         # extract_images=True: must collect eagerly so that a mid-stream
@@ -607,7 +638,69 @@ class SafePyPDFLoader:
             else:
                 # Re-raise if it's a different error
                 raise
-        yield from self._with_ocr(iter(pages))
+        yield from self._with_ocr(self._within_budget(iter(pages)))
+
+    # -- bounded reading of a native PDF (FILES-01) ---------------------------------
+    #
+    # Nothing else in the chain protects this service from a large native PDF: the edge
+    # permits more than the service can parse before every timeout above it has expired,
+    # and an unbounded parse keeps allocating for a response no caller is waiting for. A
+    # worker killed for memory cannot deliver the honest failure contract at all -- the
+    # uploader just sees a dropped connection.
+    #
+    # Stopping is not truncating silently: the pages already read are KEPT, the LAST of
+    # them carries which bound stopped the work and how many pages were never opened, and
+    # the receipt turns that into `partial`. A stopped read is never `complete`, and -- the
+    # case that matters most -- never `empty`, which is a refusal meaning something else.
+
+    def _remaining_page_count(self, pages_read: int):
+        """How many pages were never opened. `None` when the file's own page count cannot be
+        established -- reported as unknown rather than guessed as zero.
+
+        The file is re-opened only on the truncation path, so an unbounded read (and every
+        read that finishes inside its bounds) pays nothing for this.
+        """
+        try:
+            with open(self.filepath, "rb") as handle:
+                total = len(PdfReader(handle).pages)
+        except Exception as error:  # a malformed tail is exactly when this can fail
+            logger.info("Could not count pages of %s: %s", self.filepath, error)
+            return None
+        return max(0, total - pages_read)
+
+    def _within_budget(self, pages: Iterator[Document]) -> Iterator[Document]:
+        """Yield pages while the read budget allows, stamping the last one when it does not."""
+        budget = self.extraction_budget
+        if budget is None or not budget.enabled:
+            yield from pages
+            return
+
+        held = None
+        stopped = False
+        for page in pages:
+            if not budget.may_read_page():
+                stopped = True
+                break
+            if held is not None:
+                yield held
+            held = page
+
+        if held is not None:
+            if stopped:
+                # Stamped on the last page actually read, so the receipt can find it without
+                # the loader having to invent a synthetic page for the ones it never opened.
+                not_attempted = self._remaining_page_count(budget.pages_read)
+                held.metadata[STOPPED_KEY] = budget.stopped_reason
+                held.metadata[ATTEMPTED_KEY] = budget.pages_read
+                held.metadata[NOT_ATTEMPTED_KEY] = not_attempted
+                logger.warning(
+                    "Stopped reading %s after %d page(s): %s (%s page(s) not opened)",
+                    self.filepath,
+                    budget.pages_read,
+                    budget.stopped_reason,
+                    "unknown" if not_attempted is None else not_attempted,
+                )
+            yield held
 
     # -- local-first OCR (FILES-01, FS-CONTINUE-R3) ---------------------------------
     #

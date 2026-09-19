@@ -75,6 +75,12 @@ from app.utils.document_loader import (
     cleanup_temp_encoding_file,
     DocumentVerdictError,
 )
+from app.utils.extraction_budget import (
+    ATTEMPTED_KEY,
+    NOT_ATTEMPTED_KEY,
+    STOPPED_KEY,
+    ExtractionBudget,
+)
 from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget
 from app.utils.health import is_health_ok
 
@@ -494,7 +500,13 @@ async def load_file_content(
     stop = threading.Event()
     try:
         loader, known_type, file_ext = get_loader(
-            filename, content_type, file_path, ocr_budget=OcrBudget(should_stop=stop.is_set)
+            filename,
+            content_type,
+            file_path,
+            ocr_budget=OcrBudget(should_stop=stop.is_set),
+            # Unconfigured by default: `ExtractionBudget` with both bounds at 0 is a no-op,
+            # so this call costs and behaves exactly as before until an operator sets a limit.
+            extraction_budget=ExtractionBudget(),
         )
         loop = asyncio.get_running_loop()
         try:
@@ -1481,6 +1493,17 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       locators}. rag_api states what it could not read well; it never
                       calls, chooses or pays for the fallback and owns no policy about
                       whether escalating is worth it.
+      extraction_bound: PRESENT ONLY when a configured read bound stopped the loader
+                      before the end of the document (FILES-01) —
+                      {stopped_reason: 'page_limit' | 'time_limit',
+                       pages_read: int,
+                       pages_not_attempted: int | null   (null = the file's own page
+                                                          count could not be established)}
+                      `status` is forced to `partial` whenever this is present: a
+                      stopped read is never a finished one. The pages that were never
+                      opened have no locators, so they cannot appear in
+                      `empty_locators` — this block is the only place their absence is
+                      visible.
       text_sources:   Per-page provenance grouped by producer —
                       {'native': [...], 'ocr': [...], 'none': [...]} — so a citation
                       can say WHICH pages came from the text layer and which from OCR.
@@ -1518,6 +1541,9 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     # receipt must say so rather than let a "Total" row arrive silently blank.
     formula_scan: Optional[str] = None
     uncached_cells: dict = {}
+    #: Set when a configured read bound stopped the extraction early (FILES-01). Absent means the
+    #: whole document was read -- never "we did not check".
+    extraction_stop: Optional[dict] = None
     for d in docs:
         meta = getattr(d, "metadata", None) or {}
         loc = meta.get(meta_key) if meta_key is not None else None
@@ -1543,6 +1569,15 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                 units[loc]["ocr_confidence"] = meta["ocr_confidence"]
         if meta.get("text_source") is not None:
             units[loc]["source"] = meta["text_source"]
+        if meta.get(STOPPED_KEY) is not None:
+            # Scanned across ALL documents rather than read off the last one: which page
+            # carries the marker is an implementation detail of the loader, and a receipt
+            # that depended on it would go quietly wrong the day that changed.
+            extraction_stop = {
+                "stopped_reason": meta[STOPPED_KEY],
+                "pages_read": meta.get(ATTEMPTED_KEY),
+                "pages_not_attempted": meta.get(NOT_ATTEMPTED_KEY),
+            }
         if meta.get("formula_scan") is not None:
             formula_scan = meta["formula_scan"]
         cells = meta.get("formula_uncached_cells")
@@ -1673,6 +1708,26 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
         # it. Nonempty text is not success. `empty` is left alone: that is the 422 path
         # and is already the strongest possible statement of failure.
         if escalate and receipt["status"] == "complete":
+            receipt["status"] = "partial"
+
+    # --- a read that was STOPPED is never a read that FINISHED ----------------------
+    #
+    # The same rule the escalation signal enforces, for the other way a document can be
+    # short: a configured bound stopped the loader before the end of the file. Every page
+    # already read is kept and stored -- this is not a refusal -- but `complete` would be a
+    # false statement about coverage on the exact field consumers gate on, and the pages
+    # that were never opened have no locators to appear in `empty_locators`, so without
+    # this block a truncated document could look flawless.
+    if extraction_stop is not None:
+        receipt["extraction_bound"] = {
+            "stopped_reason": extraction_stop["stopped_reason"],
+            "pages_read": extraction_stop["pages_read"],
+            # None means the file's own page count could not be established. Reported as
+            # unknown rather than zero: "we did not open any more" and "there were no more"
+            # are different claims.
+            "pages_not_attempted": extraction_stop["pages_not_attempted"],
+        }
+        if receipt["status"] == "complete":
             receipt["status"] = "partial"
 
     # PER-PAGE PROVENANCE: which engine produced which page's text. Core needs this at
