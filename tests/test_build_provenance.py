@@ -112,7 +112,7 @@ def _headers_of(response):
     return {k.lower(): v for k, v in response.headers.items()}
 
 
-def test_every_answer_carries_the_stamp(stamped, auth_configured, token):
+def test_every_answer_carries_the_stamp(stamped, auth_configured, token, monkeypatch):
     """THE LOAD-BEARING ONE. A 404 from this service and a 404 from an edge that never reached it
     are indistinguishable to a caller -- that ambiguity has already cost a consuming lane a
     misdiagnosis. The stamp is what separates them, so it has to be on the refusals and on the
@@ -123,6 +123,17 @@ def test_every_answer_carries_the_stamp(stamped, auth_configured, token):
     ordering of the middleware stack is the only thing that makes all four carry the stamp, and
     that ordering is easy to break without noticing.
     """
+    # `/health` is the public case, and its 200 has to be EARNED rather than inherited. Under
+    # pytest there is no reachable store, so the real health check fails -- and this assertion was
+    # green anyway, because the route answered a failed check with HTTP 200 (a returned
+    # (body, status) tuple never sends its status). The test was passing on the defect it could not
+    # see. Pinned to a HEALTHY check so this case means "a public route stamps its answer" and
+    # nothing else; the DOWN behaviour is `tests/test_health_contract.py`'s subject, not this one's.
+    async def healthy():
+        return True
+
+    monkeypatch.setattr(document_routes, "is_health_ok", healthy)
+
     cases = [
         ("a public route", 200, lambda: client.get("/health")),
         ("a refusal with no token", 401, lambda: client.get("/ids")),
