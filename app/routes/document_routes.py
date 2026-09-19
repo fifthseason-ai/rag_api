@@ -75,6 +75,12 @@ from app.utils.document_loader import (
     cleanup_temp_encoding_file,
     DocumentVerdictError,
 )
+from app.utils.extraction_budget import (
+    ATTEMPTED_KEY,
+    NOT_INCLUDED_KEY,
+    STOPPED_KEY,
+    ExtractionBudget,
+)
 from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget
 from app.utils.health import is_health_ok
 
@@ -494,7 +500,13 @@ async def load_file_content(
     stop = threading.Event()
     try:
         loader, known_type, file_ext = get_loader(
-            filename, content_type, file_path, ocr_budget=OcrBudget(should_stop=stop.is_set)
+            filename,
+            content_type,
+            file_path,
+            ocr_budget=OcrBudget(should_stop=stop.is_set),
+            # Unconfigured by default: `ExtractionBudget` with both bounds at 0 is a no-op,
+            # so this call costs and behaves exactly as before until an operator sets a limit.
+            extraction_budget=ExtractionBudget(),
         )
         loop = asyncio.get_running_loop()
         try:
@@ -1481,6 +1493,20 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       locators}. rag_api states what it could not read well; it never
                       calls, chooses or pays for the fallback and owns no policy about
                       whether escalating is worth it.
+      extraction_bound: PRESENT ONLY when a configured read bound stopped the loader
+                      before the end of the document (FILES-01) —
+                      {stopped_reason: 'page_limit' | 'time_limit',
+                       pages_read: int,
+                       pages_not_included: int | null    (null = the file's own page
+                                                          count could not be established).
+                                                          NOT "not opened": one page beyond the
+                                                          bound is pulled and discarded, so this
+                                                          counts pages ABSENT FROM THIS RECEIPT}
+                      `status` is forced to `partial` whenever this is present: a
+                      stopped read is never a finished one. The pages that were never
+                      opened have no locators, so they cannot appear in
+                      `empty_locators` — this block is the only place their absence is
+                      visible.
       text_sources:   Per-page provenance grouped by producer —
                       {'native': [...], 'ocr': [...], 'none': [...]} — so a citation
                       can say WHICH pages came from the text layer and which from OCR.
@@ -1518,6 +1544,9 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     # receipt must say so rather than let a "Total" row arrive silently blank.
     formula_scan: Optional[str] = None
     uncached_cells: dict = {}
+    #: Set when a configured read bound stopped the extraction early (FILES-01). Absent means the
+    #: whole document was read -- never "we did not check".
+    extraction_stop: Optional[dict] = None
     for d in docs:
         meta = getattr(d, "metadata", None) or {}
         loc = meta.get(meta_key) if meta_key is not None else None
@@ -1543,6 +1572,15 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                 units[loc]["ocr_confidence"] = meta["ocr_confidence"]
         if meta.get("text_source") is not None:
             units[loc]["source"] = meta["text_source"]
+        if meta.get(STOPPED_KEY) is not None:
+            # Scanned across ALL documents rather than read off the last one: which page
+            # carries the marker is an implementation detail of the loader, and a receipt
+            # that depended on it would go quietly wrong the day that changed.
+            extraction_stop = {
+                "stopped_reason": meta[STOPPED_KEY],
+                "pages_read": meta.get(ATTEMPTED_KEY),
+                "pages_not_included": meta.get(NOT_INCLUDED_KEY),
+            }
         if meta.get("formula_scan") is not None:
             formula_scan = meta["formula_scan"]
         cells = meta.get("formula_uncached_cells")
@@ -1675,6 +1713,26 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
         if escalate and receipt["status"] == "complete":
             receipt["status"] = "partial"
 
+    # --- a read that was STOPPED is never a read that FINISHED ----------------------
+    #
+    # The same rule the escalation signal enforces, for the other way a document can be
+    # short: a configured bound stopped the loader before the end of the file. Every page
+    # already read is kept and stored -- this is not a refusal -- but `complete` would be a
+    # false statement about coverage on the exact field consumers gate on, and the pages
+    # that were never opened have no locators to appear in `empty_locators`, so without
+    # this block a truncated document could look flawless.
+    if extraction_stop is not None:
+        receipt["extraction_bound"] = {
+            "stopped_reason": extraction_stop["stopped_reason"],
+            "pages_read": extraction_stop["pages_read"],
+            # None means the file's own page count could not be established. Reported as
+            # unknown rather than zero: "we did not open any more" and "there were no more"
+            # are different claims.
+            "pages_not_included": extraction_stop["pages_not_included"],
+        }
+        if receipt["status"] == "complete":
+            receipt["status"] = "partial"
+
     # PER-PAGE PROVENANCE: which engine produced which page's text. Core needs this at
     # page granularity, not as one document-level label, because a citation has to be
     # able to say that page 3 came from OCR and page 4 from the native text layer.
@@ -1740,16 +1798,35 @@ def _assert_extractable_content(
     receipt = _extraction_receipt(data)
     if receipt["units_extracted"] == 0:
         name = filename or "uploaded file"
+        bound = receipt.get("extraction_bound")
+        if bound is not None:
+            # A CONFIGURED LIMIT STOPPED THE READ, so the file is not the thing that went wrong
+            # and must not be described as though it were. Measured in review: a ten-page document
+            # whose first page is a cover sheet, with PDF_EXTRACT_MAX_PAGES=1, was refused with
+            # "the file may be empty, image-only/scanned, corrupted, or password-protected" --
+            # four accusations about a perfectly readable file, none of them true, and the real
+            # cause was our own setting. The same nine pages extract fine unbounded.
+            #
+            # The refusal itself stands: nothing was extracted, so there is nothing to store and
+            # a 200 would be the fake success this guard exists to prevent. What changes is that
+            # it says WHOSE limit stopped it and which knob moves it.
+            message = (
+                f"No text was extracted from '{name}' before a configured read bound stopped "
+                f"the service after {bound['pages_read']} page(s) "
+                f"({bound['stopped_reason']}). This is a limit on THIS SERVICE, not a verdict "
+                f"on the file: pages beyond the bound were never read and may well contain "
+                f"text. Raise PDF_EXTRACT_MAX_PAGES / PDF_EXTRACT_TIME_BUDGET_SECONDS, or "
+                f"split the document. Nothing was stored."
+            )
+        else:
+            message = (
+                f"No extractable text found in '{name}'. The file may be empty, "
+                f"image-only/scanned, corrupted, or password-protected. Nothing "
+                f"was stored."
+            )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": (
-                    f"No extractable text found in '{name}'. The file may be empty, "
-                    f"image-only/scanned, corrupted, or password-protected. Nothing "
-                    f"was stored."
-                ),
-                "extraction": receipt,
-            },
+            detail={"message": message, "extraction": receipt},
         )
     return receipt
 
