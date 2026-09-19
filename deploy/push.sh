@@ -23,8 +23,19 @@ aws ecr get-login-password --region "${AWS_REGION}" \
 # happened to keep from this terminal. `git` may legitimately be absent (a tarball build), so a
 # missing value is reported as `unknown` and never guessed.
 BUILD_REVISION=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+# Capture the STATUS of the measurement, not only its output. `git status --porcelain` prints
+# nothing for a clean tree -- and also prints nothing when it FAILS, which the previous form read
+# as the same thing and stamped `clean` on a tree it had not managed to measure. That is reachable:
+# `git rev-parse HEAD` does not touch the index, `git status` does, so a stale `.git/index.lock`
+# from an interrupted command or a concurrent IDE process fails the second while the first still
+# answers. `unknown` is the third value for exactly this case and it must be REACHED, not merely
+# defined.
 if git rev-parse --git-dir >/dev/null 2>&1; then
-  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then BUILD_DIRTY=true; else BUILD_DIRTY=false; fi
+  if PORCELAIN=$(git status --porcelain 2>/dev/null); then
+    if [ -n "${PORCELAIN}" ]; then BUILD_DIRTY=true; else BUILD_DIRTY=false; fi
+  else
+    BUILD_DIRTY=unknown
+  fi
 else
   BUILD_DIRTY=unknown
 fi
@@ -40,6 +51,25 @@ BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # through would be worked around by calling `docker build` directly -- which loses the stamp
 # entirely, the opposite of what this exists to protect. Taking the hatch is a decision the
 # operator makes on purpose, and the image still says `tree=dirty`, so the receipt stays honest.
+# `unknown` is refused on the same terms as `true`. A tree that could not be measured is not a
+# clean tree -- it is a tree nobody has checked, and stamping a production image `clean` on that
+# basis is the fabrication this whole change exists to prevent. Reported separately from `true`
+# so the operator knows which of the two they are looking at.
+if [ "${BUILD_DIRTY}" = "unknown" ]; then
+  if [ "${PUSH_ALLOW_DIRTY:-0}" = "1" ]; then
+    echo "!!! Building a PRODUCTION image whose tree state is UNKNOWN because PUSH_ALLOW_DIRTY=1."
+    echo "!!! The image will be stamped tree=unknown. NOTHING has verified that ${BUILD_REVISION}"
+    echo "!!! describes its contents. Record that in the deployment receipt."
+  else
+    echo "REFUSED: the build tree's state could NOT BE MEASURED." >&2
+    echo "  This is not the same as clean -- git could not be asked, or failed when it was." >&2
+    echo "  No git at all:         the build cannot prove what it contains." >&2
+    echo "  A failed 'git status': run it by hand; a stale .git/index.lock is the usual cause." >&2
+    echo "  Deliberate exception:  PUSH_ALLOW_DIRTY=1 $0 ${IMAGE_TAG}" >&2
+    exit 1
+  fi
+fi
+
 if [ "${BUILD_DIRTY}" = "true" ]; then
   if [ "${PUSH_ALLOW_DIRTY:-0}" = "1" ]; then
     echo "!!! Building a PRODUCTION image from a DIRTY tree because PUSH_ALLOW_DIRTY=1."
