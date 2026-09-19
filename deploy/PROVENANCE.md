@@ -38,12 +38,27 @@ ends by printing:
 **Paste those lines into the deployment receipt.** That block *is* the pairing; everything below is
 how to recover it later if it was not recorded.
 
-### If the tree was dirty
+### If the tree is dirty, the production build is REFUSED
 
-The script warns and continues — shipping from a dirty tree is sometimes deliberate, and refusing
-would only teach people to work around the script. The image is stamped `tree=dirty`, which means:
-it names a revision but **does not contain exactly that revision's contents**, so it cannot be
-rebuilt from the revision alone. If reproducibility matters for a given deploy, commit first.
+```
+REFUSED: the build tree has UNCOMMITTED CHANGES.
+  A production image must be rebuildable from the revision it names.
+  Commit (or stash) first:   git status --porcelain
+  Deliberate exception:      PUSH_ALLOW_DIRTY=1 ./deploy/push.sh latest
+```
+
+Nothing is built or pushed. An image built from uncommitted edits names a revision whose contents
+it does not contain, so it cannot be rebuilt, reviewed or reasoned about afterwards, and the digest
+in the receipt would point at a source state that exists nowhere.
+
+**The exception exists on purpose.** An emergency where the fix must ship before it can be
+committed is real, and an absolute ban would simply be worked around with a direct `docker build`
+— which loses the stamp entirely, the opposite of what this protects. Taking the exception is a
+deliberate act: the image is still stamped `tree=dirty`, so the receipt stays honest about what
+was shipped. **Record that in the deployment receipt when it happens.**
+
+A build with no git metadata at all (a tarball, say) is allowed and stamped `unknown`, with a
+warning — but nothing will tie that image to a source state, so prefer building from a checkout.
 
 ## Reading it back, without the operator's terminal
 

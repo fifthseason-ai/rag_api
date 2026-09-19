@@ -250,3 +250,96 @@ def test_push_script_derives_and_passes_the_stamp_and_prints_the_pairing():
         "the digest and the revision are only connected by being written down together"
     )
     assert "image digest" in text and "source revision" in text
+
+
+def test_push_script_refuses_a_production_build_from_a_dirty_tree():
+    """A production image must be rebuildable from the revision it names, so a dirty tree is a
+    REFUSAL here rather than a warning -- with one deliberate, explicit way through, because an
+    absolute ban would be worked around by calling `docker build` directly, which loses the stamp
+    altogether."""
+    text = open(os.path.join(ROOT, "deploy", "push.sh"), encoding="utf-8").read()
+    assert "REFUSED: the build tree has UNCOMMITTED CHANGES." in text
+    assert "exit 1" in text, "the refusal must stop the deploy, not just print"
+    assert "PUSH_ALLOW_DIRTY" in text, "an emergency needs a documented way through"
+
+
+def test_dirty_refusal_actually_exits_and_the_override_actually_passes():
+    """EXECUTED, not read. The script is run with its side effects stubbed out, in a dirty git
+    repo, so the refusal and the override are observed rather than inferred from source text --
+    a shell guard that is only grepped for is a guard nobody has ever seen fire.
+    """
+    import subprocess
+    import tempfile
+
+    NL = chr(10)
+    QUOTE = chr(34)
+
+    repo = tempfile.mkdtemp()
+    stub_bin = os.path.join(repo, "stubs")
+    os.makedirs(stub_bin)
+
+    def write_stub(name, body_lines):
+        path = os.path.join(stub_bin, name)
+        with open(path, "w") as fh:
+            fh.write(NL.join(["#!/bin/sh"] + body_lines + [""]))
+        os.chmod(path, 0o755)
+
+    # Everything the script reaches for is stubbed, so this test runs anywhere -- including
+    # INSIDE the shipped runtime image, which has no git and no AWS credentials. `docker` echoes
+    # its arguments so a build that should not have happened is visible in the output.
+    for tool in ("aws", "docker"):
+        write_stub(
+            tool, ["echo STUB-%s %s$@%s" % (tool.upper(), QUOTE, QUOTE), "exit 0"]
+        )
+    # The `git` stub is what makes the tree dirty or clean, deterministically and without needing
+    # a real repository: `porcelain` output is exactly the signal the script keys on.
+    write_stub(
+        "git",
+        [
+            'case "$*" in',
+            '  "rev-parse HEAD") echo 1111111111111111111111111111111111111111 ;;',
+            '  "rev-parse --git-dir") echo .git ;;',
+            '  "status --porcelain") [ "${STUB_DIRTY:-1}" = "1" ] && echo " M dirt.txt" ;;',
+            "esac",
+            "exit 0",
+        ],
+    )
+
+    os.makedirs(os.path.join(repo, "deploy"))
+    with open(os.path.join(repo, "deploy", "push.sh"), "w", newline=NL) as fh:
+        fh.write(open(os.path.join(ROOT, "deploy", "push.sh"), encoding="utf-8").read())
+    with open(os.path.join(repo, "Dockerfile.lite"), "w") as fh:
+        fh.write("FROM scratch" + NL)
+
+    env = dict(os.environ)
+    env["PATH"] = stub_bin + os.pathsep + env["PATH"]
+    env["STUB_DIRTY"] = "1"
+
+    refused = subprocess.run(
+        ["bash", os.path.join(repo, "deploy", "push.sh")],
+        cwd=repo, env=env, capture_output=True, text=True,
+    )
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "REFUSED" in refused.stderr
+    assert "STUB-DOCKER build" not in refused.stdout, "it must refuse BEFORE building"
+
+    env["PUSH_ALLOW_DIRTY"] = "1"
+    allowed = subprocess.run(
+        ["bash", os.path.join(repo, "deploy", "push.sh")],
+        cwd=repo, env=env, capture_output=True, text=True,
+    )
+    assert "PUSH_ALLOW_DIRTY=1" in allowed.stdout
+    assert "STUB-DOCKER build" in allowed.stdout, "the override must let the build proceed"
+    assert "BUILD_DIRTY=true" in allowed.stdout, "and the image must still be stamped dirty"
+
+    # THE NEGATIVE CONTROL. Without this, a script that refused EVERY build would pass both
+    # assertions above and nobody would find out until a deploy failed.
+    env.pop("PUSH_ALLOW_DIRTY")
+    env["STUB_DIRTY"] = "0"
+    clean = subprocess.run(
+        ["bash", os.path.join(repo, "deploy", "push.sh")],
+        cwd=repo, env=env, capture_output=True, text=True,
+    )
+    assert "REFUSED" not in clean.stderr, "a clean tree must not be refused"
+    assert "STUB-DOCKER build" in clean.stdout
+    assert "BUILD_DIRTY=false" in clean.stdout, "and it must be stamped clean, not merely allowed"

@@ -30,14 +30,36 @@ else
 fi
 BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# A PRODUCTION image is refused from a dirty tree. This script deploys to the production cluster,
+# and an image built from uncommitted edits names a revision whose contents it does not contain:
+# it cannot be rebuilt, reviewed or reasoned about afterwards, and the digest recorded in the
+# receipt would point at a source state that exists nowhere.
+#
+# The refusal has a deliberate, explicit escape hatch rather than being absolute: an emergency
+# where the fix must ship before it can be committed is a real situation, and a ban with no way
+# through would be worked around by calling `docker build` directly -- which loses the stamp
+# entirely, the opposite of what this exists to protect. Taking the hatch is a decision the
+# operator makes on purpose, and the image still says `tree=dirty`, so the receipt stays honest.
 if [ "${BUILD_DIRTY}" = "true" ]; then
-  # Not a refusal: shipping from a dirty tree is sometimes deliberate, and blocking it here would
-  # only teach people to bypass this script. But the image must not claim a revision whose
-  # contents it does not actually contain, so it is stamped dirty and the operator is told now
-  # rather than discovering it from a digest that matches nothing reproducible.
-  echo "!!! The build tree has UNCOMMITTED CHANGES."
-  echo "!!! This image will be stamped ${BUILD_REVISION} with tree=dirty."
-  echo "!!! It cannot be rebuilt from that revision alone. Commit first if that matters."
+  if [ "${PUSH_ALLOW_DIRTY:-0}" = "1" ]; then
+    echo "!!! Building a PRODUCTION image from a DIRTY tree because PUSH_ALLOW_DIRTY=1."
+    echo "!!! The image will be stamped ${BUILD_REVISION} with tree=dirty and CANNOT be rebuilt"
+    echo "!!! from that revision alone. Record that in the deployment receipt."
+  else
+    echo "REFUSED: the build tree has UNCOMMITTED CHANGES." >&2
+    echo "  A production image must be rebuildable from the revision it names." >&2
+    echo "  Commit (or stash) first:   git status --porcelain" >&2
+    echo "  Deliberate exception:      PUSH_ALLOW_DIRTY=1 $0 ${IMAGE_TAG}" >&2
+    exit 1
+  fi
+fi
+
+if [ "${BUILD_REVISION}" = "unknown" ]; then
+  # No git metadata at all (a tarball build, say). Allowed, because it is sometimes the only way
+  # to ship, but never silently: an image nobody can trace back is exactly the situation this
+  # change exists to end.
+  echo "!!! No git revision available: this image will be stamped 'unknown' and NOTHING will tie"
+  echo "!!! it to a source state. Prefer building from a checkout."
 fi
 
 echo "==> Building image with Dockerfile.lite (linux/amd64 for ECS X86_64)..."
