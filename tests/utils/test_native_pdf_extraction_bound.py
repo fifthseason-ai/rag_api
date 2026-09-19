@@ -148,19 +148,29 @@ def test_a_document_inside_its_bounds_is_not_marked_stopped(pdf_of_10_pages):
     assert budget.stopped_reason is None
 
 
-def test_page_count_that_cannot_be_established_is_reported_as_unknown(
-    pdf_of_10_pages, monkeypatch
-):
+def test_page_count_that_cannot_be_established_is_reported_as_unknown(pdf_of_10_pages):
     """`pages_not_attempted` is None, never 0, when the file's own page count cannot be read.
-    Zero would say "there was nothing more", which is a claim this service cannot make here."""
-    loader = SafePyPDFLoader(
-        pdf_of_10_pages, extraction_budget=ExtractionBudget(max_pages=2, time_budget_seconds=0)
+    Zero would say "there was nothing more", which is a claim this service cannot make here.
+
+    The failure is made REAL rather than patched in: the file is unlinked while the already-open
+    loader keeps streaming from its handle, so the re-open that counts pages genuinely fails.
+    An earlier version of this test monkeypatched `_remaining_page_count` to return None, which
+    meant it passed identically with the real code mutated to `return 0` -- it was asserting the
+    behaviour of its own stub. Mutating that line now reddens this test.
+    """
+    budget = ExtractionBudget(max_pages=2, time_budget_seconds=0)
+    loader = SafePyPDFLoader(pdf_of_10_pages, extraction_budget=budget)
+
+    docs = []
+    for index, doc in enumerate(loader.lazy_load()):
+        if index == 0:
+            os.remove(pdf_of_10_pages)
+        docs.append(doc)
+
+    assert budget.stopped_reason == "page_limit"
+    assert docs[-1].metadata[NOT_ATTEMPTED_KEY] is None, (
+        "the count could not be established, and unknown is not zero"
     )
-    monkeypatch.setattr(
-        loader, "_remaining_page_count", lambda pages_read: None
-    )
-    docs = list(loader.lazy_load())
-    assert docs[-1].metadata[NOT_ATTEMPTED_KEY] is None
 
 
 # --- what the caller is told ----------------------------------------------------------
