@@ -15,8 +15,15 @@ neither of which had any coverage:
               happen only on LONG units, the ones least likely to be in a fixture.
 
 Measured 2026-09-20 against the real loaders and the real splitter: neither occurs. `page`,
-`page_name`, `row` and `slide_number` survive a split intact, and `split_documents` never merges
+`page_name` and `slide_number` survive a split intact, and `split_documents` never merges
 across the Documents a loader emits. These tests hold that.
+
+`row` is DELIBERATELY not in that list. The CSV loader does put a `row` key on the chunk, but
+on this base `_UNIT_LOCATOR_KEYS` is only (page, slide_number, page_name) -- `row` is not a
+citation locator this code resolves, and #36 is what makes it one. An earlier version of this
+docstring listed it anyway, describing a property the tree it ships on does not implement.
+Independent review caught it. It is the same mistake as reading a stale local `main` and
+calling it current: knowledge true on one branch, asserted about another.
 
 PROVENANCE IS DECIDED FROM THE TEXT. Each unit carries a unique marker, and a chunk's true origin
 is read from its content -- never from the metadata, which is the thing on trial. Checking the
@@ -213,3 +220,105 @@ def test_a_locator_the_service_does_not_set_is_carried_through_untouched():
     assert prepared[0].metadata["slide_number"] == 4
     assert prepared[0].metadata["page_label"] == "iv"
     assert prepared[0].metadata["file_id"] == "exactness-file"
+
+
+# ---------------------------------------------------------------------------------------
+# Added after independent review. Two findings, neither reachable through the current
+# pipeline, both closing a real edge of what the suite proves rather than a live defect.
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pdf_units(tmp_path):
+    """PDF was argued equivalent and never executed. `SafePyPDFLoader` is OURS.
+
+    The review's reasoning was right -- `SafePyPDFLoader` delegates to a strictly per-page
+    loader, so `page` survives a split by the same metadata-copy invariant as the others. But
+    it is a third CUSTOM loader with zero coverage of this property, so if it were ever changed
+    to aggregate pages, nothing here would notice. "Argued equivalent" and "tested" are not the
+    same rung, and this file had been quoting the first as the second.
+    """
+    pypdf = pytest.importorskip("pypdf")
+    from .test_scanned_pdf_ocr import _bytes, _text_page
+
+    writer = pypdf.PdfWriter()
+    _text_page(writer, ["UNIT-FOXTROT-6006 opening page"])
+    # Page two must exceed CHUNK_SIZE so it splits. Short lines, many of them: a PDF text layer
+    # is written per line, so the filler has to be broken up rather than handed over as one run.
+    long_page = ["UNIT-GOLF-7007 start of the long page"]
+    # 110 lines, not 40. At 40 the long page split into exactly two chunks, each holding one of
+    # the markers -- so it produced no MARKERLESS middle, and the set-based assertion below had
+    # nothing to bite on for PDF. Measured, not guessed: the wrong-locator-on-markerless mutation
+    # reddened PPTX and XLSX and left PDF green. A fixture that cannot manufacture the case makes
+    # its test decorative.
+    long_page += ["The delivery programme records each increment and its evidence." for _ in range(110)]
+    long_page += ["UNIT-GOLF-7008 end of the long page"]
+    _text_page(writer, long_page)
+    _text_page(writer, ["UNIT-HOTEL-8008 closing page"])
+
+    path = tmp_path / "units.pdf"
+    with open(str(path), "wb") as fh:
+        fh.write(_bytes(writer))
+
+    markers = {
+        "UNIT-FOXTROT-6006": 0,   # `page` is 0-indexed
+        "UNIT-GOLF-7007": 1,
+        "UNIT-GOLF-7008": 1,
+        "UNIT-HOTEL-8008": 2,
+    }
+    return _prepare(_load(path, "units.pdf", "application/pdf")), markers, "page", 1
+
+
+@pytest.mark.parametrize(
+    "fixture,check",
+    [("pdf_units", "split"), ("pdf_units", "merge"), ("pdf_units", "drop"), ("pdf_units", "label")],
+)
+def test_pdf_locator_is_exact_too(fixture, check, request):
+    """The same four properties, executed on the PDF path instead of argued about."""
+    chunks, markers, key, split_unit = request.getfixturevalue(fixture)
+    if check == "split":
+        produced = [c for c in chunks if str(c.metadata.get(key)) == str(split_unit)]
+        assert len(produced) > 1, (
+            "the long page produced %d chunk(s), so the split case did not happen and the DROP "
+            "check below is vacuous for PDF" % len(produced)
+        )
+    elif check == "merge":
+        merged = [c.page_content[:80] for c in chunks
+                  if len(_units_in(c.page_content, markers)) > 1]
+        assert not merged, "a PDF chunk carries more than one page: %r" % (merged,)
+    elif check == "drop":
+        missing = [c.page_content[:80] for c in chunks if c.metadata.get(key) is None]
+        assert not missing, "%d of %d PDF chunks have no `page`: %r" % (
+            len(missing), len(chunks), missing)
+    else:
+        wrong = []
+        for c in chunks:
+            units = _units_in(c.page_content, markers)
+            if len(units) == 1 and str(c.metadata.get(key)) != str(next(iter(units))):
+                wrong.append((next(iter(units)), c.metadata.get(key), c.page_content[:80]))
+        assert not wrong, "PDF locator disagrees with the page its text came from: %r" % (wrong,)
+
+
+@pytest.mark.parametrize("fixture", ["pptx_units", "xlsx_units", "pdf_units"])
+def test_no_chunk_carries_a_locator_no_unit_has(fixture, request):
+    """Closes the markerless-middle hole the review found.
+
+    The DROP test proves a middle chunk has *a* locator; the MISLABEL test skips it, because a
+    chunk with no marker has no text-derived unit to compare against. So a defect that stamped a
+    PRESENT BUT WRONG locator onto markerless chunks would pass every other assertion here.
+
+    Not reachable through the current pipeline -- `split_documents` hands every sub-chunk of a
+    unit the same metadata dict, so siblings cannot diverge. Asserted anyway, because "cannot
+    happen today" is a statement about today's splitter and this file is what would notice.
+
+    The check is set-based: the distinct locator values across ALL chunks must be exactly the
+    units the markers say exist. A stamped locator outside that set fails without needing any
+    chunk to carry a marker.
+    """
+    chunks, markers, key, _split = request.getfixturevalue(fixture)
+    expected = {str(u) for u in markers.values()}
+    seen = {str(c.metadata.get(key)) for c in chunks}
+    assert seen == expected, (
+        "chunks carry locator values %r but the only units that exist are %r -- a value outside "
+        "that set was stamped onto a chunk from somewhere else" % (sorted(seen), sorted(expected))
+    )
