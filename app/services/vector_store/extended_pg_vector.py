@@ -124,6 +124,65 @@ class ExtendedPgVector(PGVector):
             results = session.query(self.EmbeddingStore.custom_id).all()
             return [result[0] for result in results if result[0] is not None]
 
+    def get_row_uuids(
+        self,
+        file_id: str,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[str]:
+        """Primary keys of the rows that exist for one file RIGHT NOW (FILES-01 F3).
+
+        Every other lookup in this class keys on `custom_id`, which is the file_id and
+        is therefore shared by every chunk of every version of that file. Replacement
+        needs the opposite: the identity of THESE rows, so a later delete cannot touch a
+        row written after the capture.
+
+        `uuid` is the table's primary key -- one value per row, independent of the
+        chunk's text. That is deliberate and it is the whole point: if a new version
+        produces a chunk byte-identical to an old one, content- or digest-based identity
+        cannot tell the two rows apart and would either spare a superseded row or delete
+        a freshly written one. The primary key can.
+
+        Scoped by user and tenant when given, so a capture can never reach across an
+        entitlement boundary even if a caller passes someone else's file_id.
+        """
+        with Session(self._bind) as session:
+            query = session.query(self.EmbeddingStore.uuid).filter(
+                self.EmbeddingStore.custom_id == file_id
+            )
+            if user_id is not None:
+                query = query.filter(
+                    self.EmbeddingStore.cmetadata["user_id"].astext == user_id
+                )
+            if tenant_id is not None:
+                query = query.filter(
+                    self.EmbeddingStore.cmetadata["tenant_id"].astext == tenant_id
+                )
+            return [str(r[0]) for r in query.all() if r[0] is not None]
+
+    def delete_rows_by_uuid(self, row_uuids: list[str]) -> int:
+        """Delete exactly these rows by primary key; returns how many were removed.
+
+        An EMPTY list deletes NOTHING and returns 0. That is stated because the other
+        delete path in this class treats a falsy `ids` as "no id filter" and would
+        remove the whole collection -- the same shape as the dropped-filter accident the
+        `text_source` guard exists for. Here an empty capture legitimately means "this
+        file had no rows before the call", which must not become "delete everything".
+
+        Returns the count so the caller can report a partial removal instead of
+        assuming one: a replacement that did not remove what it superseded leaves stale
+        content retrievable, and that has to reach the response rather than be inferred.
+        """
+        if not row_uuids:
+            return 0
+        with Session(self._bind) as session:
+            stmt = delete(self.EmbeddingStore).where(
+                self.EmbeddingStore.uuid.in_(row_uuids)
+            )
+            result = session.execute(stmt)
+            session.commit()
+            return int(result.rowcount or 0)
+
     def get_filtered_ids(
         self, ids: list[str], user_id: Optional[str] = None, document_origin_type: Optional[str] = None, subscription_id: Optional[str] = None
     ) -> list[str]:

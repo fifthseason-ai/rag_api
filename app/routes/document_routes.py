@@ -1901,7 +1901,59 @@ async def store_data_in_vector_db(
     link: str = None,
     subscription_id: str = None,
     tenant_id: str = None,
+    replace: bool = False,
 ) -> dict:
+    """Store one file's chunks. With `replace`, supersede the file's current rows.
+
+    REPLACEMENT SEMANTICS (FILES-01 F3, contract agreed with Core 2026-09-20).
+
+    Measured before this existed: a second upload under the same file_id ADDED rows. Both
+    versions stayed retrievable under one identity, a query returned the old limit and the
+    new limit side by side, and nothing on either row said which was current. The scoped
+    delete that handles the OCR->native swap keys on `text_source`, a PRODUCER axis, so it
+    cannot separate two versions from the same producer -- two .txt uploads both carry
+    `text_source = None`.
+
+    `replace` captures the file's CURRENT row primary keys BEFORE the insert, inserts, and
+    then deletes exactly those captured rows. Three properties, in the order they matter:
+
+    1. The capture is taken BEFORE the insert and is a list of ROW identities, not "delete
+       everything except what I just wrote". Those are not the same instruction. If the new
+       version produces a chunk byte-identical to an old one -- the ordinary case when a
+       document is edited in one place -- an "except what I wrote" rule either deletes the
+       row it just created or spares a superseded one. The primary key cannot be confused
+       this way, and it is why the identity is the row and not its content or digest.
+    2. Insert first, delete second, so the document never passes through zero rows. A
+       reader querying during the swap sees the old version or both, never nothing. This is
+       the same ordering the OCR escalation path already uses.
+    3. A failed insert RAISES before the delete runs, so a store outage can never remove the
+       only copy. The delete is reached only after the new rows exist.
+
+    The count removed is reported, never assumed. A replacement that did not remove what it
+    superseded leaves stale content retrievable, which is a fact the caller has to receive
+    rather than infer from a 200.
+    """
+    superseded_rows = None
+    if replace:
+        if not hasattr(vector_store, "get_row_uuids"):
+            # Refuse rather than silently ingest without replacing. A caller that asked to
+            # supersede and got a 200 would believe the old version is gone.
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    "replace is not supported by this vector store; nothing was stored. "
+                    "The previous version would have remained retrievable."
+                ),
+            )
+        if isinstance(vector_store, AsyncPgVector):
+            superseded_rows = await vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, tenant_id=tenant_id, executor=executor
+            )
+        else:
+            superseded_rows = vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, tenant_id=tenant_id
+            )
+
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     docs = await loop.run_in_executor(
@@ -1942,7 +1994,26 @@ async def store_data_in_vector_db(
                     docs, file_id, vector_store, executor
                 )
 
-        return {"message": "Documents added successfully", "ids": ids, "docs": docs}
+        result = {"message": "Documents added successfully", "ids": ids, "docs": docs}
+
+        if superseded_rows is not None:
+            # Only now -- the new rows exist, so removing the old ones cannot empty the
+            # document. Reached only on the success path; the except below re-raises.
+            if isinstance(vector_store, AsyncPgVector):
+                removed = await vector_store.delete_rows_by_uuid(
+                    superseded_rows, executor=executor
+                )
+            else:
+                removed = vector_store.delete_rows_by_uuid(superseded_rows)
+            result["replacement"] = {
+                "superseded_rows": len(superseded_rows),
+                "removed": removed,
+                # `complete` only when every captured row is gone. Anything else means
+                # superseded content is still retrievable, and the caller is told so
+                # instead of reading a 200 as "the old version is gone".
+                "status": "complete" if removed == len(superseded_rows) else "incomplete",
+            }
+        return result
 
     except Exception as e:
         logger.error(
@@ -2131,12 +2202,14 @@ async def embed_file(
     document_owner_type: Optional[DocumentOwnerType] = Form(DocumentOwnerType.AGENT),
     document_origin_type: DocumentOriginType = Form(DocumentOriginType.ORGANIC),
     link: Optional[str] = Form(None),
-    subscription_id: Optional[str] = Form(None)
+    subscription_id: Optional[str] = Form(None),
+    replace: bool = Form(False),
 ):
     response_status = True
     response_message = "File processed successfully."
     known_type = None
     extraction_receipt = None
+    replacement_receipt = None
 
     user_id = get_user_id(request, entity_id)
     logger.info(
@@ -2182,6 +2255,7 @@ async def embed_file(
             link=link,
             subscription_id=subscription_id,
             tenant_id=tenant_id,
+            replace=replace,
         )
 
         if not result:
@@ -2192,9 +2266,12 @@ async def embed_file(
                 detail="Failed to process/store the file data.",
             )
 
+        replacement_receipt = result.get("replacement")
+
         logger.info(
-            "[embed_file] stored [file_id=%s][chunks=%d]",
-            file_id, len(result.get("docs", [])),
+            "[embed_file] stored [file_id=%s][chunks=%d][replace=%s][superseded=%s]",
+            file_id, len(result.get("docs", [])), replace,
+            (replacement_receipt or {}).get("removed"),
         )
 
         if "error" in result:
@@ -2252,6 +2329,9 @@ async def embed_file(
         "filename": file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        # PRESENT ONLY when the caller asked to replace, so every existing response keeps
+        # its exact shape. Absent means "nothing was superseded", never "we did not check".
+        **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
     }
 
 
@@ -2310,6 +2390,7 @@ async def embed_file_upload(
     file_id: str = Form(...),
     uploaded_file: UploadFile = File(...),
     entity_id: str = Form(None),
+    replace: bool = Form(False),
 ):
     user_id = get_user_id(request, entity_id)
 
@@ -2329,6 +2410,7 @@ async def embed_file_upload(
     ent = _require_entity(request, "write", user_id)
     tenant_id = ent["tenant_id"]
     extraction_receipt = None
+    replacement_receipt = None
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
@@ -2352,6 +2434,7 @@ async def embed_file_upload(
             executor=request.app.state.thread_pool,
             filename=uploaded_file.filename,
             tenant_id=tenant_id,
+            replace=replace,
         )
 
         if not result:
@@ -2359,6 +2442,8 @@ async def embed_file_upload(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
             )
+
+        replacement_receipt = result.get("replacement")
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in embed_file_upload | Status: %d | Detail: %s",
@@ -2381,6 +2466,7 @@ async def embed_file_upload(
         "filename": uploaded_file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
     }
 
 
