@@ -377,6 +377,36 @@ def _is_pandoc_missing(error: BaseException) -> bool:
     )
 
 
+def _is_libreoffice_missing(error: BaseException) -> bool:
+    """Whether this failure is LibreOffice not being installed on the server.
+
+    THE SAME CLASS AS `_is_pandoc_missing`, found by uploading a legacy `.ppt` for the first time.
+    F2 recorded `.xls .ppt .epub .rst .xml` as owned backlog and nobody had ever run one; measured
+    2026-09-20, `.xls` answers a truthful `422 unsupported` with zero rows and `.ppt` answered
+    **503**.
+
+    503 is "the service is unavailable, retry" -- and this file already says, one function up, why
+    that is the wrong answer to a missing server package: no amount of retrying installs it, and a
+    503 tells Core's listener to retry forever a file that cannot work until an operator acts. That
+    guard was written for the dependency that had been hit rather than for the class, so the next
+    one inherited the defect it was built to prevent.
+
+    `unstructured.partition.common.common.convert_office_doc` raises
+    `FileNotFoundError("soffice command was not found. Please install libreoffice ...")` -- read in
+    the shipped image, not assumed. It is the SOLE argument, so the phrase begins at position 0,
+    and `startswith` closes the same caller-influenceable-substring hole an independent review
+    found in the first pandoc version: a filename can only reach an OSError message through the
+    `[Errno N] strerror: 'path'` form, where it is never at position 0.
+
+    Legacy Office formats are the reachable case, and they are exactly the ones a person still has
+    lying in a folder.
+    """
+    return any(
+        isinstance(link, OSError) and str(link).startswith("soffice command was not found")
+        for link in _causes(error)
+    )
+
+
 def is_service_fault(error: BaseException) -> bool:
     """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
     ourselves -- but never accuse the file either (see `describe_failure`).
@@ -429,6 +459,26 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
         return (
             status.HTTP_400_BAD_REQUEST,
             f"{ERROR_MESSAGES.PANDOC_NOT_INSTALLED} Reference: {reference}.",
+        )
+    if _is_libreoffice_missing(error):
+        # Same repair as pandoc's, for the same reason: permanent until an operator acts, so it
+        # must not be a retryable 503. The message names the format family and the action, because
+        # "the cause is not established" told a caller holding a .ppt nothing at all.
+        logger.error(
+            "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+            reference,
+            name,
+            "service:libreoffice_not_installed",
+            type(error).__name__,
+            error,
+            traceback.format_exc(),
+        )
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            f"'{name}' is a legacy Office format (.doc, .xls, .ppt) and this service cannot read "
+            f"one: LibreOffice is not installed on the server. Re-saving it in the modern format "
+            f"(.docx, .xlsx, .pptx) will work today; installing LibreOffice is the operator fix. "
+            f"Retrying this upload unchanged will not help. Reference: {reference}.",
         )
     if _is_name_too_long(error):
         # SP-01.15 -- we know exactly what is wrong here, so say it instead of "cause not established".
