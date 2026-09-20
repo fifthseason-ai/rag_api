@@ -25,6 +25,7 @@ from fastapi import (
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import asyncio
+import threading
 
 if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
@@ -73,6 +74,7 @@ from app.utils.document_loader import (
     cleanup_temp_encoding_file,
     DocumentVerdictError,
 )
+from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget
 from app.utils.health import is_health_ok
 
 router = APIRouter()
@@ -321,6 +323,52 @@ def _is_name_too_long(error: BaseException) -> bool:
     )
 
 
+def _is_pandoc_missing(error: BaseException) -> bool:
+    """Whether this failure is pandoc not being installed on the server.
+
+    FILES-01 F2 -- this is a REGRESSION REPAIR, not a new policy. `/text` and `/local/embed` each carry
+    an explicit `"No pandoc was found" in str(e)` branch answering with
+    `ERROR_MESSAGES.PANDOC_NOT_INSTALLED`. Those branches sit on the OUTER handler, but the failure they
+    target is raised inside `loader.lazy_load()`, and SP-01.10 now converts that into an `HTTPException`
+    at the `load_file_content` seam -- which the outer handlers re-raise untouched. So the branches
+    stopped being reached and the one actionable answer on those handlers was silently replaced by "the
+    cause is not established". Measured, not inferred: a route test drives a pandoc-less loader and reads
+    the response.
+
+    It belongs HERE because `describe_failure` is now the single classifier every intake path flows
+    through; putting it back on the outer handlers would restore a branch that can no longer execute.
+
+    Status stays 400, exactly as it was before the regression. A missing server package is infrastructure
+    but it is not TRANSIENT: no amount of retrying installs pandoc, and a 503 would tell Core's listener
+    to retry forever a file that cannot work until an operator acts -- the same harm the DataError and
+    ENAMETOOLONG corrections exist to prevent. The message carries the operator action instead.
+
+    HOW IT MATCHES, and why not the obvious way. An independent review broke the first version of this,
+    which was `"No pandoc was found" in str(link)` over the whole chain. That substring is
+    CALLER-INFLUENCEABLE: a save-path `OSError` carries the temp path in its message, and that path is
+    built by `_make_unique_temp_path` from the UPLOADER'S FILENAME. A file named
+    `No pandoc was found.txt` therefore made a genuine, retryable storage outage answer 400 "install
+    pandoc" -- turning a 503 into a permanent do-not-retry for every route sharing this classifier. That
+    is exactly the harm the DataError and ENAMETOOLONG corrections exist to prevent, re-opened by me.
+
+    So the match is pinned to what the library actually does, verified in the shipped image rather than
+    assumed: `pypandoc/__init__.py:802` raises `OSError("No pandoc was found: either install pandoc ...")`
+    -- the phrase is the START of the message. A user-controlled filename can only ever reach an OSError
+    message through the `[Errno N] strerror: 'path'` form, where it is never at position 0, so
+    `startswith` closes the injection. `isinstance(OSError)` narrows it further, and no code in `app/`
+    constructs a single-argument OSError from user input (checked).
+
+    NOTE for anyone tempted by the reviewer's other suggestion -- moving this check to run only when
+    `is_service_fault` is False. It looks safer and would SILENTLY BREAK THE REPAIR: pypandoc raises an
+    OSError, OSError is a service-fault type, so the real case would never reach the branch and the
+    actionable message would be lost again. Discriminate by type and position, not by order.
+    """
+    return any(
+        isinstance(link, OSError) and str(link).startswith("No pandoc was found")
+        for link in _causes(error)
+    )
+
+
 def is_service_fault(error: BaseException) -> bool:
     """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
     ourselves -- but never accuse the file either (see `describe_failure`).
@@ -358,6 +406,22 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
     """
     reference = uuid.uuid4().hex[:12]
     name = filename or "the uploaded file"
+    if _is_pandoc_missing(error):
+        # FILES-01 F2 -- restore the actionable answer the outer handlers can no longer produce.
+        # An operator can fix this; "the cause is not established" told nobody anything.
+        logger.error(
+            "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+            reference,
+            name,
+            "service:pandoc_not_installed",
+            type(error).__name__,
+            error,
+            traceback.format_exc(),
+        )
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            f"{ERROR_MESSAGES.PANDOC_NOT_INSTALLED} Reference: {reference}.",
+        )
     if _is_name_too_long(error):
         # SP-01.15 -- we know exactly what is wrong here, so say it instead of "cause not established".
         logger.error(
@@ -414,10 +478,29 @@ async def load_file_content(
     during loading, before any `add_documents` call, so nothing is stored.
     """
     loader = None
+    # Bounded local OCR for scanned PDF pages (FILES-01). `stop` is the cancellation
+    # half: `run_in_executor` cancels the FUTURE when the caller goes away, but the
+    # worker THREAD keeps running -- so without this a disconnected client leaves a
+    # 50-page OCR burning CPU for nobody. The loader checks this flag between pages.
+    #
+    # There is deliberately NO `except OcrCancelled` handler here. The flag is set only
+    # inside the `except asyncio.CancelledError` below, which re-raises immediately, so
+    # by the time the worker thread raises `OcrCancelled` nobody is awaiting that future
+    # and the exception is discarded -- which is the correct outcome, because a cancelled
+    # request has no caller left to answer. The first version answered 503 there; review
+    # showed it was unreachable, and an uncovered handler that implies a tested path is
+    # worse than no handler (the same call made for the dead verdict guard in #29).
+    stop = threading.Event()
     try:
-        loader, known_type, file_ext = get_loader(filename, content_type, file_path)
+        loader, known_type, file_ext = get_loader(
+            filename, content_type, file_path, ocr_budget=OcrBudget(should_stop=stop.is_set)
+        )
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
+        try:
+            data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
+        except asyncio.CancelledError:
+            stop.set()
+            raise
         return data, known_type, file_ext
     except DocumentVerdictError as verdict_error:
         logger.warning(
@@ -577,6 +660,12 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+#: The producers a delete may be narrowed to. These are the exact values the PDF loader
+#: writes into `text_source` on every stored chunk; they are a CONTRACT SURFACE that Core
+#: reads at retrieval time, so renaming one silently breaks a consumer.
+_DELETABLE_TEXT_SOURCES = frozenset({"native", "ocr"})
+
+
 @router.delete("/documents")
 async def delete_documents(
     body: DeleteDocumentsBody,
@@ -586,6 +675,22 @@ async def delete_documents(
     user_id = body.entity_id
     document_origin_type = body.document_origin_type
     subscription_id = body.subscription_id
+    # FILES-01: when set, only the rows written by this producer are removed and the
+    # file itself survives. Validated against a closed set rather than passed through,
+    # because every filter in the delete path NARROWS: a value that reached the SQL
+    # unmatched would delete nothing, but a value that got DROPPED on the way would
+    # delete the whole file. A typo must be a refusal, never a wider delete.
+    text_source = body.text_source
+    if text_source is not None and text_source not in _DELETABLE_TEXT_SOURCES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": (
+                    f"Unknown text_source '{text_source}'. Expected one of: "
+                    f"{', '.join(sorted(_DELETABLE_TEXT_SOURCES))}. Nothing was deleted."
+                )
+            },
+        )
 
     # Entitlement (D-KSPT-1): delete is scoped to an authorized entity. The
     # caller-supplied entity_id is only a filter; it must be within the token
@@ -616,10 +721,24 @@ async def delete_documents(
                 user_id=user_id,
                 document_origin_type=origin_type_value,
                 subscription_id=subscription_id,
+                text_source=text_source,
                 executor=request.app.state.thread_pool,
             )
         else:
             existing_ids = vector_store.get_filtered_ids(document_ids)
+            if text_source is not None:
+                # Only the pgvector store can narrow a delete by producer. Refusing is
+                # the only honest answer for the others: silently deleting the whole
+                # file would destroy exactly the text the caller asked to keep.
+                raise HTTPException(
+                    status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                    detail={
+                        "message": (
+                            "Deleting by text_source is only supported on the pgvector "
+                            "store. Nothing was deleted."
+                        )
+                    },
+                )
             vector_store.delete(ids=document_ids)
 
         if document_ids:
@@ -633,7 +752,10 @@ async def delete_documents(
             len(existing_ids), len(document_ids),
         )
 
-        # Delete cached summaries for the removed files
+        # Delete cached summaries for the removed files. This runs for a text_source
+        # delete too, and deliberately: a summary built from text that has just been
+        # superseded is stale, and a stale summary presented as current is worse than
+        # no summary. It is regenerated on next use.
         if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
             try:
                 await delete_summaries_by_file_ids(document_ids, user_id=user_id)
@@ -645,6 +767,19 @@ async def delete_documents(
                 )
 
         file_count = len(document_ids)
+        if text_source is not None:
+            # NOT "deleted successfully": the file still exists and still has its other
+            # rows. Saying otherwise would be the same shape of dishonest success this
+            # service has spent the whole lane removing.
+            return {
+                "message": (
+                    f"Removed the '{text_source}' rows for {file_count} "
+                    f"file{'s' if file_count > 1 else ''}. The file"
+                    f"{'s' if file_count > 1 else ''} and any rows from other sources "
+                    f"remain."
+                ),
+                "text_source": text_source,
+            }
         return {
             "message": f"Documents for {file_count} file{'s' if file_count > 1 else ''} deleted successfully"
         }
@@ -1248,6 +1383,52 @@ _UNIT_LOCATOR_KEYS = (
 )
 
 
+#: How one page's local-OCR outcome becomes the receipt's unit reason (FILES-01).
+#:
+#: `no_page_image` and `disabled` deliberately map to nothing, so those pages keep the
+#: plain `empty` they reported before OCR existed: a page with no embedded image is
+#: indistinguishable HERE from a blank page, and claiming it needs escalation would be
+#: inventing a fact. Everything else names what went wrong specifically.
+#:
+#: `ocr_no_text` and `page_limit`/`time_limit`/`cancelled` map to DIFFERENT reasons on
+#: purpose. "We read the page and got nothing" and "we never looked at the page" are
+#: the pair Core called out as the one that gets collapsed by accident.
+_OCR_REASON_TO_UNIT_REASON = {
+    "ocr_no_text": "ocr_no_text",
+    "ocr_low_confidence": "ocr_low_confidence",
+    "ocr_orientation_suspect": "ocr_orientation_suspect",
+    "engine_unavailable": "ocr_unavailable",
+    "page_limit": "ocr_not_attempted",
+    "time_limit": "ocr_not_attempted",
+    "cancelled": "ocr_not_attempted",
+    "budget_exhausted": "ocr_not_attempted",
+}
+
+#: Outcomes where a better reader might succeed -- the ONLY ones that set
+#: `escalation.recommended`. `ocr_low_confidence` belongs here even though such a page
+#: DID yield stored text: it is the "nonempty text is not success" case.
+_ESCALATABLE_OCR_REASONS = frozenset(
+    {"ocr_no_text", "ocr_low_confidence", "ocr_orientation_suspect", "engine_unavailable",
+     "page_limit", "time_limit", "cancelled", "budget_exhausted"}
+)
+
+#: Outcomes where OCR DID produce stored text that should not read as clean success.
+#: Deliberately NOT used for any per-reason count: each weak page is counted under its own
+#: reason exactly once, so the buckets stay addable.
+#:
+#: Review caught the first version counting an orientation-suspect page under BOTH
+#: `pages_low_confidence` and `pages_orientation_suspect` -- one weak page, two increments.
+#: The label was false as well as duplicated: a sideways page comes back at HIGH
+#: confidence (~0.96 measured), which is the entire reason the geometric signal exists, so
+#: reporting it as low confidence contradicted the data and this module's own docstring.
+_OCR_WEAK_REASONS = frozenset({"ocr_low_confidence", "ocr_orientation_suspect"})
+
+#: Page-level outcomes that mean a BOUND stopped the work rather than the page itself
+#: being unreadable. Surfaced as `ocr.stopped_reason` so a truncated run is never
+#: mistaken for a complete one.
+_OCR_STOP_REASONS = frozenset({"page_limit", "time_limit", "cancelled", "budget_exhausted"})
+
+
 def _extraction_receipt(data: Iterable[Document]) -> dict:
     """Build the additive extraction receipt for the /embed response (KI-02 WP-G1).
 
@@ -1265,7 +1446,12 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     Shape:
       status:         'complete' (every unit extracted) | 'partial' (>=1 extracted
                       AND >=1 empty/image-only unit) | 'empty' (0 extracted units;
-                      this is the 422 path)
+                      this is the 422 path).
+                      ALSO forced to 'partial' when `escalation.recommended` is true,
+                      so a document with pages that still need a better reader can
+                      never read as `complete` on the field consumers already check --
+                      including when every page yielded some text the engine does not
+                      vouch for. Nonempty text is not success.
       locator_kind:   'page' | 'slide' | 'sheet' | 'none'
       units_total / units_extracted / units_empty / units_image_only
       empty_locators: sorted locators (page ints / slide ints / sheet names) of
@@ -1273,6 +1459,26 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       units only)
       reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
                       locator-bearing unit
+      ocr:            PRESENT ONLY when local OCR ran on at least one unit (FILES-01) —
+                      {engine,
+                       pages_attempted,      pages the engine actually looked at
+                       pages_recovered,      pages whose stored text came from OCR
+                       pages_no_text,        attempted, engine returned nothing
+                       pages_not_attempted,  skipped because a bound was already spent
+                       pages_low_confidence, recovered but the engine does not vouch
+                       mean_confidence,      over recovered pages, or null
+                       stopped_reason}       'page_limit'|'time_limit'|'cancelled'|null
+                      `pages_attempted` and `pages_not_attempted` are deliberately
+                      separate: "read it and got nothing" and "never looked" are
+                      different facts about coverage.
+      escalation:     PRESENT with `ocr`. The typed outcome for a controlled fallback
+                      to the approved AWS document route — {recommended, reason,
+                      locators}. rag_api states what it could not read well; it never
+                      calls, chooses or pays for the fallback and owns no policy about
+                      whether escalating is worth it.
+      text_sources:   Per-page provenance grouped by producer —
+                      {'native': [...], 'ocr': [...], 'none': [...]} — so a citation
+                      can say WHICH pages came from the text layer and which from OCR.
       formulas:       PRESENT ONLY for formats that report a formula scan
                       (spreadsheets; KI-02 SP-01.5) —
                       {scan: 'complete' | 'unavailable',
@@ -1311,13 +1517,27 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
         meta = getattr(d, "metadata", None) or {}
         loc = meta.get(meta_key) if meta_key is not None else None
         if loc not in units:
-            units[loc] = {"content": False, "image_only": False}
+            units[loc] = {
+                "content": False,
+                "image_only": False,
+                "ocr": None,
+                "source": None,
+                "attempted": False,
+            }
             order.append(loc)
         pc = getattr(d, "page_content", None)
         if pc and clean_text(pc).strip():
             units[loc]["content"] = True
         if meta.get("image_only") is True:
             units[loc]["image_only"] = True
+        if meta.get("ocr_reason") is not None:
+            units[loc]["ocr"] = meta["ocr_reason"]
+            if meta.get("ocr_attempted"):
+                units[loc]["attempted"] = True
+            if meta.get("ocr_confidence") is not None:
+                units[loc]["ocr_confidence"] = meta["ocr_confidence"]
+        if meta.get("text_source") is not None:
+            units[loc]["source"] = meta["text_source"]
         if meta.get("formula_scan") is not None:
             formula_scan = meta["formula_scan"]
         cells = meta.get("formula_uncached_cells")
@@ -1352,6 +1572,18 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     reason_by_loc = {loc: "image_only" for loc in image_only}
     reason_by_loc.update({loc: "empty" for loc in empty})
 
+    # --- local OCR outcome, and the typed escalation signal Core acts on -------------
+    #
+    # Every value here is derived from what the loader actually did to each page; none
+    # of it decides anything about cost or providers. A page whose OCR fell short keeps
+    # the honest `empty` family it already had, but gains a SPECIFIC reason, because
+    # "this page is a scan we could not read well enough" and "this page is blank" are
+    # different facts and only one of them is worth escalating.
+    for loc in non_extracted:
+        mapped = _OCR_REASON_TO_UNIT_REASON.get(units[loc]["ocr"])
+        if mapped:
+            reason_by_loc[loc] = mapped
+
     receipt = {
         "status": status_str,
         "locator_kind": locator_kind,
@@ -1368,6 +1600,91 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             if loc is not None
         ],
     }
+
+    # Present ONLY when OCR actually ran on at least one unit, so every receipt for a
+    # native PDF, a workbook or a deck keeps its exact previous shape.
+    ocr_locs = [loc for loc in order if units[loc]["ocr"] is not None]
+    if ocr_locs:
+        recovered = [loc for loc in ocr_locs if units[loc]["source"] == "ocr"]
+        weak = [loc for loc in recovered if units[loc]["ocr"] == "ocr_low_confidence"]
+        suspect = [loc for loc in recovered if units[loc]["ocr"] == "ocr_orientation_suspect"]
+        attempted = [loc for loc in ocr_locs if units[loc]["attempted"]]
+        not_attempted = [
+            loc for loc in ocr_locs
+            if _OCR_REASON_TO_UNIT_REASON.get(units[loc]["ocr"]) == "ocr_not_attempted"
+        ]
+        no_text = [loc for loc in ocr_locs if units[loc]["ocr"] == "ocr_no_text"]
+        confidences = [
+            units[loc]["ocr_confidence"]
+            for loc in recovered
+            if units[loc].get("ocr_confidence") is not None
+        ]
+        escalate = sorted(
+            (loc for loc in ocr_locs if units[loc]["ocr"] in _ESCALATABLE_OCR_REASONS),
+            key=_sort_key,
+        )
+        stopped = next(
+            (units[loc]["ocr"] for loc in ocr_locs if units[loc]["ocr"] in _OCR_STOP_REASONS),
+            None,
+        )
+        receipt["ocr"] = {
+            "engine": OCR_ENGINE_NAME,
+            # COVERAGE, in three separable counts. `pages_attempted` counts only pages
+            # the engine actually looked at; a page skipped because a bound was already
+            # spent is in `pages_not_attempted`, never folded into "attempted, nothing".
+            "pages_attempted": len(attempted),
+            "pages_recovered": len(recovered),
+            "pages_no_text": len(no_text),
+            "pages_not_attempted": len(not_attempted),
+            # Recovered but weak. Separated from `pages_recovered` so nonempty text can
+            # never read as clean success.
+            "pages_low_confidence": len(weak),
+            # Pages whose detected text runs vertically: read, but almost certainly
+            # sideways, so most of the page was missed. Counted separately AND
+            # exclusively -- it is a DIFFERENT fact from low confidence, because these
+            # pages come back confident and wrong. A page is never in both buckets.
+            "pages_orientation_suspect": len(suspect),
+            "mean_confidence": (
+                round(sum(confidences) / len(confidences), 4) if confidences else None
+            ),
+            # Which bound ended the work, or null when the whole document was read.
+            "stopped_reason": stopped,
+        }
+        # The typed outcome Core escalates on. rag_api states WHAT it could not read
+        # well; it does not call, choose or pay for the fallback, and it owns no policy
+        # about whether escalating is worth it.
+        receipt["escalation"] = {
+            "recommended": bool(escalate),
+            "reason": (
+                _OCR_REASON_TO_UNIT_REASON.get(units[escalate[0]]["ocr"], units[escalate[0]]["ocr"])
+                if escalate
+                else None
+            ),
+            "locators": [loc for loc in escalate if loc is not None],
+        }
+        # THE LOAD-BEARING ONE. A document with pages still needing a better reader must
+        # never present as `complete` on the field consumers already read -- including
+        # the case where every page yielded SOME text but the engine does not vouch for
+        # it. Nonempty text is not success. `empty` is left alone: that is the 422 path
+        # and is already the strongest possible statement of failure.
+        if escalate and receipt["status"] == "complete":
+            receipt["status"] = "partial"
+
+    # PER-PAGE PROVENANCE: which engine produced which page's text. Core needs this at
+    # page granularity, not as one document-level label, because a citation has to be
+    # able to say that page 3 came from OCR and page 4 from the native text layer.
+    # Grouped rather than one object per page so a long document stays compact.
+    if ocr_locs or any(units[loc]["source"] for loc in order):
+        sources: dict = {}
+        for loc in order:
+            source = units[loc]["source"]
+            if source is None:
+                source = "native" if units[loc]["content"] else "none"
+            sources.setdefault(source, []).append(loc)
+        receipt["text_sources"] = {
+            name: sorted((l for l in locs if l is not None), key=_sort_key)
+            for name, locs in sorted(sources.items())
+        }
 
     # Present ONLY for formats that report a formula scan (spreadsheets today), so
     # every existing receipt keeps its exact shape.
@@ -1494,7 +1811,34 @@ async def store_data_in_vector_db(
             str(e),
             traceback.format_exc(),
         )
-        return {"message": "An error occurred while adding documents.", "error": str(e)}
+        # FILES-01 F3 -- PROPAGATE, so the caller can attribute the failure.
+        #
+        # This used to return {"message": "An error occurred...", "error": str(e)}. Both that and the
+        # success value are truthy dicts, so the four callers each invented their own way to read it
+        # and only one was right:
+        #     /summarize     `if not result or "error" in result:`  correct
+        #     /local/embed   `if result:`                           ALWAYS true -> 200 {"status": true}
+        #     /embed-upload  `if not result:`                       NEVER true  -> 200 {"status": true}
+        #     /embed         has an `if "error" in result` check, but sets response_message = the RAW
+        #                    exception and falls through to the 200 success return
+        # A vector-store outage was therefore reported to the uploader and to Core as a successful
+        # ingest with zero rows written -- and on /embed it also handed the caller str(e).
+        #
+        # My first fix returned None. That killed the fake success, but an independent review showed it
+        # traded one harm for another: swallowing the exception left every store failure indistinguishable,
+        # so an outage and a PERMANENT content fault both became a flat 500. `describe_failure` classifies
+        # a psycopg2/sqlalchemy DataError as content (`_CONTENT_FAULT_TYPE_NAMES`) precisely because the
+        # value being written is text extracted from the upload -- a NUL byte in a non-PDF extraction
+        # reaches pgvector unmodified, since `clean_text` only runs when clean_content is True. Under the
+        # None fix that permanent fault was answered 5xx, so a listener keying retry on 5xx would retry
+        # forever a file that can never store. I introduced that; this corrects it.
+        #
+        # Raising is also the fix that cannot be misread: there is no sentinel value for a caller to
+        # interpret, so `if result:` / `if not result:` / `"error" in result` are all moot. Every caller
+        # already has `except Exception -> describe_failure`, the same seam the loader path uses, so an
+        # outage becomes a retryable 503 that exonerates the file and a content fault stays a permanent
+        # 400. The exception and traceback are logged here, where they happen, before it leaves.
+        raise
 
 
 @router.post("/local/embed")
@@ -1558,9 +1902,13 @@ async def embed_local_file(
                 "extraction": extraction_receipt,
             }
         else:
+            # Defensive only: `store_data_in_vector_db` now raises rather than returning a falsy
+            # sentinel, so a store failure cannot reach here. Kept as a guard, and given the same
+            # message its sibling routes use instead of the generic "Something went wrong :/" --
+            # a string this lane's own tests forbid on the attributed path.
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=ERROR_MESSAGES.DEFAULT(),
+                detail="Failed to process/store the file data.",
             )
     except HTTPException as http_exc:
         logger.error(
@@ -1570,17 +1918,30 @@ async def embed_local_file(
         )
         raise http_exc
     except Exception as e:
-        logger.error(e)
-        if "No pandoc was found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT(e),
-            )
+        # FILES-01 F3 (re-review NOTE-2) -- the last raw `str(e)` on the intake surface.
+        #
+        # This handler carried BOTH of the defects already fixed on /text:
+        #   * `ERROR_MESSAGES.DEFAULT(e)` interpolates the exception verbatim
+        #     (`constants.py`: f"Something went wrong :/\n{err}"), so any failure reaching here
+        #     handed the caller our internal text -- and at 400, telling Core's listener that a
+        #     fault which may well be ours is the uploader's file and must not be retried.
+        #   * the `"No pandoc was found" in str(e)` branch was DEAD (the loader failure it targets
+        #     is converted to an HTTPException upstream and re-raised by the handler above) AND was
+        #     the caller-influenceable substring match that an independent review broke on /text: a
+        #     save-path OSError embeds our temp path, which is built from the uploader's filename.
+        #
+        # Both are now the shared, reviewed `describe_failure`: pandoc keeps its actionable operator
+        # message via a match pinned to type and position, a service fault becomes a retryable 503
+        # that exonerates the file, and anything unclassified keeps 400 without the raw text. The
+        # exception and traceback stay in the log under the reference the caller is given.
+        logger.error(
+            "Error in embed_local_file | File: %s | Error: %s | Traceback: %s",
+            document.filename,
+            str(e),
+            traceback.format_exc(),
+        )
+        status_code, message = describe_failure(e, document.filename)
+        raise HTTPException(status_code=status_code, detail=message) from e
 
 
 async def _generate_summary_background(
@@ -1988,22 +2349,34 @@ async def extract_text_from_file(
         )
         raise http_exc
     except Exception as e:
+        # FILES-01 F2 -- the last caller-facing `str(e)` on the /text intake path. (NOT the last in the
+        # file: /local/embed's else-branch still returns ERROR_MESSAGES.DEFAULT(e), which interpolates
+        # str(e) verbatim. That route is outside this increment; recorded, not silently absorbed.)
+        #
+        # `save_upload_file_async` (SP-01.13) and `load_file_content` (SP-01.10) now raise
+        # `HTTPException` and are re-raised untouched above. Two calls in the `try` are behind neither
+        # seam: `os.makedirs`, whose `PermissionError`/`OSError` carries OUR temp directory in `str(e)`,
+        # and `extract_text_from_documents`. Both landed here and were echoed to the caller verbatim --
+        # proven at route level, with an injected marker that reached the response body.
+        #
+        # Worse than the disclosure: every one of them was answered 400, telling the caller their file is
+        # bad and telling Core's listener not to retry, for faults that are ours. `describe_failure`
+        # attributes it instead -- a service fault becomes a retryable 503 that exonerates the file, a
+        # missing pandoc keeps its actionable operator message, and anything unclassified keeps its 400
+        # but says the cause is not established rather than guessing. The exception and traceback stay in
+        # the log, under the reference the caller is given.
+        #
+        # The `"No pandoc was found"` branch that stood here is gone deliberately, not dropped: it could
+        # no longer execute (the loader failure it targets is converted to an `HTTPException` upstream),
+        # and the answer it produced now comes from `describe_failure` where it is reachable again.
         logger.error(
             "Error during text extraction | File: %s | Error: %s | Traceback: %s",
             file.filename,
             str(e),
             traceback.format_exc(),
         )
-        if "No pandoc was found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error during text extraction: {str(e)}",
-            )
+        status_code, message = describe_failure(e, file.filename)
+        raise HTTPException(status_code=status_code, detail=message) from e
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
 
@@ -2158,4 +2531,15 @@ async def summarize_entity_files(
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        # FILES-01 F3 -- this handler became REACHABLE for store failures when
+        # `store_data_in_vector_db` started propagating instead of swallowing, so leaving `str(e)` here
+        # would have turned a fix into a new leak on a route that previously never saw those exceptions.
+        # Same reviewed contract as every other intake path: attribution by status code, a sentence plus
+        # a reference to the caller, the exception and traceback to the log.
+        #
+        # `None`, not `file_id`: this route has no filename in scope, and passing the id put an
+        # internal identifier where the sentence says "filename" -- which would have told a user to
+        # "shorten the file name" of something that is not a name they chose. `describe_failure`
+        # falls back to "the uploaded file": vaguer, but not wrong.
+        status_code, message = describe_failure(e, None)
+        raise HTTPException(status_code=status_code, detail=message) from e

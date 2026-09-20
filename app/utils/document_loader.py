@@ -7,10 +7,17 @@ import zipfile
 
 from typing import Iterator, List, Optional
 import chardet
+from pypdf import PdfReader
 
 from langchain_core.documents import Document
 
-from app.config import known_source_ext, PDF_EXTRACT_IMAGES, CHUNK_OVERLAP, logger
+from app.config import (
+    known_source_ext,
+    PDF_EXTRACT_IMAGES,
+    PDF_OCR_ENABLED,
+    CHUNK_OVERLAP,
+    logger,
+)
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
@@ -319,15 +326,22 @@ def cleanup_temp_encoding_file(loader) -> None:
             logger.warning(f"Failed to remove temporary UTF-8 file: {e}")
 
 
-def get_loader(filename: str, file_content_type: str, filepath: str):
-    """Get the appropriate document loader based on file type and\or content type."""
+def get_loader(filename: str, file_content_type: str, filepath: str, ocr_budget=None):
+    """Get the appropriate document loader based on file type and\or content type.
+
+    `ocr_budget` is the caller's bounded allowance for reading SCANNED PDF pages
+    locally (FILES-01). It is optional and PDF-only: omitting it leaves every loader
+    behaving exactly as it did before OCR existed.
+    """
     file_ext = filename.split(".")[-1].lower()
     known_type = True
 
     # File Content Type reference:
     # ref.: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types/Common_types
     if file_ext == "pdf" or file_content_type == "application/pdf":
-        loader = SafePyPDFLoader(filepath, extract_images=PDF_EXTRACT_IMAGES)
+        loader = SafePyPDFLoader(
+            filepath, extract_images=PDF_EXTRACT_IMAGES, ocr_budget=ocr_budget
+        )
     elif file_ext == "csv" or file_content_type == "text/csv":
         # Detect encoding for CSV files
         encoding = detect_file_encoding(filepath)
@@ -505,18 +519,77 @@ class SafePyPDFLoader:
     ref.: https://github.com/langchain-ai/langchain/issues/26652
     """
 
-    def __init__(self, filepath: str, extract_images: bool = False):
+    def __init__(self, filepath: str, extract_images: bool = False, ocr_budget=None):
         self.filepath = filepath
         self.extract_images = extract_images
         self._temp_filepath = None  # For compatibility with cleanup function
+        #: One document's OCR allowance, supplied by the route. `None` means "do not
+        #: OCR at all" -- so every existing direct construction of this loader keeps
+        #: exactly its previous behaviour and cost.
+        self.ocr_budget = ocr_budget
+        self._ocr_reader_obj = None
+        self._ocr_handle = None
+
+    #: A PDF can be "encrypted" in two very different ways and only ONE of them is a refusal.
+    #: Measured with pypdf in the shipped image, not assumed:
+    #:
+    #:   user password       is_encrypted=True, decrypt("") -> 0 (NOT_DECRYPTED), pages UNREADABLE
+    #:   owner password ONLY is_encrypted=True, decrypt("") -> 1, pages READ PERFECTLY WELL
+    #:
+    #: Owner-password PDFs carry only usage restrictions (no printing, no copying) and extract
+    #: today. Refusing on `is_encrypted` alone would reject a whole class of files that currently
+    #: work -- which is why the test is "the empty password does not unlock it", not "it is
+    #: encrypted".
+    def _refuse_if_locked(self) -> None:
+        """Give a password-protected PDF the same actionable verdict a workbook already gets.
+
+        FILES-01, approved as a small maintenance change: a locked PDF used to answer the generic
+        400 "the cause is not established" while an encrypted .xlsx answered 422 `encrypted` with
+        an instruction the uploader can act on. Same condition, same contract now.
+
+        Deliberately NOT done, and not wanted: storing passwords, prompting for them, or trying to
+        break them. This only names what is wrong.
+        """
+        try:
+            reader = PdfReader(self.filepath)
+            if not reader.is_encrypted:
+                return
+            unlocked = reader.decrypt("")
+        except Exception as probe_error:
+            # The check itself failed. Say nothing rather than invent a verdict from a probe that
+            # did not work -- the parser below produces its own honest answer, i.e. we degrade to the
+            # behaviour that shipped before this check existed.
+            #
+            # No `except DocumentVerdictError: raise` guard here: review showed it was unreachable.
+            # Nothing inside this `try` raises one, and the EncryptedDocumentError below is raised
+            # OUTSIDE it, so it can never be swallowed. An uncovered guard that implies a tested path
+            # is worse than no guard.
+            #
+            # `info`, not `debug`, to match SheetExcelLoader._precheck_container: an inconclusive
+            # pre-check means the caller may get a vaguer message than we could have given, which an
+            # operator should be able to see.
+            logger.info(
+                "PDF encryption pre-check inconclusive for %s: %s", self.filepath, probe_error
+            )
+            return
+
+        if not unlocked:
+            raise EncryptedDocumentError(
+                "The PDF is password-protected, so its contents cannot be read. "
+                "Upload a copy saved without a password.",
+                filename=os.path.basename(self.filepath),
+            )
 
     def lazy_load(self) -> Iterator[Document]:
         """Lazy load PDF documents with automatic fallback on image extraction errors."""
+        # Decide the encrypted verdict BEFORE parsing, the same way SheetExcelLoader decides
+        # encrypted-vs-corrupt from the container first.
+        self._refuse_if_locked()
         loader = PyPDFLoader(self.filepath, extract_images=self.extract_images)
 
         if not self.extract_images:
             # No image extraction: no fallback needed, stream directly
-            yield from loader.lazy_load()
+            yield from self._with_ocr(loader.lazy_load())
             return
 
         # extract_images=True: must collect eagerly so that a mid-stream
@@ -534,7 +607,125 @@ class SafePyPDFLoader:
             else:
                 # Re-raise if it's a different error
                 raise
-        yield from pages
+        yield from self._with_ocr(iter(pages))
+
+    # -- local-first OCR (FILES-01, FS-CONTINUE-R3) ---------------------------------
+    #
+    # Native text FIRST, always: a page pypdf could read is never sent to OCR, so a
+    # native PDF costs exactly what it cost before and a mixed document never gets the
+    # same page twice (the one duplication risk this design has to avoid). OCR runs
+    # ONLY on pages that produced no usable text -- which is precisely a scan.
+    #
+    # `PDF_EXTRACT_IMAGES` is NOT this switch. Measured in the shipped image,
+    # `PyPDFLoader(extract_images=True)` returns 0 characters on a genuine scan even
+    # with langchain's own OCR image parser attached, so the page image is fetched
+    # here explicitly instead.
+
+    def _ocr_reader(self):
+        """The pypdf reader used for OCR, opened at most once and only if needed.
+
+        Opened lazily so a native PDF never pays for it, and kept on an explicit file
+        handle that `close_ocr_reader` releases rather than relying on GC.
+        """
+        if self._ocr_reader_obj is None:
+            self._ocr_handle = open(self.filepath, "rb")
+            reader = PdfReader(self._ocr_handle)
+            if reader.is_encrypted:
+                # Re-applies to THIS reader what `_refuse_if_locked` already established:
+                # the empty password opens the file. An owner-password scan is a readable
+                # scan and must be OCR'd like any other.
+                #
+                # Not "a user-password PDF never reaches here" -- review was right that
+                # the claim was too absolute. If the pre-check's own probe fails, it stays
+                # silent by design and a locked file can arrive here. There is no bypass:
+                # `decrypt("")` then returns NOT_DECRYPTED, reading the page fails, the
+                # failure is caught and the page is reported empty. Nothing is stored and
+                # no password is guessed.
+                reader.decrypt("")
+            self._ocr_reader_obj = reader
+        return self._ocr_reader_obj
+
+    def close_ocr_reader(self) -> None:
+        self._ocr_reader_obj = None
+        if self._ocr_handle is not None:
+            try:
+                self._ocr_handle.close()
+            finally:
+                self._ocr_handle = None
+
+    def _with_ocr(self, pages: Iterator[Document]) -> Iterator[Document]:
+        """Pass native pages through untouched; OCR the ones that came back empty."""
+        from app.utils.ocr import OcrCancelled, ocr_page  # local: keeps OCR off the import path
+
+        budget = self.ocr_budget
+        try:
+            for document in pages:
+                metadata = document.metadata if document.metadata is not None else {}
+                document.metadata = metadata
+                if (document.page_content or "").strip():
+                    # Real text on the page. Never OCR it -- that is what would produce
+                    # duplicate text for a mixed document.
+                    #
+                    # The provenance stamp is gated on the feature being ON. Review found
+                    # it was being written unconditionally, so a NATIVE PDF gained a
+                    # `text_sources` block in its receipt even with OCR disabled -- which
+                    # made the "byte-identical to the pre-OCR build" claim false for the
+                    # one format the feature touches, exactly where the kill switch is
+                    # supposed to be total.
+                    if PDF_OCR_ENABLED:
+                        metadata.setdefault("text_source", "native")
+                    yield document
+                    continue
+                if budget is None:
+                    yield document
+                    continue
+
+                page_index = metadata.get("page")
+                page = None
+                try:
+                    reader = self._ocr_reader()
+                    if isinstance(page_index, int) and 0 <= page_index < len(reader.pages):
+                        page = reader.pages[page_index]
+                except Exception as error:
+                    # Reopening for OCR failed. The page keeps its honest empty result.
+                    logger.info("OCR could not open %s: %s", self.filepath, error)
+
+                if page is None:
+                    yield document
+                    continue
+
+                result = ocr_page(page, budget)
+                if result.reason == "disabled":
+                    # The kill switch is off: leave no trace at all, so the receipt is
+                    # byte-identical to the build before OCR existed.
+                    yield document
+                    continue
+                metadata["ocr_reason"] = result.reason
+                metadata["ocr_attempted"] = result.attempted
+                if result.images_seen:
+                    metadata["ocr_images"] = result.images_seen
+                if result.notes:
+                    metadata["ocr_notes"] = ",".join(sorted(set(result.notes)))
+                if result.text.strip():
+                    # Extracted characters are NEVER discarded here, including weak
+                    # ones. Whether coverage is good enough to call the document
+                    # ingested is Core's judgement, not this service's -- so a weak
+                    # page is REPORTED as weak (and escalated) rather than silently
+                    # dropped, which would hide from Core the very thing it decides on.
+                    document.page_content = result.text
+                    metadata["text_source"] = "ocr"
+                    metadata["ocr_confidence"] = round(result.confidence, 4)
+                    metadata["ocr_chars"] = len(result.text.strip())
+                else:
+                    metadata["text_source"] = "none"
+                yield document
+        except OcrCancelled:
+            # Stop producing pages rather than returning while a worker thread keeps
+            # OCR-ing a document nobody is waiting for.
+            logger.info("OCR cancelled for %s; stopping extraction", self.filepath)
+            raise
+        finally:
+            self.close_ocr_reader()
 
     def load(self) -> List[Document]:
         """Load PDF documents with automatic fallback on image extraction errors."""

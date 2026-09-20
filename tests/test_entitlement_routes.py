@@ -87,7 +87,7 @@ def _patch_store(monkeypatch):
 
     async def dummy_delete(
         self, ids=None, collection_only=False, user_id=None,
-        document_origin_type=None, subscription_id=None, executor=None
+        document_origin_type=None, subscription_id=None, executor=None, **_
     ):
         return None
 
