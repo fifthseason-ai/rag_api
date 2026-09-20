@@ -1079,6 +1079,7 @@ async def _process_documents_async_pipeline(
     file_id: str,
     vector_store: "AsyncPgVector",
     executor: "ThreadPoolExecutor",
+    protected_row_uuids: Optional[List[str]] = None,
 ) -> List[str]:
     """
     Process documents using async producer-consumer pattern for batched embedding and insertion.
@@ -1228,8 +1229,29 @@ async def _process_documents_async_pipeline(
         if all_ids:
             try:
                 logger.warning("Performing rollback of file %s", file_id)
-                await vector_store.delete(ids=[file_id], executor=executor)
-                logger.info("Rollback completed for file %s", file_id)
+                if protected_row_uuids:
+                    # A REPLACEMENT IS IN FLIGHT AND THE OLD VERSION IS STILL THE ONLY GOOD
+                    # COPY. The plain rollback below deletes by custom_id, i.e. EVERY row for
+                    # this file -- which here means the rows this call was supposed to
+                    # supersede, not merely the ones it wrote. Independent review demonstrated
+                    # it end to end: with the production default EMBEDDING_BATCH_SIZE=500, a
+                    # failure on any batch after the first left the file with ZERO rows and
+                    # answered 400, so a caller retrying only on 5xx would treat the document
+                    # as done while the only good copy was gone.
+                    #
+                    # Roll back only what THIS call inserted: everything present now that was
+                    # not present at capture.
+                    protected = set(protected_row_uuids)
+                    current = await vector_store.get_row_uuids(file_id, executor=executor)
+                    inserted = [u for u in current if u not in protected]
+                    await vector_store.delete_rows_by_uuid(inserted, executor=executor)
+                    logger.info(
+                        "Rollback completed for file %s: removed %d newly inserted row(s), "
+                        "kept %d pre-existing", file_id, len(inserted), len(protected),
+                    )
+                else:
+                    await vector_store.delete(ids=[file_id], executor=executor)
+                    logger.info("Rollback completed for file %s", file_id)
             except Exception as cleanup_error:
                 logger.error("Rollback failed for file %s: %s", file_id, cleanup_error)
 
@@ -1242,6 +1264,7 @@ async def _process_documents_batched_sync(
     file_id: str,
     vector_store: "PgVector",
     executor: "ThreadPoolExecutor",
+    protected_row_uuids: Optional[List[str]] = None,
 ) -> List[str]:
     """
     Process documents in batches using synchronous vector store operations.
@@ -1305,10 +1328,29 @@ async def _process_documents_batched_sync(
             ):  # any batch succeeded (i.e., any chunks for this file were inserted)
                 logger.warning("Rolling back file %s due to batch failure", file_id)
                 try:
-                    await loop.run_in_executor(
-                        executor, lambda: vector_store.delete(ids=[file_id])
-                    )
-                    logger.info("Rollback completed for file %s", file_id)
+                    if protected_row_uuids:
+                        # See the same guard in _process_documents_async_pipeline: under a
+                        # replacement, a delete-by-file_id removes the version this call was
+                        # superseding, which is still the only good copy while the new one
+                        # has failed. Roll back only what THIS call inserted.
+                        protected = set(protected_row_uuids)
+                        current = await loop.run_in_executor(
+                            executor, lambda: vector_store.get_row_uuids(file_id)
+                        )
+                        inserted = [u for u in current if u not in protected]
+                        await loop.run_in_executor(
+                            executor, lambda: vector_store.delete_rows_by_uuid(inserted)
+                        )
+                        logger.info(
+                            "Rollback completed for file %s: removed %d newly inserted "
+                            "row(s), kept %d pre-existing",
+                            file_id, len(inserted), len(protected),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            executor, lambda: vector_store.delete(ids=[file_id])
+                        )
+                        logger.info("Rollback completed for file %s", file_id)
                 except Exception as rollback_error:
                     logger.error(
                         "Rollback failed for file %s: %s", file_id, rollback_error
@@ -1785,8 +1827,14 @@ async def store_data_in_vector_db(
     2. Insert first, delete second, so the document never passes through zero rows. A
        reader querying during the swap sees the old version or both, never nothing. This is
        the same ordering the OCR escalation path already uses.
-    3. A failed insert RAISES before the delete runs, so a store outage can never remove the
-       only copy. The delete is reached only after the new rows exist.
+    3. A failed insert never removes the old version. Two different mechanisms, and the
+       second was missing until independent review demonstrated the loss: the single-shot
+       path RAISES before `delete_rows_by_uuid` is reached, and the BATCHED paths (the
+       production default is EMBEDDING_BATCH_SIZE=500) roll back only the rows this call
+       inserted instead of deleting by file_id. The earlier wording here claimed the first
+       mechanism covered both. It did not: a failure on any batch after the first left the
+       file with ZERO rows and answered 400, so a caller retrying only on 5xx would have
+       treated the document as done with the only good copy gone.
 
     The count removed is reported, never assumed. A replacement that did not remove what it
     superseded leaves stale content retrievable, which is a fact the caller has to receive
@@ -1808,10 +1856,21 @@ async def store_data_in_vector_db(
             superseded_rows = await vector_store.get_row_uuids(
                 file_id, user_id=user_id or None, tenant_id=tenant_id, executor=executor
             )
+            all_rows_before = await vector_store.get_row_uuids(file_id, executor=executor)
         else:
             superseded_rows = vector_store.get_row_uuids(
                 file_id, user_id=user_id or None, tenant_id=tenant_id
             )
+            all_rows_before = vector_store.get_row_uuids(file_id)
+        # ROWS THIS CALLER'S SCOPE CANNOT SEE, and therefore cannot supersede. Counted
+        # because independent review found the silent case: rows written before
+        # `tenant_id` was populated carry no such key, so a tenant-scoped capture returns
+        # NOTHING for them. The delete then removes 0 of 0 captured rows and
+        # `removed == len(captured)` reads as a complete replacement -- while the old
+        # version is still there and still retrievable. A count, never content: the
+        # caller already named this file_id, and a number is what it takes to stop a
+        # 200 meaning "the old version is gone" when it is not.
+        out_of_scope_rows = max(0, len(all_rows_before) - len(superseded_rows))
 
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
@@ -1845,12 +1904,14 @@ async def store_data_in_vector_db(
 
             if isinstance(vector_store, AsyncPgVector):
                 ids = await _process_documents_async_pipeline(
-                    docs, file_id, vector_store, executor
+                    docs, file_id, vector_store, executor,
+                    protected_row_uuids=superseded_rows,
                 )
             else:
                 # Fallback to batched processing for sync vector stores
                 ids = await _process_documents_batched_sync(
-                    docs, file_id, vector_store, executor
+                    docs, file_id, vector_store, executor,
+                    protected_row_uuids=superseded_rows,
                 )
 
         result = {"message": "Documents added successfully", "ids": ids, "docs": docs}
@@ -1867,10 +1928,18 @@ async def store_data_in_vector_db(
             result["replacement"] = {
                 "superseded_rows": len(superseded_rows),
                 "removed": removed,
-                # `complete` only when every captured row is gone. Anything else means
-                # superseded content is still retrievable, and the caller is told so
-                # instead of reading a 200 as "the old version is gone".
-                "status": "complete" if removed == len(superseded_rows) else "incomplete",
+                # Rows for this file that the caller's own scope could not see and
+                # therefore could not supersede. Zero is the ordinary case.
+                "out_of_scope_rows": out_of_scope_rows,
+                # `complete` requires BOTH: every captured row gone, AND nothing left
+                # behind outside the capture's scope. Either shortfall means superseded
+                # content is still retrievable, and saying `complete` would be the fake
+                # success this receipt exists to prevent.
+                "status": (
+                    "complete"
+                    if removed == len(superseded_rows) and out_of_scope_rows == 0
+                    else "incomplete"
+                ),
             }
         return result
 
