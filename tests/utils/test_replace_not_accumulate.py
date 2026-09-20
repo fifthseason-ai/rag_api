@@ -132,7 +132,23 @@ class FakeStore(AsyncPgVector):
             self.rows.append(FakeRow(ids[0] if ids else None, d.page_content, d.metadata))
         return ids
 
-    async def delete(self, *a, **k):
+    async def delete(self, ids=None, collection_only=False, user_id=None,
+                     document_origin_type=None, subscription_id=None, text_source=None,
+                     executor=None, **_):
+        """Models `_delete_multiple`: deletes by CUSTOM_ID, i.e. every row of a file.
+
+        This was `return None` -- a no-op -- and that made the double unable to express
+        the very failure the rollback test exists to catch. The control proved it: with
+        the destructive rollback restored, the test reddened on "rows were left behind"
+        instead of on "the old version was destroyed", because nothing in the double
+        actually deleted anything. A double that models the table must model THIS method
+        too, or the most dangerous delete in the codebase is invisible to every test that
+        uses it."""
+        self.calls.append("delete-by-file_id")
+        if not ids:
+            return None
+        wanted = set(ids)
+        self.rows = [r for r in self.rows if r.custom_id not in wanted]
         return None
 
     def documents_for(self, file_id):
@@ -278,7 +294,10 @@ def test_the_capture_happens_before_the_insert_and_the_delete_after_it(client, s
     assert _embed(client, V1, "policy-v1.txt").status_code == 200
     store.calls.clear()
     assert _embed(client, V2, "policy-v2.txt", replace=True).status_code == 200
-    assert store.calls == ["capture", "insert", "delete"], store.calls
+    # Two captures: the scoped one whose rows will be deleted, and an unscoped one that
+    # counts what this caller's scope cannot see (see `out_of_scope_rows`). Both are
+    # reads and both must precede the insert.
+    assert store.calls == ["capture", "capture", "insert", "delete"], store.calls
 
 
 def test_the_document_is_never_empty_at_any_moment_of_the_swap(client, store):
@@ -342,7 +361,8 @@ def test_the_response_reports_what_was_actually_removed(client, store):
     r = _embed(client, V2, "policy-v2.txt", replace=True)
     rep = r.json()["replacement"]
     assert rep == {
-        "superseded_rows": v1_rows, "removed": v1_rows, "status": "complete"
+        "superseded_rows": v1_rows, "removed": v1_rows,
+        "out_of_scope_rows": 0, "status": "complete",
     }, rep
 
 
@@ -372,7 +392,7 @@ def test_a_first_upload_with_replace_deletes_nothing(client, store):
     r = _embed(client, V1, "policy-v1.txt", replace=True)
     assert r.status_code == 200, r.text
     assert r.json()["replacement"] == {
-        "superseded_rows": 0, "removed": 0, "status": "complete"
+        "superseded_rows": 0, "removed": 0, "out_of_scope_rows": 0, "status": "complete",
     }
     assert store.documents_for(FID), "the first upload stored nothing"
 
@@ -386,10 +406,15 @@ def test_the_replacement_block_is_absent_when_replace_was_not_asked_for(client, 
     assert "replacement" not in r.json()
 
 
-def test_replace_cannot_reach_across_a_tenant_boundary(client, store):
-    """The capture is scoped by user and tenant, so a caller passing someone else's
-    file_id cannot cause their rows to be deleted. Belt and braces behind the
-    entitlement check, because this is the one operation that removes data."""
+def test_the_route_passes_the_callers_tenant_into_the_capture(client, store):
+    """NAME CORRECTED after independent review. This proves the ROUTE hands the caller's
+    tenant to the capture and honours a scoped result -- it does NOT prove the SQL filter,
+    because the double reimplements `get_row_uuids` in Python. Review demonstrated the
+    gap: deleting the `tenant_id` clause from the real query left this file 13/13 green.
+
+    The SQL filter is covered by `test_real_sql_*` below, which skips without a reachable
+    pgvector. Two tests, because they prove two different things and the old single name
+    claimed both."""
     assert _embed(client, V1, "policy-v1.txt").status_code == 200
     # Re-label the stored row as another tenant's, leaving the file_id alone.
     for row in store.rows:
@@ -423,3 +448,79 @@ def test_embed_upload_honours_replace_too(client, store):
     docs = store.documents_for(FID)
     assert all("500 EUR" not in d for d in docs), docs
     assert any("900 EUR" in d for d in docs), docs
+
+
+# ---------------------------------------------------------------------------
+# Independent review, 2026-09-20 -- findings that were not covered at all
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_LATER_batch_does_not_destroy_the_old_version(client, store, monkeypatch):
+    """HIGH finding: the batched insert paths roll back by deleting the WHOLE file.
+
+    Under `replace`, that rollback removes the version this call was superseding -- which
+    is still the only good copy, because the new one just failed. Review demonstrated it
+    end to end: with the production default EMBEDDING_BATCH_SIZE=500, a failure on any
+    batch after the first left the file with ZERO rows and answered 400, so a caller
+    retrying only on 5xx would treat the document as done.
+
+    The earlier failure test pinned EMBEDDING_BATCH_SIZE to 0, which takes the single-shot
+    branch and is structurally incapable of reaching the pipeline. This one does not pin
+    it to 0 -- that is the entire point -- and would have caught the loss."""
+    assert _embed(client, V1, "policy-v1.txt").status_code == 200
+    before = store.uuids_for(FID)
+    assert len(before) > 1
+
+    # Batch size 1 so several batches run; fail on a batch that is NOT the first.
+    monkeypatch.setattr(document_routes, "EMBEDDING_BATCH_SIZE", 1, raising=False)
+    calls = {"n": 0}
+    real_add = store.aadd_documents
+
+    async def failing_after_first(docs, ids=None, executor=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await real_add(docs, ids=ids, executor=executor)
+        raise RuntimeError("vector store unavailable mid-file")
+
+    store.aadd_documents = failing_after_first
+    r = _embed(client, V2, "policy-v2.txt", replace=True)
+
+    assert r.status_code >= 400, r.text
+    after = store.uuids_for(FID)
+    assert before <= after, "the OLD version was destroyed by the rollback: %s" % (before - after)
+    # And the partially written new rows are gone -- the rollback still does its job.
+    assert after == before, "rows this failed call inserted were left behind: %s" % (after - before)
+
+
+def test_rows_outside_the_callers_scope_are_never_reported_as_replaced(client, store):
+    """MEDIUM finding: `removed == len(captured)` is 0 == 0 when the capture saw nothing.
+
+    Rows written before `tenant_id` was populated carry no such key, so a tenant-scoped
+    capture returns NOTHING for them: the delete removes 0 of 0 and the receipt used to
+    read `complete` while the old version was still there and still retrievable. A count
+    of what the scope could not see is what stops a 200 meaning "the old version is
+    gone"."""
+    assert _embed(client, V1, "policy-v1.txt").status_code == 200
+    # Legacy shape: the row predates tenant stamping.
+    for row in store.rows:
+        row.metadata.pop("tenant_id", None)
+    legacy = store.uuids_for(FID)
+
+    r = _embed(client, V2, "policy-v2.txt", replace=True)
+    assert r.status_code == 200, r.text
+    rep = r.json()["replacement"]
+
+    assert rep["superseded_rows"] == 0 and rep["removed"] == 0
+    assert rep["out_of_scope_rows"] == len(legacy)
+    assert rep["status"] == "incomplete", rep
+    # The honest part: those rows really are still there.
+    assert legacy <= store.uuids_for(FID)
+
+
+def test_a_clean_replacement_still_reports_no_rows_outside_scope(client, store):
+    """Positive control for the field above: the ordinary case must read zero, or
+    `incomplete` becomes an alarm that fires on the normal case and gets ignored."""
+    assert _embed(client, V1, "policy-v1.txt").status_code == 200
+    rep = _embed(client, V2, "policy-v2.txt", replace=True).json()["replacement"]
+    assert rep["out_of_scope_rows"] == 0
+    assert rep["status"] == "complete", rep
