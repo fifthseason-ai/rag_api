@@ -1741,11 +1741,16 @@ def _assert_extractable_content(
     if receipt["units_extracted"] == 0:
         name = filename or "uploaded file"
         if receipt.get("locator_kind") == "row":
-            # THE FILE PARSED. Every row is present and every one of them is value-less --
-            # a row-delimited export carrying no data, which is a different fact from a
-            # file that could not be read. The generic message below would accuse it of
-            # being empty, image-only, corrupted or password-protected: four things it
-            # demonstrably is not, since we counted its rows.
+            # THE FILE PARSED. Every row it parsed into is present and none of them
+            # yielded a value -- a different fact from a file that could not be read. The
+            # generic message below would accuse it of being empty, image-only, corrupted
+            # or password-protected: four things it demonstrably is not, since we counted
+            # its rows.
+            #
+            # Stated as a fact about the PARSE, not about the file, because those can
+            # differ: a repeated column name collapses in csv.DictReader and its earlier
+            # columns never reach us, so a file with visible data can parse to nothing.
+            # The message says so rather than contradicting what the operator can see.
             #
             # This branch is reachable ONLY because of the CSV row locator. Before it, a
             # file like this returned 200 and indexed its column labels, so this guard was
