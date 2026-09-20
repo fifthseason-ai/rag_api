@@ -1740,16 +1740,32 @@ def _assert_extractable_content(
     receipt = _extraction_receipt(data)
     if receipt["units_extracted"] == 0:
         name = filename or "uploaded file"
+        if receipt.get("locator_kind") == "row":
+            # THE FILE PARSED. Every row is present and every one of them is value-less --
+            # a row-delimited export carrying no data, which is a different fact from a
+            # file that could not be read. The generic message below would accuse it of
+            # being empty, image-only, corrupted or password-protected: four things it
+            # demonstrably is not, since we counted its rows.
+            #
+            # This branch is reachable ONLY because of the CSV row locator. Before it, a
+            # file like this returned 200 and indexed its column labels, so this guard was
+            # never reached for it -- a repair that makes a new input class reachable
+            # leaves the guard at the end of that path untested unless someone looks.
+            message = (
+                f"'{name}' was read correctly and every one of its "
+                f"{receipt['units_total']} row(s) is empty, so there is nothing to store. "
+                f"The file is not unreadable and it is not protected — it carries no "
+                f"values. Nothing was stored."
+            )
+        else:
+            message = (
+                f"No extractable text found in '{name}'. The file may be empty, "
+                f"image-only/scanned, corrupted, or password-protected. Nothing "
+                f"was stored."
+            )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": (
-                    f"No extractable text found in '{name}'. The file may be empty, "
-                    f"image-only/scanned, corrupted, or password-protected. Nothing "
-                    f"was stored."
-                ),
-                "extraction": receipt,
-            },
+            detail={"message": message, "extraction": receipt},
         )
     return receipt
 
