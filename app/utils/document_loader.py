@@ -675,6 +675,29 @@ class SafePyPDFLoader:
 
         The file is re-opened only on the truncation path, so an unbounded read (and every
         read that finishes inside its bounds) pays nothing for this.
+
+        WHAT THE TRUNCATION PATH PAYS, measured 2026-09-20 rather than reasoned about. Raised in
+        review as a SUSPECTED finding and left unmeasured by both the reviewer and me until now;
+        300-page fixture, median of 5, inside the test image:
+
+            healthy xref   open + 2 pages = 21.5 ms   this call adds 16.9 ms   (+79%)
+            damaged xref   open + 2 pages = 41.9 ms   this call adds 43.2 ms  (+103%)
+
+        So this call is ~100% of the overhead a bounded read adds over the floor, and on a file
+        whose cross-reference table is damaged pypdf rebuilds it by scanning, which roughly
+        doubles that again.
+
+        THE BOUND STILL BOUNDS -- that was worth checking before calling this a defect. Against
+        reading all 300 pages the bounded read saves 56% (healthy) and 29% (damaged). The first
+        version of this measurement compared bounded against unbounded with no FLOOR and read
+        "68% of unbounded" as "the bound is not bounding"; most of that 68% is the unavoidable
+        cost of opening a 300-page document at all, which no bound can avoid.
+
+        WHY IT IS STILL DONE THIS WAY. The alternative -- counting pages up front -- moves the
+        cost onto EVERY read, including the unbounded ones that are the common case, to benefit
+        the truncated ones that are rare. Charging the rare path is the better trade. It is
+        written down here so the next person does not have to re-measure it, and so the trade is
+        visible as a choice rather than looking like an oversight.
         """
         try:
             with open(self.filepath, "rb") as handle:
