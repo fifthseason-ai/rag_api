@@ -1302,9 +1302,19 @@ class RowCSVLoader(CSVLoader):
         """Indices of rows whose every field value is blank, read from the file.
 
         Uses the same `csv_args` and `encoding` the base loader parses with, so the
-        indices refer to the same rows. A failure here is never fatal and never a
-        silent "no blanks found": the base loader's own error is the one that matters,
-        and this pass adds nothing rather than inventing a coverage claim.
+        indices refer to the same rows.
+
+        A failure here is never fatal: it reports no blanks rather than inventing a
+        coverage claim, which is the safe direction -- a real row is never wrongly
+        blanked. It is NOT a general guarantee that blanks are always found, and the
+        earlier wording here claimed that it was. Independent review found the case:
+        this pass has no `autodetect_encoding` fallback, so a caller constructing this
+        loader with `autodetect_encoding=True`, on a file the BASE loader recovers by
+        re-detecting, would load successfully with its blank rows missed. `get_loader`
+        never does that -- it converts non-UTF-8 to a UTF-8 temp file first and leaves
+        autodetect off -- so through the route both passes read the same bytes or both
+        fail together, which was measured. The claim was true as CONSTRUCTED and false
+        as stated, which is the more dangerous of the two.
         """
         blank = set()
         try:

@@ -56,13 +56,13 @@ ALL_BLANK_CSV = "region,revenue\n,\n,\n"
 LABEL_SHAPED_CSV = "region,note\n,\nEMEA,revenue: 4200000\n"
 
 
-def _hdr(uid="testuser", tid="tenantA"):
+def _hdr(uid="testuser", tid="tenantA", act=("write",)):
     os.environ["JWT_SECRET"] = _SECRET
     payload = {
         "id": uid,
         "tid": tid,
         "ent": ["userA"],
-        "act": ["write"],
+        "act": list(act),
         "exp": datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(hours=1),
     }
@@ -206,7 +206,35 @@ def test_the_refusal_does_not_accuse_a_file_that_parsed_perfectly(rec_client):
     for accusation in ("image-only", "scanned", "corrupt", "password-protected"):
         assert accusation not in message, "accuses a file that parsed: %r" % message
     # It must still say what DID happen, with the count it actually measured.
-    assert "2 row(s)" in message and "empty" in message, message
+    assert "2 row(s)" in message and "none of them yielded a value" in message, message
+
+
+#: Two columns with the SAME name. csv.DictReader collapses them -- last one wins -- so
+#: `X` and `Y` are dropped before this service ever sees them, and the parse legitimately
+#: finds no values. The file, however, plainly contains X and Y.
+DUP_HEADER_CSV = "region,region\nX,\nY,\n"
+
+
+def test_the_refusal_never_claims_the_file_carries_no_values(rec_client):
+    """Found by independent review, in the honesty message added by this very branch.
+
+    The first wording said the file "carries no values" -- a claim about the FILE. For a
+    CSV with a repeated column name that is false: csv.DictReader keeps only the last
+    column of a repeated name, so `X` and `Y` here are discarded at the parse and the
+    row really does read as empty, while the source text visibly contains them. A
+    message written to stop the service accusing a readable file was itself asserting
+    something it could not know.
+
+    The refusal stands -- nothing was extracted, so a 200 would be the fake success this
+    guard exists to prevent. What must be true is the sentence: it may describe what was
+    READ, never what the file contains, and it should name the one cause that makes this
+    surprising."""
+    r = _embed(rec_client, "dup.csv", DUP_HEADER_CSV)
+    assert r.status_code == 422, r.text
+    message = r.json()["detail"]["message"]
+    assert "carries no values" not in message, message
+    assert "about what was READ" in message, message
+    assert "repeated header" in message or "repeated column names" in message, message
 
 
 def test_a_file_that_really_is_unreadable_keeps_the_original_message(rec_client):
@@ -249,6 +277,30 @@ def test_a_value_less_row_keeps_its_place_and_never_renumbers_the_file(tmp_path)
     docs = _load(tmp_path, "gappy.csv", GAPPY_CSV)
     assert [d.metadata.get("row") for d in docs] == [0, 1, 2, 3]
     assert [bool(d.page_content.strip()) for d in docs] == [True, False, True, False]
+
+
+def test_the_text_route_stops_emitting_column_labels_for_a_blank_row(rec_client):
+    """`/text` output changes for a gappy CSV and nothing covered it.
+
+    Independent review found this: `extract_text_from_documents` concatenates
+    page_content, so a blanked row now contributes an empty line instead of
+    "region: \nrevenue:". The change is right -- those labels are the loader's own
+    scaffolding, not text anyone wrote -- but `/text` has no empty-extraction guard and
+    never refuses, so it is the one surface where this change is visible and silent.
+    Asserted here rather than left to be noticed later."""
+    r = rec_client.post(
+        "/text",
+        data={"file_id": "f-text-csv", "entity_id": "userA"},
+        files={"file": ("gappy.csv", io.BytesIO(GAPPY_CSV.encode("utf-8")), "text/csv")},
+        headers=_hdr(act=("read",)),  # what Core mints for /text
+    )
+    assert r.status_code == 200, r.text
+    text = r.json()["text"]
+    # The real rows survive.
+    assert "EMEA" in text and "APAC" in text
+    # The blank rows contribute nothing. Counting is the assertion: "region:" appears
+    # once per row that really has a region, not once per row in the file.
+    assert text.count("region:") == 2, text
 
 
 def test_the_row_family_does_not_capture_other_formats():
