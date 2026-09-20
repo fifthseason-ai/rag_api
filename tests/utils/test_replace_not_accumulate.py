@@ -524,3 +524,71 @@ def test_a_clean_replacement_still_reports_no_rows_outside_scope(client, store):
     rep = _embed(client, V2, "policy-v2.txt", replace=True).json()["replacement"]
     assert rep["out_of_scope_rows"] == 0
     assert rep["status"] == "complete", rep
+
+
+# ---------------------------------------------------------------------------------------
+# `out_of_scope_rows` scoping. Added after a measured cross-tenant disclosure, found while
+# reviewing CORE's consumer of this very receipt rather than by reading this file.
+#
+# The count was derived from an UNSCOPED view of the file_id, and `file_id` arrives in the
+# form body -- the caller chooses it. Measured against a real service: tenant B held 4 rows
+# under `quarterly-board-pack`; tenant A uploaded its own file under that name, replaced
+# it, and got `out_of_scope_rows: 4` with `status: incomplete` against a control of 0 and
+# `complete`. An existence oracle, the stranger's exact row count, and a false alarm about
+# the caller's own data that a consumer renders to a person.
+#
+# These two tests are a PAIR and neither is sufficient. The first proves a stranger is
+# excluded; on its own it is satisfied by deleting the field entirely. The second proves
+# the case the field EXISTS for is still counted.
+# ---------------------------------------------------------------------------------------
+
+
+def test_another_tenants_rows_are_not_counted_as_out_of_scope(client, store):
+    """THE DISCLOSURE. A stranger's rows under the same caller-chosen file_id must be
+    invisible to this count -- otherwise the number is an existence oracle and a size
+    estimate for a document the caller cannot read."""
+    stranger = FakeRow(FID, "another tenant's confidential board pack", {
+        "file_id": FID, "user_id": "userB", "tenant_id": "tenantB",
+    })
+    store.rows.append(stranger)
+
+    assert _embed(client, V1, "mine-v1.txt").status_code == 200
+    r = _embed(client, V2, "mine-v2.txt", replace=True)
+    rep = r.json()["replacement"]
+
+    assert rep["out_of_scope_rows"] == 0, (
+        "a stranger's rows were counted (%r). `file_id` is caller-chosen, so this number "
+        "tells any caller whether another tenant holds that id, and how many rows they "
+        "have." % (rep,)
+    )
+    assert rep["status"] == "complete", (
+        "the caller's own replacement succeeded, but a stranger's rows made it report "
+        "%r -- which a consumer renders to a person as 'a previous version may still be "
+        "retrievable'" % (rep["status"],)
+    )
+    # And the stranger's row is untouched: this is a scoping fix, not a wider delete.
+    assert stranger in store.rows, "the fix must not have widened what gets deleted"
+
+
+def test_the_callers_own_pre_tenant_rows_ARE_still_counted(client, store):
+    """THE CASE THE FIELD EXISTS FOR, which the disclosure fix must not remove.
+
+    A row written for this file before `tenant_id` was populated carries no tenant key,
+    so the tenant-scoped capture misses it and the delete cannot supersede it. That row
+    is genuinely still retrievable and the caller must be told. Same owner, no tenant.
+    """
+    legacy = FakeRow(FID, "the caller's own older version", {
+        "file_id": FID, "user_id": "userA",  # same owner, and NO tenant_id
+    })
+    store.rows.append(legacy)
+
+    assert _embed(client, V1, "mine-v1.txt").status_code == 200
+    r = _embed(client, V2, "mine-v2.txt", replace=True)
+    rep = r.json()["replacement"]
+
+    assert rep["out_of_scope_rows"] >= 1, (
+        "the caller's own pre-tenant row was not counted (%r) -- the disclosure fix has "
+        "removed the case this field was built for, and a stale version would now be "
+        "reported as a complete replacement" % (rep,)
+    )
+    assert rep["status"] == "incomplete", rep

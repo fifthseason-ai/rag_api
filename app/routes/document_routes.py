@@ -2067,20 +2067,40 @@ async def store_data_in_vector_db(
             superseded_rows = await vector_store.get_row_uuids(
                 file_id, user_id=user_id or None, tenant_id=tenant_id, executor=executor
             )
-            all_rows_before = await vector_store.get_row_uuids(file_id, executor=executor)
+            all_rows_before = await vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, executor=executor
+            )
         else:
             superseded_rows = vector_store.get_row_uuids(
                 file_id, user_id=user_id or None, tenant_id=tenant_id
             )
-            all_rows_before = vector_store.get_row_uuids(file_id)
-        # ROWS THIS CALLER'S SCOPE CANNOT SEE, and therefore cannot supersede. Counted
-        # because independent review found the silent case: rows written before
-        # `tenant_id` was populated carry no such key, so a tenant-scoped capture returns
-        # NOTHING for them. The delete then removes 0 of 0 captured rows and
-        # `removed == len(captured)` reads as a complete replacement -- while the old
-        # version is still there and still retrievable. A count, never content: the
-        # caller already named this file_id, and a number is what it takes to stop a
-        # 200 meaning "the old version is gone" when it is not.
+            all_rows_before = vector_store.get_row_uuids(file_id, user_id=user_id or None)
+        # ROWS OF THIS CALLER'S OWN FILE that the TENANT filter cannot see, and therefore
+        # cannot supersede. Counted because independent review found the silent case:
+        # rows written before `tenant_id` was populated carry no such key, so a
+        # tenant-scoped capture returns NOTHING for them. The delete then removes 0 of 0
+        # captured rows and `removed == len(captured)` reads as a complete replacement --
+        # while the old version is still there and still retrievable.
+        #
+        # SCOPED BY `user_id`, and that scoping is the whole correctness of this number.
+        # It was unscoped at first, which swept in rows belonging to ANY tenant that
+        # happened to use the same `file_id` -- and `file_id` arrives in the form body,
+        # so a caller chooses it. Measured 2026-09-20: tenant B held 4 rows under
+        # `quarterly-board-pack`; tenant A uploaded its own file under that name and
+        # replaced it, and got back `out_of_scope_rows: 4` with `status: incomplete`
+        # against a control of 0 and `complete`. Three defects in one number -- an
+        # existence oracle for a caller-chosen id, the exact row count of a document the
+        # caller is not entitled to, and a FALSE ALARM about the caller's own data that
+        # a consumer renders to a person as "a previous version may still be
+        # retrievable".
+        #
+        # `user_id` keeps exactly the case this field exists for -- same owner, missing
+        # tenant key -- and excludes a stranger's rows, whose `user_id` differs. Same
+        # shape as the `/ids` disclosure fixed in #38: an unscoped primitive reachable
+        # from a request.
+        #
+        # A count, never content: the caller already named this file_id, and a number is
+        # what it takes to stop a 200 meaning "the old version is gone" when it is not.
         out_of_scope_rows = max(0, len(all_rows_before) - len(superseded_rows))
 
     # Run document preparation in executor to avoid blocking the event loop
