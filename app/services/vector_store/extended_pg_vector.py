@@ -120,9 +120,38 @@ class ExtendedPgVector(PGVector):
         ExtendedPgVector._query_logging_setup = True
 
     def get_all_ids(self) -> list[str]:
+        """EVERY file identifier in the store, unscoped.
+
+        Kept as the primitive, and deliberately NOT renamed: it does what it says. What
+        changed is that `GET /ids` no longer calls it -- an unscoped list reached every
+        authenticated caller, whatever tenant they belonged to. Use
+        `get_ids_for_entities` for anything a request can reach.
+        """
         with Session(self._bind) as session:
             results = session.query(self.EmbeddingStore.custom_id).all()
             return [result[0] for result in results if result[0] is not None]
+
+    def get_ids_for_entities(self, entity_ids: list[str]) -> list[str]:
+        """File identifiers owned by these entities, and nothing else.
+
+        The predicate is the one `get_documents_by_ids` and `load_document_context`
+        already apply at the route -- a document is visible when its `user_id` is within
+        the token entitlement. This is that existing rule reaching a route that was
+        missed, not a new policy invented here.
+
+        An EMPTY entity list returns NOTHING. Stated because the sibling delete path in
+        this class treats a falsy list as "no filter", and the same shape here would turn
+        an entitlement with no entities into a disclosure of the whole store.
+        """
+        if not entity_ids:
+            return []
+        with Session(self._bind) as session:
+            results = (
+                session.query(self.EmbeddingStore.custom_id)
+                .filter(self.EmbeddingStore.cmetadata["user_id"].astext.in_(entity_ids))
+                .all()
+            )
+            return [r[0] for r in results if r[0] is not None]
 
     def get_filtered_ids(
         self, ids: list[str], user_id: Optional[str] = None, document_origin_type: Optional[str] = None, subscription_id: Optional[str] = None

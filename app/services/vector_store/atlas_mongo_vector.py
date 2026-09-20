@@ -42,8 +42,17 @@ class AtlasMongoVector(MongoDBAtlasVectorSearch):
         return processed_documents
 
     def get_all_ids(self) -> list[str]:
-        # Return unique file_id fields in self._collection
+        # Return unique file_id fields in self._collection. UNSCOPED -- see
+        # ExtendedPgVector.get_all_ids; `GET /ids` must not call this.
         return self._collection.distinct("file_id")
+
+    def get_ids_for_entities(self, entity_ids: list[str]) -> list[str]:
+        """File identifiers owned by these entities. Documents here carry a top-level
+        `user_id` (see `get_documents_by_ids`), which is the same field the pgvector
+        store keeps in `cmetadata`. An empty list returns nothing, never everything."""
+        if not entity_ids:
+            return []
+        return self._collection.distinct("file_id", {"user_id": {"$in": entity_ids}})
     
     def get_filtered_ids(self, ids: list[str]) -> list[str]:
         # Return unique file_id fields filtered by the provided ids
