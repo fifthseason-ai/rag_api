@@ -1752,10 +1752,12 @@ def _assert_extractable_content(
             # never reached for it -- a repair that makes a new input class reachable
             # leaves the guard at the end of that path untested unless someone looks.
             message = (
-                f"'{name}' was read correctly and every one of its "
-                f"{receipt['units_total']} row(s) is empty, so there is nothing to store. "
-                f"The file is not unreadable and it is not protected — it carries no "
-                f"values. Nothing was stored."
+                f"'{name}' parsed as {receipt['units_total']} row(s) and none of them "
+                f"yielded a value, so there is nothing to store. That is a statement "
+                f"about what was READ, not about what the file contains: if it visibly "
+                f"has data, check for repeated column names — a repeated header collapses "
+                f"and only the last column of that name survives the parse. The file is "
+                f"not unreadable and it is not protected. Nothing was stored."
             )
         else:
             message = (
