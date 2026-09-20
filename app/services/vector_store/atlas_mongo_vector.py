@@ -50,6 +50,12 @@ class AtlasMongoVector(MongoDBAtlasVectorSearch):
         """File identifiers owned by these entities. Documents here carry a top-level
         `user_id` (see `get_documents_by_ids`), which is the same field the pgvector
         store keeps in `cmetadata`. An empty list returns nothing, never everything."""
+        # MUST be a list. `ent["entity_ids"]` is a set and BSON cannot encode one:
+        # `InvalidDocument: cannot encode object: {'userY','userX'}, of type: <class 'set'>`
+        # raised for every caller on an atlas-mongo deployment. Fail-closed -- the 500
+        # handler caught it and nothing leaked -- but the route was dead, and the suite is
+        # pgvector-only so nothing noticed. Found by independent review, not by a test.
+        entity_ids = list(entity_ids or [])
         if not entity_ids:
             return []
         return self._collection.distinct("file_id", {"user_id": {"$in": entity_ids}})

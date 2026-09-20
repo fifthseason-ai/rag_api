@@ -619,9 +619,11 @@ async def get_all_ids(request: Request):
         # The exception text stays in the LOG, never in the response. `str(e)` here was
         # handing the caller internal class and ORM attribute names, and on a database
         # fault it would carry connection or schema details -- the same disclosure shape
-        # repaired on the protected routes for PyJWT's own diagnoses. The reference ties
-        # the caller's report to this log line without telling them anything about the
-        # service.
+        # repaired for PyJWT's own diagnoses in the SEPARATE branch #35, which is NOT in
+        # this branch's base -- independent review correctly pointed out that the earlier
+        # wording here read as though that repair were already present in this tree. It is
+        # the same shape and a different change. The reference ties the caller's report to
+        # this log line without telling them anything about the service.
         reference = uuid.uuid4().hex[:12]
         logger.error(
             "Failed to list ids [reference=%s] | Error: %s | Traceback: %s",

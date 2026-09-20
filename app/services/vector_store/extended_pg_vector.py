@@ -143,6 +143,12 @@ class ExtendedPgVector(PGVector):
         this class treats a falsy list as "no filter", and the same shape here would turn
         an entitlement with no entities into a disclosure of the whole store.
         """
+        # The route hands this the entitlement's `entity_ids`, which the middleware builds
+        # as a SET. SQLAlchemy tolerates one; pymongo does not, and the mongo sibling was
+        # raising on every call because of it. Normalised in both implementations so the
+        # contract is "any iterable of entity ids" and the next caller cannot reintroduce
+        # the difference.
+        entity_ids = list(entity_ids or [])
         if not entity_ids:
             return []
         with Session(self._bind) as session:

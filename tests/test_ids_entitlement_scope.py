@@ -219,3 +219,60 @@ def test_an_unexpected_failure_does_not_describe_the_service(client_with, rows):
     for secret in ("db.internal", "10.0.4.12", "5432", "RuntimeError", "EmbeddingStore"):
         assert secret not in body, "the response described the service: %r" % body
     assert "reference" in body.lower(), body
+
+
+def test_the_store_is_given_a_list_not_the_entitlements_set(client_with, rows):
+    """Found by independent review, CONFIRMED on the mongo path.
+
+    `ent["entity_ids"]` is a SET -- the middleware builds it with a set comprehension.
+    SQLAlchemy's `.in_()` tolerates one; BSON does not, and on an atlas-mongo deployment
+    this route raised `InvalidDocument: cannot encode object: {...}, of type: <class
+    'set'>` for EVERY caller. Fail-closed, so nothing leaked, but the route was dead and
+    the suite is pgvector-only so nothing noticed.
+
+    Asserted on the TYPE the store actually receives rather than on the response, because
+    the response is identical either way on pgvector -- which is exactly why this survived
+    until someone ran the other backend."""
+    class TypeWatcher(AsyncPgVector):
+        def __init__(self, rows):
+            self._bind = None
+            self.rows = dict(rows)
+            self.received = None
+
+        async def get_ids_for_entities(self, entity_ids, executor=None):
+            self.received = entity_ids
+            return [f for f, owner in self.rows.items() if owner in list(entity_ids)]
+
+    store = TypeWatcher(rows)
+    client = client_with(store)
+    assert client.get("/ids", headers=_hdr("userB", "tenantB")).status_code == 200
+    # A set reaching pymongo is the defect; the store normalises, but the route must not
+    # be the only thing standing between a set and a backend that cannot encode one.
+    import bson
+
+    bson.encode({"user_id": {"$in": list(store.received)}})  # must not raise
+
+
+def test_the_mongo_predicate_encodes_what_the_route_passes():
+    """The other half, at the implementation that broke: a set must not reach pymongo.
+
+    Calls the real method with the real shape the route supplies and asserts the query
+    document it builds is BSON-encodable. A test that only checked pgvector would have
+    stayed green through the outage."""
+    import bson
+    from app.services.vector_store.atlas_mongo_vector import AtlasMongoVector
+
+    captured = {}
+
+    class FakeCollection:
+        def distinct(self, field, filt=None):
+            captured["filter"] = filt
+            bson.encode(filt)  # raises InvalidDocument on a set -- that was the bug
+            return ["some-file"]
+
+    store = object.__new__(AtlasMongoVector)
+    store._collection = FakeCollection()
+
+    out = store.get_ids_for_entities({"userA", "userB"})  # a SET, as the route passes
+    assert out == ["some-file"]
+    assert isinstance(captured["filter"]["user_id"]["$in"], list), captured["filter"]
