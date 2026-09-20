@@ -2,6 +2,7 @@
 
 import os
 import codecs
+import csv
 import tempfile
 import zipfile
 
@@ -383,14 +384,14 @@ def get_loader(
 
                     temp_filepath = temp_file.name
 
-                loader = CSVLoader(temp_filepath)
+                loader = RowCSVLoader(temp_filepath)
                 loader._temp_filepath = temp_filepath
             except Exception as e:
                 if temp_file and os.path.exists(temp_file.name):
                     os.unlink(temp_file.name)
                 raise e
         else:
-            loader = CSVLoader(filepath)
+            loader = RowCSVLoader(filepath)
     elif file_ext == "rst":
         loader = UnstructuredRSTLoader(filepath, mode="elements")
     elif file_ext == "xml" or file_content_type in [
@@ -1268,3 +1269,64 @@ class SlidePowerPointLoader:
 
     def load(self) -> List[Document]:
         return list(self.lazy_load())
+
+
+class RowCSVLoader(CSVLoader):
+    """CSVLoader plus the one fact CSVLoader cannot express: a row with no values.
+
+    CSVLoader already numbers every data row (`row`, 0-indexed) and rag_api already
+    stored that number on every chunk -- so a CSV citation could always have named a
+    row. What it could NOT do is say that a row is blank, because CSVLoader renders a
+    value-less row as its COLUMN LABELS ALONE:
+
+        region: \nrevenue:
+
+    which is not empty text. Left alone, every row of every CSV counted as extracted,
+    a gappy file and a complete file produced byte-identical receipts, and the label
+    scaffolding was indexed as if it were content.
+
+    The decision is made HERE, from the parsed field VALUES, and deliberately not by
+    pattern-matching the rendered text: a cell whose content is "revenue: 4200000"
+    renders indistinguishably from the scaffolding, so a text-shaped rule would call a
+    real value empty. The values are only knowable at the parse, which is why this
+    lives in the loader and not in the receipt.
+
+    A blank row is yielded with EMPTY page_content and its `row` metadata intact --
+    the same shape, for the same reason, as an image-only PPTX slide. Keeping the
+    Document rather than dropping it is load-bearing: dropping it would shift every
+    later row's citation by one, so a citation would point at the wrong record while
+    looking correct.
+    """
+
+    def _blank_rows(self) -> set:
+        """Indices of rows whose every field value is blank, read from the file.
+
+        Uses the same `csv_args` and `encoding` the base loader parses with, so the
+        indices refer to the same rows. A failure here is never fatal and never a
+        silent "no blanks found": the base loader's own error is the one that matters,
+        and this pass adds nothing rather than inventing a coverage claim.
+        """
+        blank = set()
+        try:
+            with open(self.file_path, newline="", encoding=self.encoding) as fh:
+                for i, row in enumerate(csv.DictReader(fh, **self.csv_args)):
+                    values = []
+                    for v in row.values():
+                        # DictReader puts overflow fields in a LIST under the restkey.
+                        if isinstance(v, list):
+                            values.extend(x for x in v if x is not None)
+                        elif v is not None:
+                            values.append(v)
+                    if not any(str(v).strip() for v in values):
+                        blank.add(i)
+        except Exception as e:  # noqa: BLE001 - diagnostic pass, never fatal
+            logger.warning("CSV blank-row scan failed for %s: %s", self.file_path, e)
+            return set()
+        return blank
+
+    def lazy_load(self) -> Iterator[Document]:
+        blank = self._blank_rows()
+        for doc in super().lazy_load():
+            if doc.metadata.get("row") in blank:
+                doc.page_content = ""
+            yield doc

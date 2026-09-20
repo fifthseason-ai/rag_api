@@ -1427,6 +1427,7 @@ _UNIT_LOCATOR_KEYS = (
     ("page", "page"),           # PDF: 0-indexed page (SafePyPDFLoader / pypdf)
     ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
     ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
+    ("row", "row"),             # CSV: 0-indexed data row (RowCSVLoader / langchain CSVLoader)
 )
 
 
@@ -1499,9 +1500,13 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       never read as `complete` on the field consumers already check --
                       including when every page yielded some text the engine does not
                       vouch for. Nonempty text is not success.
-      locator_kind:   'page' | 'slide' | 'sheet' | 'none'
+      locator_kind:   'page' | 'slide' | 'sheet' | 'row' | 'none'
+                      NEW 2026-09-20: 'row' (CSV). Core's two consumers of this field
+                      (sourceLifecycle.js, ingestionReceipts.js) pass any string through
+                      and default only a NON-string to 'none', so a new member is additive
+                      -- measured at release head e3dbdf296, not assumed.
       units_total / units_extracted / units_empty / units_image_only
-      empty_locators: sorted locators (page ints / slide ints / sheet names) of
+      empty_locators: sorted locators (page ints / slide ints / sheet names / row ints) of
                       every unit that yielded NO extractable text (locator-bearing
                       units only)
       reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
