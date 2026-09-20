@@ -1480,22 +1480,50 @@ def _prepare_documents_sync(
             doc.page_content = clean_text(doc.page_content)
 
     # Preparing documents with page content and metadata for insertion.
+    #
+    # ORDER IS LOAD-BEARING. The loader's metadata goes FIRST and this service's fields
+    # go LAST, so the service always wins a collision. It used to be the other way round.
+    #
+    # The visible consequence was a wrong filename: `UnstructuredExcelLoader` writes its
+    # own `filename` from the path it was handed -- our unique temp path -- so an XLSX
+    # chunk carried `book_f8af9976fbc44873bd34c21c359c686b.xlsx` for a file uploaded as
+    # `book.xlsx`, and a citation would have shown the user a name they never chose.
+    # PPTX, PDF, CSV and DOCX kept the real one; spreadsheets were the single format that
+    # did not, which is why it was easy to miss.
+    #
+    # The consequence that matters more was never visible: `file_id`, `user_id`,
+    # `tenant_id`, `digest` and `document_origin_type` were equally overridable, and
+    # `user_id`/`tenant_id` are the fields `/ids`, `GET /documents`,
+    # `/documents/{id}/context`, `/query` and `get_ids_for_entities` all filter on. No
+    # shipped loader emits those keys today -- checked, not assumed -- so nothing was
+    # breached. What was wrong is that PARSER OUTPUT, derived from an uploaded file,
+    # could take over an authorization field, and a dependency upgrade would have done it
+    # silently. Identity is not something a document gets to assert about itself.
+    #
+    # Everything the loader contributes that we do NOT set -- the locator keys
+    # (`page`, `page_label`, `slide_number`, `slide_title`, `page_name`, `page_number`,
+    # `row`), `text_source`, `filetype`, `text_as_html` and the rest -- is preserved
+    # exactly, because it comes first and nothing below collides with it.
+    service_fields = lambda doc: {
+        "file_id": file_id,
+        "user_id": user_id,
+        "digest": generate_digest(doc.page_content),
+        "document_origin_type": document_origin_type,
+        # Tenant tag (D-KSPT-1): stored on every embed path so a later
+        # increment can filter by tenant. rag_api has no tenant column
+        # today, so this lives in cmetadata.
+        **({"tenant_id": tenant_id} if tenant_id else {}),
+        **({"filename": filename} if filename else {}),
+        **({"link": link} if link else {}),
+        **({"subscription_id": subscription_id} if subscription_id else {}),
+    }
+
     return [
         Document(
             page_content=doc.page_content,
             metadata={
-                "file_id": file_id,
-                "user_id": user_id,
-                "digest": generate_digest(doc.page_content),
-                "document_origin_type": document_origin_type,
-                # Tenant tag (D-KSPT-1): stored on every embed path so a later
-                # increment can filter by tenant. rag_api has no tenant column
-                # today, so this lives in cmetadata.
-                **({"tenant_id": tenant_id} if tenant_id else {}),
-                **({"filename": filename} if filename else {}),
-                **({"link": link} if link else {}),
-                **({"subscription_id": subscription_id} if subscription_id else {}),
                 **(doc.metadata or {}),
+                **service_fields(doc),
             },
         )
         for doc in documents
