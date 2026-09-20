@@ -192,6 +192,37 @@ def test_a_csv_of_only_value_less_rows_is_refused_with_zero_writes(rec_client):
     assert _stored(rec_client) == []
 
 
+def test_the_refusal_does_not_accuse_a_file_that_parsed_perfectly(rec_client):
+    """The 422 this change makes newly reachable for CSV must not describe a readable
+    file as corrupt, protected or image-only.
+
+    A CSV whose rows are all value-less reaches the empty-extraction guard only BECAUSE
+    of this change -- before the row locator existed the file returned 200 and its column
+    labels were indexed. A repair that makes a new input class reachable leaves the guard
+    at the end of that path untested, so it is tested here rather than assumed."""
+    r = _embed(rec_client, "blank.csv", ALL_BLANK_CSV)
+    assert r.status_code == 422, r.text
+    message = r.json()["detail"]["message"]
+    for accusation in ("image-only", "scanned", "corrupt", "password-protected"):
+        assert accusation not in message, "accuses a file that parsed: %r" % message
+    # It must still say what DID happen, with the count it actually measured.
+    assert "2 row(s)" in message and "empty" in message, message
+
+
+def test_a_file_that_really_is_unreadable_keeps_the_original_message(rec_client):
+    """Positive control for the branch above: the generic wording must survive for the
+    formats it is true of. A zero-byte .txt has no locator family, takes the else branch,
+    and should still be told it may be empty or corrupt."""
+    r = rec_client.post(
+        "/embed",
+        data={"file_id": "f-empty-txt", "entity_id": "userA"},
+        files={"file": ("empty.txt", io.BytesIO(b""), "text/plain")},
+        headers=_hdr(),
+    )
+    assert r.status_code == 422, r.text
+    assert "image-only/scanned" in r.json()["detail"]["message"]
+
+
 # ---------------------------------------------------------------------------
 # Positive controls -- each reddens at its own site
 # ---------------------------------------------------------------------------

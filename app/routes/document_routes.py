@@ -1853,6 +1853,23 @@ def _assert_extractable_content(
                 f"text. Raise PDF_EXTRACT_MAX_PAGES / PDF_EXTRACT_TIME_BUDGET_SECONDS, or "
                 f"split the document. Nothing was stored."
             )
+        elif receipt.get("locator_kind") == "row":
+            # THE FILE PARSED. Every row is present and every one of them is value-less --
+            # a row-delimited export carrying no data, which is a different fact from a
+            # file that could not be read. The generic message below would accuse it of
+            # being empty, image-only, corrupted or password-protected: four things it
+            # demonstrably is not, since we counted its rows.
+            #
+            # This branch is reachable ONLY because of the CSV row locator. Before it, a
+            # file like this returned 200 and indexed its column labels, so this guard was
+            # never reached for it -- a repair that makes a new input class reachable
+            # leaves the guard at the end of that path untested unless someone looks.
+            message = (
+                f"'{name}' was read correctly and every one of its "
+                f"{receipt['units_total']} row(s) is empty, so there is nothing to store. "
+                f"The file is not unreadable and it is not protected — it carries no "
+                f"values. Nothing was stored."
+            )
         else:
             message = (
                 f"No extractable text found in '{name}'. The file may be empty, "
