@@ -129,3 +129,88 @@ def test_a_loader_key_the_service_does_not_set_is_untouched_when_absent():
     md = _prepare([Document(page_content="body", metadata={"filename": "loader-name.xlsx"})],
                   filename=None)[0].metadata
     assert md["filename"] == "loader-name.xlsx", md
+
+
+# ---------------------------------------------------------------------------------------
+# The six tests above prove PRECEDENCE, and they prove it on hand-built Documents. That is
+# unavoidable for the identity keys -- no shipped loader emits them, so there is nothing
+# real to drive. But it leaves a durability gap that the independent review named: the
+# EMPIRICAL fact those fixtures encode (that a real loader really does write its own
+# `filename`, and really can write an authorization key) lives outside this repository. If
+# a dependency bump changed the parser's metadata contract, the fixtures would keep passing
+# while no longer describing anything that happens.
+#
+# So these two drive the REAL loaders. They are not precedence tests; they pin the
+# assumption the precedence tests are built on.
+# ---------------------------------------------------------------------------------------
+
+
+def test_the_excel_loader_really_does_write_its_own_filename(tmp_path):
+    """The symptom, reproduced against the installed parser rather than described.
+
+    This is the test that fails when `unstructured` changes its metadata contract. When it
+    does, `test_the_uploaded_filename_survives_a_loader_that_writes_its_own` above has
+    stopped reflecting a real defect and its fixture needs rereading -- which is exactly
+    the thing that would otherwise happen silently.
+    """
+    from app.utils.document_loader import get_loader
+    from .test_parser_fitness import make_multisheet_xlsx
+
+    # The shape this service actually hands a loader: the user's name, plus a uuid, in our
+    # upload directory. That basename is what leaked into the citation.
+    temp_name = "book_f8af9976fbc44873bd34c21c359c686b.xlsx"
+    path = str(tmp_path / temp_name)
+    make_multisheet_xlsx(path)
+
+    loader, _known, _ext = get_loader(
+        temp_name,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        path,
+    )
+    docs = list(loader.load())
+    assert docs, "the excel loader returned nothing; this test can no longer say anything"
+
+    emitted = {d.metadata.get("filename") for d in docs}
+    assert emitted == {temp_name}, (
+        "the excel loader no longer writes the temp basename as `filename` (got %r). The "
+        "precedence fix is still correct, but the fixture upstairs now describes a defect "
+        "that this parser version does not produce -- reread it." % (emitted,)
+    )
+    assert "book.xlsx" not in emitted
+
+
+def test_a_real_loader_that_emits_an_authorization_key_still_loses(tmp_path):
+    """`user_id` is not hypothetical: one supported loader can be told to emit it.
+
+    `CSVLoader` accepts `metadata_columns`. rag_api constructs it with defaults, so this is
+    NOT reachable today and nothing was breached -- the review confirmed that and so did I.
+    What it does mean is that "a parser could take over an authorization field" is a
+    property of a loader this service already ships, not a story about a future dependency.
+
+    Driving it here makes the containment MEASURED against a loader that really emits the
+    key, instead of asserted against a dict I wrote to emit it. `user_id` is what `/ids`,
+    `GET /documents`, `/documents/{id}/context`, `/query` and `get_ids_for_entities` filter
+    on, so a document winning this collision would be choosing its own entitlement.
+    """
+    from langchain_community.document_loaders import CSVLoader
+
+    path = str(tmp_path / "ledger.csv")
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write("region,user_id\nEMEA,attacker-entity\n")
+
+    loaded = list(CSVLoader(path, metadata_columns=["user_id"]).load())
+
+    # Precondition. Without this the test could pass because the loader emitted nothing,
+    # which is the failure mode this whole file exists to avoid.
+    assert loaded, "the CSV loader returned nothing"
+    assert loaded[0].metadata.get("user_id") == "attacker-entity", (
+        "this loader no longer emits `user_id` from a column, so this test is no longer "
+        "exercising a real collision: %r" % (loaded[0].metadata,)
+    )
+
+    prepared = _prepare(loaded)
+
+    assert prepared[0].metadata["user_id"] == "real-user"
+    assert prepared[0].metadata["user_id"] != "attacker-entity"
+    # The non-identity column is still carried through untouched.
+    assert prepared[0].metadata["row"] == 0
