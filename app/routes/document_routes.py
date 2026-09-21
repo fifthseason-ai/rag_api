@@ -8,8 +8,9 @@ import traceback
 import aiofiles
 import aiofiles.os
 from shutil import copyfileobj
-from typing import List, Iterable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, List, Iterable, Optional, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AsyncExitStack
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -42,6 +43,7 @@ from app.config import (
     CHUNK_OVERLAP,
     EMBEDDING_BATCH_SIZE,
     EMBEDDING_MAX_QUEUE_SIZE,
+    FILE_WRITE_LOCK_WAIT_SECONDS,
     VECTOR_DB_TYPE,
     VectorDBType,
     HYBRID_SEARCH_ENABLED,
@@ -68,6 +70,12 @@ from app.services.summary_store import (
     delete_summaries_by_file_ids,
 )
 from app.services.vector_store.async_pg_vector import AsyncPgVector
+from app.services.database import PSQLDatabase
+from app.services.file_write_lock import (
+    FileWriteBusy,
+    NoFileWriteLock,
+    PgAdvisoryFileLock,
+)
 from app.services.hybrid_search import keyword_search, reciprocal_rank_fusion
 from app.services.reranker import rerank
 from app.utils.document_loader import (
@@ -83,7 +91,7 @@ from app.utils.extraction_budget import (
     STOPPED_KEY,
     ExtractionBudget,
 )
-from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget
+from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget, OcrCancelled
 from app.utils.health import is_health_ok
 
 router = APIRouter()
@@ -530,7 +538,8 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
 
 
 async def load_file_content(
-    filename: str, content_type: str, file_path: str, executor
+    filename: str, content_type: str, file_path: str, executor,
+    still_wanted: "Optional[StillWanted]" = None,
 ) -> tuple:
     """Load file content using appropriate loader.
 
@@ -549,13 +558,13 @@ async def load_file_content(
     # worker THREAD keeps running -- so without this a disconnected client leaves a
     # 50-page OCR burning CPU for nobody. The loader checks this flag between pages.
     #
-    # There is deliberately NO `except OcrCancelled` handler here. The flag is set only
-    # inside the `except asyncio.CancelledError` below, which re-raises immediately, so
-    # by the time the worker thread raises `OcrCancelled` nobody is awaiting that future
-    # and the exception is discarded -- which is the correct outcome, because a cancelled
-    # request has no caller left to answer. The first version answered 503 there; review
-    # showed it was unreachable, and an uncovered handler that implies a tested path is
-    # worse than no handler (the same call made for the dead verdict guard in #29).
+    # `OcrCancelled` IS handled below, and that is a reversal worth stating. An earlier
+    # version had no handler because the flag was set only in the CancelledError branch,
+    # which re-raises at once, so nobody was left awaiting the future. F04B added the
+    # disconnect watcher, which sets the flag WHILE this coroutine is still awaiting --
+    # measured: the loader then raises OcrCancelled through the route's generic handler,
+    # logged as "File processing failed ... attribution=undetermined", an error that
+    # blames nothing for a caller who simply left. It is answered as the same 499 F04 uses.
     stop = threading.Event()
     try:
         loader, known_type, file_ext = get_loader(
@@ -568,11 +577,42 @@ async def load_file_content(
             extraction_budget=ExtractionBudget(),
         )
         loop = asyncio.get_running_loop()
+        # F04B: a departed caller must stop the OCR too. The CancelledError branch below
+        # never runs for a disconnect -- Starlette does not cancel the handler (measured
+        # for F04) -- so without this a 12-page scan was OCR'd to the last page, 15 s after
+        # the client had left. Polls the request's shared disconnect probe and trips the
+        # same `stop` flag the loader already checks between pages.
+        stop_watch = None
+        if still_wanted is not None:
+
+            async def _stop_when_caller_leaves():
+                while not stop.is_set():
+                    if not await still_wanted():
+                        logger.info("Caller left during extraction of %s; stopping OCR", filename)
+                        stop.set()
+                        return
+                    await asyncio.sleep(0.25)
+
+            stop_watch = asyncio.create_task(_stop_when_caller_leaves())
         try:
             data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
         except asyncio.CancelledError:
             stop.set()
             raise
+        except OcrCancelled as cancelled:
+            logger.info("Extraction of %s stopped: the caller left; nothing stored", filename)
+            raise HTTPException(
+                status_code=CALLER_GONE_STATUS,
+                detail={
+                    "message": "The caller stopped waiting while the file was being read; "
+                    "nothing from this request was kept.",
+                    "stage": "during extraction",
+                    "rows_removed": 0,
+                },
+            ) from cancelled
+        finally:
+            if stop_watch is not None:
+                stop_watch.cancel()
         return data, known_type, file_ext
     except DocumentVerdictError as verdict_error:
         logger.warning(
@@ -803,6 +843,48 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
 _DELETABLE_TEXT_SOURCES = frozenset({"native", "ocr"})
 
 
+async def _hold_file_locks(
+    file_ids: Optional[List[str]], still_wanted: "Optional[StillWanted]"
+) -> AsyncExitStack:
+    """Hold the write lock of every named file_id (F02B), in SORTED order so two
+    multi-file deletes can never wait on each other in a cycle. The caller closes the
+    returned stack when done. Nothing has been deleted if this raises: a 499 when the
+    caller left while waiting, a 409 when another write outlasted the wait."""
+
+    async def _stop_waiting():
+        await _stop_if_caller_gone(still_wanted, "waiting for a write of this file")
+
+    stack = AsyncExitStack()
+    try:
+        for file_id in sorted(set(file_ids or [])):
+            await stack.enter_async_context(
+                file_write_lock.hold(
+                    file_id, stop_waiting=_stop_waiting,
+                    max_wait=FILE_WRITE_LOCK_WAIT_SECONDS,
+                )
+            )
+    except CallerGone as gone:
+        await stack.aclose()
+        raise HTTPException(
+            status_code=CALLER_GONE_STATUS,
+            detail={"message": "The caller stopped waiting; nothing was deleted.",
+                    "stage": gone.stage},
+        ) from gone
+    except FileWriteBusy as busy:
+        await stack.aclose()
+        raise HTTPException(
+            status_code=FILE_BUSY_STATUS,
+            detail=(
+                f"A write of file {busy.file_id!r} was still in progress after "
+                f"{busy.waited:.0f}s; nothing was deleted. Retry once it has finished."
+            ),
+        ) from busy
+    except BaseException:
+        await stack.aclose()
+        raise
+    return stack
+
+
 @router.delete("/documents")
 async def delete_documents(
     body: DeleteDocumentsBody,
@@ -838,6 +920,13 @@ async def delete_documents(
         raise HTTPException(
             status_code=403, detail="Not authorized for the requested entity"
         )
+
+    # F02B: take each file's write lock before touching its rows. Measured 2026-09-21:
+    # a delete that landed between two batches of an in-flight upload removed batch 1,
+    # the upload then wrote batches 2..7, and BOTH calls answered success -- leaving a
+    # partial document (6 of 7 chunks) that neither caller knew about. Waiting for the
+    # upload makes the delete apply to the whole file it finished writing.
+    file_locks = await _hold_file_locks(document_ids, caller_still_waiting(request))
 
     try:
         origin_type_value = document_origin_type.value if document_origin_type else None
@@ -935,6 +1024,8 @@ async def delete_documents(
             traceback.format_exc(),
         )
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await file_locks.aclose()
 
 
 # The embedding function is wrapped with the Redis cache in app.config, so
@@ -1158,7 +1249,17 @@ async def query_embeddings_by_file_id(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/query/{entity_id}")
+# response_model as on `/query` (#45, F-QC1): SIBLING ROUTE, MEASURED byte-identical.
+# The non-empty wire of this route is byte-for-byte the same as `/query` -- same envelope
+# `[[document, score], ...]`, same document keys `id`/`metadata`/`page_content`/`type`,
+# same OPEN `metadata` dict -- so the model that describes `/query` describes this one, and
+# publishing it here is the additive close of an asymmetry, not a redesign. `metadata` MUST
+# stay open: FastAPI re-serialises through the model, so naming its keys would DELETE every
+# locator (page/page_label/page_name/slide_number/row/...) a citation is built from while the
+# diff read as purely additive. The empty result of THIS route is `[]` (200), unlike
+# `/query_multiple`, which answers 404 -- that divergence is pinned in the test file, not
+# changed here (changing it would move the wire and is Core/Demian's contract call).
+@router.post("/query/{entity_id}", response_model=List[QueryHit])
 async def query_embeddings_by_entity_id(
     entity_id: str,
     body: QueryByEntityBody,
@@ -1211,12 +1312,100 @@ async def query_embeddings_by_entity_id(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+#: HTTP 499 ("client closed request"). Nobody reads this response -- the caller has gone --
+#: but it is what the access log records, so an abandoned write is distinguishable there
+#: from a stored file (200) and from a failure the caller was told about (4xx/5xx).
+CALLER_GONE_STATUS = 499
+
+
+class CallerGone(Exception):
+    """The HTTP caller stopped waiting before this request's rows were final.
+
+    FILES-01 F04. Measured 2026-09-21 against a real uvicorn server, the real middleware
+    stack and the real /embed route: a client that gave up at 0.8 s did NOT cancel the
+    handler. The insert committed at 2.05 s and the route returned its success receipt to
+    nobody; on the batched path every later batch kept inserting after the caller left.
+    Core's /embed client times out at 120 s and reports the upload as failed -- so a
+    document the uploader was told had FAILED became retrievable afterwards, and a retry
+    of that "failed" upload wrote the same file a second time.
+
+    Starlette does not cancel a handler when its client disconnects; it only reports it
+    through `request.is_disconnected()`. So the write path asks, at each point where
+    stopping is still possible, whether anyone is still waiting for the answer.
+    """
+
+    def __init__(self, stage: str):
+        super().__init__(f"caller stopped waiting ({stage})")
+        self.stage = stage
+
+
+StillWanted = Callable[[], Awaitable[bool]]
+
+
+def caller_still_waiting(request: Request) -> StillWanted:
+    """The `still_wanted` probe for a route: True while the HTTP caller is connected.
+
+    NOT `request.is_disconnected()`. That was the first implementation and it never fired:
+    measured through this app's real stack, it answered "connected" at every check for 8 s
+    after the client had gone. It polls `receive` inside an already-cancelled scope, and
+    each BaseHTTPMiddleware layer (this app has two: LogMiddleware and the security
+    middleware) routes `receive` through a task group whose exit is itself a checkpoint --
+    so the cancellation always wins and the disconnect message is never returned.
+
+    Instead a watcher task makes a BLOCKING `receive()`, the way a streaming response
+    learns its client left. It starts on the first check, which every caller makes only
+    after the request body has been read, so it can never consume the upload itself. Once
+    the response is sent the middleware answers it with `http.disconnect` and it ends.
+
+    If the watcher fails, the caller is treated as STILL WAITING: an unexplained error
+    must not discard an upload that someone may be waiting for. It is logged.
+
+    ONE probe per request, cached on `request.state`: extraction (F04B) and storage both
+    ask, and two watchers would be two concurrent `receive()` calls on one connection."""
+    cached = getattr(request.state, "caller_still_waiting", None)
+    if cached is not None:
+        return cached
+    gone = asyncio.Event()
+    watcher: Optional[asyncio.Task] = None
+
+    async def _watch() -> None:
+        try:
+            # Bounded: after the body, the only message left is the disconnect. Anything
+            # else repeating means this is not the server this code was measured against,
+            # and the answer is then "unknown", which is treated as still waiting.
+            for _ in range(64):
+                message = await request.receive()
+                if message.get("type") == "http.disconnect":
+                    gone.set()
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as watch_error:  # noqa: BLE001 - see docstring: fail towards storing
+            logger.warning("Disconnect watcher stopped without an answer: %r", watch_error)
+
+    async def _still_waiting() -> bool:
+        nonlocal watcher
+        if watcher is None:
+            watcher = asyncio.create_task(_watch())
+            await asyncio.sleep(0)
+        return not gone.is_set()
+
+    request.state.caller_still_waiting = _still_waiting
+    return _still_waiting
+
+
+async def _stop_if_caller_gone(still_wanted: Optional[StillWanted], stage: str) -> None:
+    if still_wanted is not None and not await still_wanted():
+        raise CallerGone(stage)
+
+
 async def _process_documents_async_pipeline(
     documents: List[Document],
     file_id: str,
     vector_store: "AsyncPgVector",
     executor: "ThreadPoolExecutor",
     protected_row_uuids: Optional[List[str]] = None,
+    still_wanted: Optional[StillWanted] = None,
 ) -> List[str]:
     """
     Process documents using async producer-consumer pattern for batched embedding and insertion.
@@ -1291,6 +1480,11 @@ async def _process_documents_async_pipeline(
 
                 batch_documents, batch_ids, batch_num, total_batches = item
 
+                # F04: outside the per-batch try on purpose. That try records a failed
+                # batch and CONTINUES to the next one; a departed caller must stop the
+                # loop, so CallerGone has to reach the outer handler and end the consumer.
+                await _stop_if_caller_gone(still_wanted, f"before batch {batch_num}")
+
                 logger.info(
                     "Inserting batch %d/%d into database (%d chunks)",
                     batch_num,
@@ -1352,6 +1546,17 @@ async def _process_documents_async_pipeline(
             if producer_task is not None and not producer_task.done():
                 producer_task.cancel()
 
+            # F04: the producer's `finally` puts an end marker on a BOUNDED queue. Once the
+            # consumer has stopped nothing takes from it, so with the queue full that put
+            # blocks forever and the gather below never returns -- measured: the request
+            # never finished once a departed caller stopped the consumer with more batches
+            # queued than EMBEDDING_MAX_QUEUE_SIZE (default 3). Keep the queue drained
+            # until the producer has actually exited.
+            while producer_task is not None and not producer_task.done():
+                while not embedding_queue.empty():
+                    embedding_queue.get_nowait()
+                await asyncio.sleep(0)
+
             # Await cancelled tasks to ensure proper cleanup
             if consumer_task is None:
                 await asyncio.gather(producer_task, return_exceptions=True)
@@ -1402,6 +1607,7 @@ async def _process_documents_batched_sync(
     vector_store: "PgVector",
     executor: "ThreadPoolExecutor",
     protected_row_uuids: Optional[List[str]] = None,
+    still_wanted: Optional[StillWanted] = None,
 ) -> List[str]:
     """
     Process documents in batches using synchronous vector store operations.
@@ -1445,6 +1651,10 @@ async def _process_documents_batched_sync(
             end_idx - 1,
             len(batch_documents),
         )
+
+        # F04: before the try, so a departed caller is not handled as a batch failure.
+        # The rollback of what earlier batches wrote belongs to store_data_in_vector_db.
+        await _stop_if_caller_gone(still_wanted, f"before batch {batch_idx + 1}")
 
         try:
             # Wrap sync call in executor to avoid blocking the event loop
@@ -2050,6 +2260,42 @@ def _assert_extractable_content(
     return receipt
 
 
+async def _undo_abandoned_insert(
+    file_id: str, rows_before_insert: Optional[List[str]], executor
+) -> Optional[int]:
+    """Remove the rows an abandoned write added: everything present now that was not
+    present before it inserted. Returns how many, or None when the store cannot list rows
+    (then nothing can be removed safely, and the log says so rather than claiming 0).
+
+    Why this cannot remove ANOTHER request's rows: it runs inside the file_id's write
+    lock (F02, `store_data_in_vector_db`), so no other write of this file_id is between
+    the capture and now. That holds on pgvector; a store with NoFileWriteLock (Atlas, the
+    in-memory test models) has no such guarantee, and there a concurrent writer's rows
+    would be removed too."""
+    if rows_before_insert is None:
+        return None
+    before = set(rows_before_insert)
+    if isinstance(vector_store, AsyncPgVector):
+        now = await vector_store.get_row_uuids(file_id, executor=executor)
+        added = [u for u in now if u not in before]
+        return await vector_store.delete_rows_by_uuid(added, executor=executor)
+    now = vector_store.get_row_uuids(file_id)
+    added = [u for u in now if u not in before]
+    return vector_store.delete_rows_by_uuid(added)
+
+
+#: One writer per file_id (FILES-01 F02). Only pgvector has a shared database to lock in;
+#: tests/conftest.py installs NoFileWriteLock for the in-memory table models.
+file_write_lock = (
+    PgAdvisoryFileLock(PSQLDatabase.get_pool)
+    if VECTOR_DB_TYPE == VectorDBType.PGVECTOR
+    else NoFileWriteLock()
+)
+
+#: HTTP 409 when another write of the same file_id did not finish in time.
+FILE_BUSY_STATUS = 409
+
+
 async def store_data_in_vector_db(
     data: Iterable[Document],
     file_id: str,
@@ -2062,8 +2308,85 @@ async def store_data_in_vector_db(
     subscription_id: str = None,
     tenant_id: str = None,
     replace: bool = False,
+    still_wanted: Optional[StillWanted] = None,
+) -> dict:
+    """Store one file's chunks while holding that file_id's write lock.
+
+    SIMULTANEOUS WRITES (FILES-01 F02). Without the lock, two `replace` uploads of one
+    file_id both captured the same original rows, both inserted, and each deleted only
+    its own capture -- leaving BOTH new versions retrievable, with the first reporting
+    `complete`. Measured through the real route; see app/services/file_write_lock.py.
+    Held from before the captures to after the last delete, so the second writer
+    supersedes the first. Everything else is `_store_data_in_vector_db_unlocked`.
+    """
+
+    async def _stop_waiting():
+        await _stop_if_caller_gone(still_wanted, "waiting for another write of this file")
+
+    try:
+        async with file_write_lock.hold(
+            file_id, stop_waiting=_stop_waiting, max_wait=FILE_WRITE_LOCK_WAIT_SECONDS
+        ):
+            return await _store_data_in_vector_db_unlocked(
+                data, file_id, user_id, clean_content, executor, document_origin_type,
+                filename, link, subscription_id, tenant_id, replace, still_wanted,
+            )
+    except CallerGone as gone:
+        # Only reachable while WAITING: inside the section the unlocked body turns
+        # CallerGone into its own 499 after undoing what it wrote. Here nothing was.
+        logger.warning(
+            "Caller stopped waiting for the write lock | File ID: %s | nothing written",
+            file_id,
+        )
+        raise HTTPException(
+            status_code=CALLER_GONE_STATUS,
+            detail={
+                "message": "The caller stopped waiting before the file was stored; "
+                "nothing from this request was kept.",
+                "stage": gone.stage,
+                "rows_removed": 0,
+            },
+        ) from gone
+    except FileWriteBusy as busy:
+        raise HTTPException(
+            status_code=FILE_BUSY_STATUS,
+            detail=(
+                f"Another upload of this file was still being stored after "
+                f"{busy.waited:.0f}s; nothing from this request was stored. "
+                "Retry once it has finished."
+            ),
+        ) from busy
+
+
+async def _store_data_in_vector_db_unlocked(
+    data: Iterable[Document],
+    file_id: str,
+    user_id: str = "",
+    clean_content: bool = False,
+    executor=None,
+    document_origin_type: str = DocumentOriginType.ORGANIC.value,
+    filename: str = None,
+    link: str = None,
+    subscription_id: str = None,
+    tenant_id: str = None,
+    replace: bool = False,
+    still_wanted: Optional[StillWanted] = None,
 ) -> dict:
     """Store one file's chunks. With `replace`, supersede the file's current rows.
+
+    ABANDONED REQUESTS (FILES-01 F04). With `still_wanted` (a route passes
+    `caller_still_waiting(request)`), the write stops once the caller has gone: before the
+    first insert, before every later batch, and once more after the last insert -- the
+    last point at which the result can still be undone. Anything this call inserted is
+    then removed, the superseded version of a replacement is NOT deleted, and `CallerGone`
+    becomes a 499. So a caller that timed out, and told its user the upload failed, never
+    finds the file retrievable afterwards. See `CallerGone` for the measurement.
+
+    That guarantee needs a store that can list its rows (`get_row_uuids`) -- pgvector,
+    which is what runs in production. On Atlas (no row listing) the write still STOPS at
+    the next check, but rows already inserted by an additive upload stay, and the 499
+    reports `rows_removed: null` (unknown) rather than claiming they were removed.
+    (`replace` is already refused there with a 501.)
 
     REPLACEMENT SEMANTICS (FILES-01 F3, contract agreed with Core 2026-09-20).
 
@@ -2167,7 +2490,33 @@ async def store_data_in_vector_db(
         tenant_id,
     )
 
+    # F04: the rows this file ALREADY had, captured before anything is inserted, so an
+    # abandoned write removes exactly what this call added. Deleting by file_id would
+    # also destroy the prior version -- the additive default keeps earlier rows on
+    # purpose, and under `replace` they are the only good copy until this call succeeds.
+    #
+    # A capture that fails must not fail the UPLOAD: the capture exists only for the rare
+    # abandoned case, and a caller who is still waiting is owed their file. Without it an
+    # abandoned write cannot be undone precisely, and the 499 then reports the rows it
+    # left as unknown (None), never as 0.
+    rows_before_insert = None
+    if still_wanted is not None and hasattr(vector_store, "get_row_uuids"):
+        try:
+            if isinstance(vector_store, AsyncPgVector):
+                rows_before_insert = await vector_store.get_row_uuids(
+                    file_id, executor=executor
+                )
+            else:
+                rows_before_insert = vector_store.get_row_uuids(file_id)
+        except Exception as capture_error:  # noqa: BLE001 - see above: fail towards storing
+            logger.warning(
+                "Could not list existing rows for %s before insert (%s); an abandoned "
+                "write of this request could not be undone precisely",
+                file_id, type(capture_error).__name__,
+            )
+
     try:
+        await _stop_if_caller_gone(still_wanted, "before insert")
         if EMBEDDING_BATCH_SIZE <= 0:
             # synchronously embed the file and insert into vector store in one go
             if isinstance(vector_store, AsyncPgVector):
@@ -2185,13 +2534,20 @@ async def store_data_in_vector_db(
                 ids = await _process_documents_async_pipeline(
                     docs, file_id, vector_store, executor,
                     protected_row_uuids=superseded_rows,
+                    still_wanted=still_wanted,
                 )
             else:
                 # Fallback to batched processing for sync vector stores
                 ids = await _process_documents_batched_sync(
                     docs, file_id, vector_store, executor,
                     protected_row_uuids=superseded_rows,
+                    still_wanted=still_wanted,
                 )
+
+        # F04: the last point at which this write can still be undone. A single-shot
+        # insert cannot be interrupted part-way, so this is the check that catches a
+        # caller who left DURING it -- the measured case.
+        await _stop_if_caller_gone(still_wanted, "after insert")
 
         result = {"message": "Documents added successfully", "ids": ids, "docs": docs}
 
@@ -2221,6 +2577,25 @@ async def store_data_in_vector_db(
                 ),
             }
         return result
+
+    except CallerGone as gone:
+        rolled_back = await _undo_abandoned_insert(file_id, rows_before_insert, executor)
+        logger.warning(
+            "Caller stopped waiting; write abandoned | File ID: %s | User ID: %s | stage: %s"
+            " | rows removed: %s | superseded version kept: %s",
+            file_id, user_id, gone.stage,
+            "unknown (store cannot list rows)" if rolled_back is None else rolled_back,
+            superseded_rows is not None,
+        )
+        raise HTTPException(
+            status_code=CALLER_GONE_STATUS,
+            detail={
+                "message": "The caller stopped waiting before the file was stored; "
+                "nothing from this request was kept.",
+                "stage": gone.stage,
+                "rows_removed": rolled_back,
+            },
+        ) from gone
 
     except Exception as e:
         logger.error(
@@ -2296,6 +2671,7 @@ async def embed_local_file(
             document.file_content_type,
             file_path,
             request.app.state.thread_pool,
+            still_wanted=caller_still_waiting(request),
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
@@ -2310,6 +2686,7 @@ async def embed_local_file(
             executor=request.app.state.thread_pool,
             filename=document.filename,
             tenant_id=tenant_id,
+            still_wanted=caller_still_waiting(request),
         )
 
         if result:
@@ -2445,6 +2822,7 @@ async def embed_file(
             file.content_type,
             validated_file_path,
             request.app.state.thread_pool,
+            still_wanted=caller_still_waiting(request),
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
@@ -2463,6 +2841,7 @@ async def embed_file(
             subscription_id=subscription_id,
             tenant_id=tenant_id,
             replace=replace,
+            still_wanted=caller_still_waiting(request),
         )
 
         if not result:
@@ -2627,6 +3006,7 @@ async def embed_file_upload(
             uploaded_file.content_type,
             validated_temp_file_path,
             request.app.state.thread_pool,
+            still_wanted=caller_still_waiting(request),
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
@@ -2642,6 +3022,7 @@ async def embed_file_upload(
             filename=uploaded_file.filename,
             tenant_id=tenant_id,
             replace=replace,
+            still_wanted=caller_still_waiting(request),
         )
 
         if not result:
@@ -2677,7 +3058,16 @@ async def embed_file_upload(
     }
 
 
-@router.post("/query_multiple")
+# response_model as on `/query` (#45, F-QC1): SIBLING ROUTE, MEASURED byte-identical on the
+# SUCCESS path. The model describes only the 2xx body, which this route reaches ONLY with a
+# non-empty list (an empty result raises 404 before returning). That 404 -- `{"detail": ...}` --
+# is produced by the exception handler, NOT the response_model, so declaring the model here does
+# not touch it; byte-identity of both the 200 body and the 404 body was proven before/after (see
+# the test file). Empty-result behaviour therefore DIFFERS from `/query` and `/query/{entity_id}`,
+# which return `[]` 200: that difference is real and undocumented, so it is PINNED in the test
+# file rather than changed here (changing it would move the wire and is Core/Demian's call).
+# `metadata` stays an OPEN dict for the same silent-deletion reason as `/query`.
+@router.post("/query_multiple", response_model=List[QueryHit])
 async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
     # Entitlement (D-KSPT-1): file ids are only filters. Constrain retrieval to
     # the authorized entity set and defensively drop any document owned by an
@@ -2763,6 +3153,7 @@ async def extract_text_from_file(
             file.content_type,
             validated_temp_file_path,
             request.app.state.thread_pool,
+            still_wanted=caller_still_waiting(request),
         )
 
         # Extract text content from loaded documents
@@ -2936,6 +3327,7 @@ async def summarize_entity_files(
                 clean_content=False,
                 executor=request.app.state.thread_pool,
                 tenant_id=tenant_id,
+                still_wanted=caller_still_waiting(request),
             )
             if not result or "error" in result:
                 error_detail = result.get("error", "Unknown error") if result else "No result"

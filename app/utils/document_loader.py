@@ -84,6 +84,11 @@ class UnsupportedDocumentError(DocumentVerdictError):
     verdict = "unsupported"
 
 
+#: Compound File Binary (OLE2) header. A legacy .doc/.xls/.ppt is an OLE2 container, and so is an
+#: ENCRYPTED OOXML file (.docx/.xlsx/.pptx). Defined once here and reused by `SheetExcelLoader`, which
+#: needs the same literal to tell an encrypted workbook from a corrupt one on the .xls/.xlsx branch.
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
 #: Leading byte signatures for formats this service has no text extractor for. Named rather than
 #: lumped into "binary" because "we do not read images" is actionable and "unsupported file" is not.
 _BINARY_SIGNATURES = (
@@ -104,6 +109,13 @@ _BINARY_SIGNATURES = (
     (b"MZ", "a Windows executable"),
     (b"\x7fELF", "a Linux executable"),
     (b"SQLite format 3\x00", "a SQLite database"),
+    # An OLE2 file reaching THIS table came through the fallback branch — an unknown extension and no
+    # Office content type — so no earlier branch claimed it as a workbook or a Word document. Naming it
+    # "a legacy Microsoft Office file ... or an encrypted Office document" is the actionable truth; the
+    # generic "not a text-based format" was not. A .xls/.xlsx or .doc arriving with its real extension
+    # or content type never reaches here — it is routed to SheetExcelLoader / Docx2txtLoader first — so
+    # this entry cannot relabel the `encrypted` verdict a password-protected .xlsx already earns there.
+    (_OLE2_MAGIC, "a legacy Microsoft Office file (.doc, .xls or .ppt) or an encrypted Office document"),
 )
 
 
@@ -981,8 +993,9 @@ class SheetExcelLoader:
 
     #: Compound File Binary header. An .xlsx is a ZIP; an ENCRYPTED .xlsx is an
     #: OLE2 container holding the encrypted package. Legacy .xls is also OLE2.
-    #: One definition, module level, shared with the Word branch.
-    _OLE2_MAGIC = OLE2_MAGIC
+    #: The literal lives at module scope (`_OLE2_MAGIC`) so the fallback-branch
+    #: signature table and this container check can never drift apart.
+    _OLE2_MAGIC = _OLE2_MAGIC
     _ZIP_MAGIC = b"PK\x03\x04"
 
     #: Cap on the per-sheet sample of uncached-formula cell references carried in
