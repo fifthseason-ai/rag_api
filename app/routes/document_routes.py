@@ -1029,9 +1029,9 @@ async def query_embeddings_by_file_id(
 # publishing it here is the additive close of an asymmetry, not a redesign. `metadata` MUST
 # stay open: FastAPI re-serialises through the model, so naming its keys would DELETE every
 # locator (page/page_label/page_name/slide_number/row/...) a citation is built from while the
-# diff read as purely additive. The empty result of THIS route is `[]` (200), unlike
-# `/query_multiple`, which answers 404 -- that divergence is pinned in the test file, not
-# changed here (changing it would move the wire and is Core/Demian's contract call).
+# diff read as purely additive. The empty result of all three query routes is now `[]` (200):
+# `/query_multiple`'s former 404-on-empty was aligned to `[]` in a later PR (Core Q3 decision,
+# CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md -- zero Core call sites), so they agree on empty too.
 @router.post("/query/{entity_id}", response_model=List[QueryHit])
 async def query_embeddings_by_entity_id(
     entity_id: str,
@@ -2290,11 +2290,17 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             if doc.metadata.get("user_id") in ent["entity_ids"]
         ]
 
-        # Ensure documents list is not empty
+        # Empty result aligned to [] (200), matching /query and /query/{entity_id}.
+        # Was 404 {"detail":"No documents found for the given query"}; that divergence
+        # was pinned by #52 and is now removed. Core has ZERO call sites of this route
+        # (`git grep query_multiple` == 0 at Core 881a124cf and Candidate B) and asked
+        # Files to unify empty -> []/200 in a separate explicit PR; see
+        # C:/fswt/.coord/CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md (Q3). This branch
+        # covers both "no hits" and "hits all filtered out by entitlement" -- exactly as
+        # /query collapses both into [] -- so no auth/validation error is masked here
+        # (auth is enforced by _require_action above; a genuine fault still raises 500).
         if not documents:
-            raise HTTPException(
-                status_code=404, detail="No documents found for the given query"
-            )
+            return []
 
         return documents
     except HTTPException as http_exc:

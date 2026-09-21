@@ -12,13 +12,19 @@ MEASURED (throwaway probe, raw response bytes, store double, five-format metadat
              [[{"id":null,"metadata":{<open dict>},"page_content":...,"type":"Document"}, <float>]]
              -> the asymmetry (only `/query` documented) was a real gap, closed additively here.
 
-  EMPTY      `/query`             -> []                                    (200)
-             `/query/{entity_id}` -> []                                    (200)
-             `/query_multiple`    -> {"detail":"No documents found ..."}   (404)
-             -> a REAL, undocumented divergence. `/query_multiple` signals "no results" as an
-                ERROR a consumer must catch, while the other two signal it as an empty list.
-                It is a wire/contract behaviour, so it is PINNED here, NOT changed -- changing it
-                is Core/Demian's call, exactly as #45 left adoption to them.
+  EMPTY (originally)  `/query`             -> []                                    (200)
+                      `/query/{entity_id}` -> []                                    (200)
+                      `/query_multiple`    -> {"detail":"No documents found ..."}   (404)
+             -> a REAL, undocumented divergence #52 first pinned: `/query_multiple` signalled
+                "no results" as an ERROR a consumer had to catch, while its two siblings signalled
+                it as an empty list.
+
+  EMPTY (now, this PR)  ALL THREE -> [] (200).
+             -> The divergence is REMOVED, not merely re-pinned. Core has ZERO call sites of
+                `/query_multiple` (`git grep query_multiple` == 0 at Core 881a124cf and its
+                Candidate B composition), and asked Files to align empty -> []/200 in a separate
+                explicit PR -- CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md (Q3). Only the empty
+                branch changed; the non-empty wire is byte-identical (proven below and by probe).
 
 WHY `metadata` STAYS AN OPEN DICT. FastAPI validates and re-serialises through the model, so
 naming metadata's keys would DELETE every locator a citation is built from -- page, page_label,
@@ -170,7 +176,7 @@ def test_all_three_routes_return_the_identical_non_empty_body(one_hit_client, mo
     )
 
 
-# --- The one place they DIVERGE: the empty result ---------------------------------------------
+# --- The empty result: all three routes now AGREE on [] 200 -----------------------------------
 
 def test_query_empty_result_is_an_empty_list_200(empty_client):
     r = _post(empty_client, "/query")
@@ -184,16 +190,35 @@ def test_query_by_entity_empty_result_is_an_empty_list_200(empty_client):
     assert r.json() == [], r.text
 
 
-def test_query_multiple_empty_result_is_a_404_not_an_empty_list(empty_client):
-    """PINNED DIVERGENCE, not a bug being fixed. `/query_multiple` answers 404 on no results,
-    while its two siblings answer `[]` 200. A consumer that treats "no matches" as an empty list
-    gets an EXCEPTION here instead. Adding the response_model did NOT change this: the 404 is
-    raised as an HTTPException and rendered by the exception handler, which the model never sees.
-    If this route is ever unified to `[]` 200, that is a deliberate contract change and reddens
-    here -- it must not happen silently."""
+def test_query_multiple_empty_result_is_now_an_empty_list_200(empty_client):
+    """THE PRODUCT CHANGE THIS PR MAKES, pinned on the wire. `/query_multiple` previously
+    answered 404 {"detail":"No documents found for the given query"} on no results; #52 pinned
+    that divergence. This PR aligns it to `[]` 200 to match its two siblings (Core Q3 decision,
+    CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md -- Core has zero call sites of this route). The
+    failure control reverts the route's empty branch to the 404 raise and this reddens on both
+    the status assertion (404 != 200) and the body assertion (the 404 detail object != [])."""
     r = _post(empty_client, "/query_multiple")
-    assert r.status_code == 404, r.text
-    assert r.json() == {"detail": "No documents found for the given query"}, r.text
+    assert r.status_code == 200, r.text
+    assert r.json() == [], r.text
+    # The former 404 detail object must no longer appear anywhere in the empty response.
+    assert r.text.strip() == "[]", r.text
+
+
+def test_all_three_query_routes_agree_on_empty_result(empty_client, monkeypatch):
+    """Source-of-truth equality on the EMPTY path, the mirror of the non-empty equality test.
+    Three consumers of one producer, given nothing, must put the SAME bytes on the wire. This is
+    the invariant the alignment establishes; if any route regresses (e.g. the 404 returns to
+    `/query_multiple`), the set of distinct bodies grows and this reddens."""
+    bodies = {}
+    for label in ROUTES:
+        client = empty_client if label == "/query" else _install(monkeypatch, [])
+        r = _post(client, label)
+        bodies[label] = (r.status_code, r.content)
+    distinct = set(bodies.values())
+    assert distinct == {(200, b"[]")}, (
+        "the query routes disagree on the empty wire: %s" %
+        {k: (s, b.decode("utf-8", "replace")) for k, (s, b) in bodies.items()}
+    )
 
 
 # --- The asymmetry itself: all three now carry the same declared response_model ----------------
