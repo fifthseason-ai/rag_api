@@ -1185,6 +1185,21 @@ async def _retrieve_documents(
     return await rerank(query, candidates, top_n=top_n)
 
 
+def _authorized_only(documents, entity_ids):
+    """Defensive entitlement post-filter shared by every query route (D-KSPT-1).
+
+    Keeps only (Document, score) pairs whose owning entity (`user_id`) is within the
+    token entitlement. The retrieval arms already filter by user_id; this is defence in
+    depth, so a filter dropped from any arm (dense, keyword, fused, reranked) can never
+    put another entity's row on the wire. On correct data it is the identity.
+    """
+    return [
+        (doc, score)
+        for (doc, score) in documents
+        if doc.metadata.get("user_id") in entity_ids
+    ]
+
+
 @router.post("/query", response_model=List[QueryHit])
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
@@ -1217,11 +1232,7 @@ async def query_embeddings_by_file_id(
         if not documents:
             return authorized_documents
 
-        authorized_documents = [
-            (doc, score)
-            for (doc, score) in documents
-            if doc.metadata.get("user_id") in ent["entity_ids"]
-        ]
+        authorized_documents = _authorized_only(documents, ent["entity_ids"])
         if len(authorized_documents) != len(documents):
             logger.warning(
                 "[query] filtered %d unauthorized document(s) out of %d for file_id=%s",
@@ -1267,8 +1278,9 @@ async def query_embeddings_by_entity_id(
     request: Request,
 ):
     # Entitlement (D-KSPT-1): the path entity_id is a filter; it must be within the
-    # token entitlement and read must be granted.
-    _require_entity(request, "read", entity_id)
+    # token entitlement and read must be granted. Results are defensively re-filtered to
+    # the entitlement exactly as /query and /query_multiple do (F-ENTITLEMENT-FUSED).
+    ent = _require_entity(request, "read", entity_id)
     logger.info(
         "[query_embeddings_by_entity_id] request [entity_id=%s][query=%r][k=%d][args=%s]",
         entity_id, body.query, body.k, body.args
@@ -1293,7 +1305,16 @@ async def query_embeddings_by_entity_id(
         if not documents:
             return []
 
-        return documents
+        authorized_documents = _authorized_only(documents, ent["entity_ids"])
+        if len(authorized_documents) != len(documents):
+            logger.warning(
+                "[query_embeddings_by_entity_id] filtered %d unauthorized document(s) out of %d for entity_id=%s",
+                len(documents) - len(authorized_documents),
+                len(documents),
+                entity_id,
+            )
+
+        return authorized_documents
 
     except HTTPException as http_exc:
         logger.error(
@@ -3188,11 +3209,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             filters,
         )
 
-        documents = [
-            (doc, score)
-            for (doc, score) in documents
-            if doc.metadata.get("user_id") in ent["entity_ids"]
-        ]
+        documents = _authorized_only(documents, ent["entity_ids"])
 
         # Empty result aligned to [] (200), matching /query and /query/{entity_id}.
         # Was 404 {"detail":"No documents found for the given query"}; that divergence
