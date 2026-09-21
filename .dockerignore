@@ -5,3 +5,11 @@ myenv/
 venv/
 deploy/
 .env
+# The whole git history was being COPYed into the production image: every past revision, every
+# branch name, every author email, in an artifact that only needs the working tree. It also made
+# the image non-deterministic for no benefit, and -- found the hard way -- it made `.git` present
+# inside the runtime, so a test discriminating "checkout" from "shipped image" got the wrong
+# answer. Nothing in the build or the runtime reads git: the build revision arrives as a build
+# ARG.
+.git/
+.github/
