@@ -74,7 +74,7 @@ from app.utils.document_loader import (
     cleanup_temp_encoding_file,
     DocumentVerdictError,
 )
-from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget
+from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget, OcrCancelled
 from app.utils.health import is_health_ok
 
 router = APIRouter()
@@ -464,7 +464,8 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
 
 
 async def load_file_content(
-    filename: str, content_type: str, file_path: str, executor
+    filename: str, content_type: str, file_path: str, executor,
+    still_wanted: "Optional[StillWanted]" = None,
 ) -> tuple:
     """Load file content using appropriate loader.
 
@@ -483,24 +484,55 @@ async def load_file_content(
     # worker THREAD keeps running -- so without this a disconnected client leaves a
     # 50-page OCR burning CPU for nobody. The loader checks this flag between pages.
     #
-    # There is deliberately NO `except OcrCancelled` handler here. The flag is set only
-    # inside the `except asyncio.CancelledError` below, which re-raises immediately, so
-    # by the time the worker thread raises `OcrCancelled` nobody is awaiting that future
-    # and the exception is discarded -- which is the correct outcome, because a cancelled
-    # request has no caller left to answer. The first version answered 503 there; review
-    # showed it was unreachable, and an uncovered handler that implies a tested path is
-    # worse than no handler (the same call made for the dead verdict guard in #29).
+    # `OcrCancelled` IS handled below, and that is a reversal worth stating. An earlier
+    # version had no handler because the flag was set only in the CancelledError branch,
+    # which re-raises at once, so nobody was left awaiting the future. F04B added the
+    # disconnect watcher, which sets the flag WHILE this coroutine is still awaiting --
+    # measured: the loader then raises OcrCancelled through the route's generic handler,
+    # logged as "File processing failed ... attribution=undetermined", an error that
+    # blames nothing for a caller who simply left. It is answered as the same 499 F04 uses.
     stop = threading.Event()
     try:
         loader, known_type, file_ext = get_loader(
             filename, content_type, file_path, ocr_budget=OcrBudget(should_stop=stop.is_set)
         )
         loop = asyncio.get_running_loop()
+        # F04B: a departed caller must stop the OCR too. The CancelledError branch below
+        # never runs for a disconnect -- Starlette does not cancel the handler (measured
+        # for F04) -- so without this a 12-page scan was OCR'd to the last page, 15 s after
+        # the client had left. Polls the request's shared disconnect probe and trips the
+        # same `stop` flag the loader already checks between pages.
+        stop_watch = None
+        if still_wanted is not None:
+
+            async def _stop_when_caller_leaves():
+                while not stop.is_set():
+                    if not await still_wanted():
+                        logger.info("Caller left during extraction of %s; stopping OCR", filename)
+                        stop.set()
+                        return
+                    await asyncio.sleep(0.25)
+
+            stop_watch = asyncio.create_task(_stop_when_caller_leaves())
         try:
             data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
         except asyncio.CancelledError:
             stop.set()
             raise
+        except OcrCancelled as cancelled:
+            logger.info("Extraction of %s stopped: the caller left; nothing stored", filename)
+            raise HTTPException(
+                status_code=CALLER_GONE_STATUS,
+                detail={
+                    "message": "The caller stopped waiting while the file was being read; "
+                    "nothing from this request was kept.",
+                    "stage": "during extraction",
+                    "rows_removed": 0,
+                },
+            ) from cancelled
+        finally:
+            if stop_watch is not None:
+                stop_watch.cancel()
         return data, known_type, file_ext
     except DocumentVerdictError as verdict_error:
         logger.warning(
@@ -1120,7 +1152,13 @@ def caller_still_waiting(request: Request) -> StillWanted:
     the response is sent the middleware answers it with `http.disconnect` and it ends.
 
     If the watcher fails, the caller is treated as STILL WAITING: an unexplained error
-    must not discard an upload that someone may be waiting for. It is logged."""
+    must not discard an upload that someone may be waiting for. It is logged.
+
+    ONE probe per request, cached on `request.state`: extraction (F04B) and storage both
+    ask, and two watchers would be two concurrent `receive()` calls on one connection."""
+    cached = getattr(request.state, "caller_still_waiting", None)
+    if cached is not None:
+        return cached
     gone = asyncio.Event()
     watcher: Optional[asyncio.Task] = None
 
@@ -1146,6 +1184,7 @@ def caller_still_waiting(request: Request) -> StillWanted:
             await asyncio.sleep(0)
         return not gone.is_set()
 
+    request.state.caller_still_waiting = _still_waiting
     return _still_waiting
 
 
@@ -2229,6 +2268,7 @@ async def embed_local_file(
             document.file_content_type,
             file_path,
             request.app.state.thread_pool,
+            still_wanted=caller_still_waiting(request),
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
@@ -2379,6 +2419,7 @@ async def embed_file(
             file.content_type,
             validated_file_path,
             request.app.state.thread_pool,
+            still_wanted=caller_still_waiting(request),
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
@@ -2562,6 +2603,7 @@ async def embed_file_upload(
             uploaded_file.content_type,
             validated_temp_file_path,
             request.app.state.thread_pool,
+            still_wanted=caller_still_waiting(request),
         )
 
         # Empty-extraction guard (KI-02 WP-C): never store an empty extraction.
@@ -2699,6 +2741,7 @@ async def extract_text_from_file(
             file.content_type,
             validated_temp_file_path,
             request.app.state.thread_pool,
+            still_wanted=caller_still_waiting(request),
         )
 
         # Extract text content from loaded documents
