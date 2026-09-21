@@ -588,12 +588,38 @@ async def cleanup_temp_file_async(file_path: str) -> None:
 
 @router.get("/ids")
 async def get_all_ids(request: Request):
-    _require_action(request, "read")
+    """File identifiers the CALLER may see. Previously: every identifier in the store.
+
+    Measured on the wire before this change -- tenant B calls /ids and receives tenant A's
+    `acme-merger-2026-confidential`. The route asserted the `read` ACTION and then ran a
+    query with no entity predicate, so a valid token for any tenant returned a complete
+    list of every file the service held.
+
+    A file identifier is not page content, and it is not nothing either: it is the
+    argument every other route takes, it is frequently the customer's own document id or
+    filename, and the full list is a map of what another tenant holds. The sibling routes
+    `GET /documents` and `/documents/{id}/context` already keep only rows whose `user_id`
+    is within the entitlement; this route was the one that did not.
+    """
+    ent = _require_action(request, "read")
     try:
+        if not hasattr(vector_store, "get_ids_for_entities"):
+            # FAIL CLOSED. The alternative -- falling back to the unscoped list -- is the
+            # exact disclosure this change exists to stop, and it would be invisible
+            # because the response shape is identical.
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    "This vector store cannot scope identifiers to the caller, so no "
+                    "identifiers are returned."
+                ),
+            )
         if isinstance(vector_store, AsyncPgVector):
-            ids = await vector_store.get_all_ids(executor=request.app.state.thread_pool)
+            ids = await vector_store.get_ids_for_entities(
+                ent["entity_ids"], executor=request.app.state.thread_pool
+            )
         else:
-            ids = vector_store.get_all_ids()
+            ids = vector_store.get_ids_for_entities(ent["entity_ids"])
 
         return list(set(ids))
     except HTTPException as http_exc:
@@ -604,12 +630,28 @@ async def get_all_ids(request: Request):
         )
         raise http_exc
     except Exception as e:
+        # The exception text stays in the LOG, never in the response. `str(e)` here was
+        # handing the caller internal class and ORM attribute names, and on a database
+        # fault it would carry connection or schema details -- the same disclosure shape
+        # repaired for PyJWT's own diagnoses in the SEPARATE branch #35, which is NOT in
+        # this branch's base -- independent review correctly pointed out that the earlier
+        # wording here read as though that repair were already present in this tree. It is
+        # the same shape and a different change. The reference ties the caller's report to
+        # this log line without telling them anything about the service.
+        reference = uuid.uuid4().hex[:12]
         logger.error(
-            "Failed to get all IDs | Error: %s | Traceback: %s",
+            "Failed to list ids [reference=%s] | Error: %s | Traceback: %s",
+            reference,
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The identifier list could not be produced. Quote reference "
+                f"{reference} to an operator."
+            ),
+        )
 
 
 @router.get("/health")
