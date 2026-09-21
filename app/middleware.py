@@ -133,6 +133,28 @@ async def security_middleware(request: Request, call_next):
         return JSONResponse(
             status_code=403, content={"detail": "Missing entitlement"}
         )
+    # D-ENT-EMPTY (Richard, 2026-09-21): an empty string is not a valid entitlement.
+    # A malformed entry -- "", whitespace-only, or any non-string (None, numbers) -- is
+    # rejected EXPLICITLY here, before it can reach the entity set. It must never grant
+    # access and never silently widen scope:
+    #   * `{str(e) for e in entity_ids}` two lines down would turn None into the literal
+    #     "None" and "" into "", each of which could then MATCH a row whose user_id is
+    #     empty/None -- so the malformed value would become an authority, not a no-op.
+    #   * Dropping the bad entries and proceeding on the rest would be the "silent
+    #     expansion" the ruling forbids: a token minted [""] would read as no constraint.
+    # The whole token is refused; a caller with a real entitlement is unaffected. Core
+    # mints `ent: [req.user.id]` (createContextHandlers.js:28 @ 881a124cf) and its own
+    # signer already rejects an empty array (jwt.ts:51), so no documented caller sends
+    # this. The message does not disclose which entry was bad.
+    if any((not isinstance(e, str)) or (not e.strip()) for e in entity_ids):
+        logger.info(
+            "Forbidden request with a malformed entitlement entry (empty/whitespace/"
+            "non-string) to: %s",
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=403, content={"detail": "Malformed entitlement"}
+        )
     if not actions or not isinstance(actions, (list, tuple)):
         logger.info(
             "Forbidden request with missing/empty actions (act) to: %s",

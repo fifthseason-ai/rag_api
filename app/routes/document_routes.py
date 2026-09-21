@@ -1256,9 +1256,9 @@ async def query_embeddings_by_file_id(
 # publishing it here is the additive close of an asymmetry, not a redesign. `metadata` MUST
 # stay open: FastAPI re-serialises through the model, so naming its keys would DELETE every
 # locator (page/page_label/page_name/slide_number/row/...) a citation is built from while the
-# diff read as purely additive. The empty result of THIS route is `[]` (200), unlike
-# `/query_multiple`, which answers 404 -- that divergence is pinned in the test file, not
-# changed here (changing it would move the wire and is Core/Demian's contract call).
+# diff read as purely additive. The empty result of all three query routes is now `[]` (200):
+# `/query_multiple`'s former 404-on-empty was aligned to `[]` in a later PR (Core Q3 decision,
+# CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md -- zero Core call sites), so they agree on empty too.
 @router.post("/query/{entity_id}", response_model=List[QueryHit])
 async def query_embeddings_by_entity_id(
     entity_id: str,
@@ -1722,6 +1722,7 @@ def _prepare_documents_sync(
     link: str = None,
     subscription_id: str = None,
     tenant_id: str = None,
+    ingest_id: str = None,
 ) -> List[Document]:
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
@@ -1774,6 +1775,14 @@ def _prepare_documents_sync(
         **({"filename": filename} if filename else {}),
         **({"link": link} if link else {}),
         **({"subscription_id": subscription_id} if subscription_id else {}),
+        # FILES-01 F03 / Core C05 (CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md, Q1). One id
+        # per write, on every chunk of it. A citation records the id it was taken from; if
+        # the file is later replaced, the current rows carry a DIFFERENT id, so Core can say
+        # "this source has changed since it was cited" instead of silently opening new text.
+        # A service field, so it wins over anything a loader emits: a document must not be
+        # able to assert which version it is. Absent on rows written before this existed,
+        # and Core reads absent as UNKNOWN, never as unchanged.
+        **({"ingest_id": ingest_id} if ingest_id else {}),
     }
 
     return [
@@ -1845,6 +1854,25 @@ _OCR_WEAK_REASONS = frozenset({"ocr_low_confidence", "ocr_orientation_suspect"})
 #: being unreadable. Surfaced as `ocr.stopped_reason` so a truncated run is never
 #: mistaken for a complete one.
 _OCR_STOP_REASONS = frozenset({"page_limit", "time_limit", "cancelled", "budget_exhausted"})
+
+
+#: D-F05 image/OCR coverage states, worst first. The document rollup takes the WORST
+#: across its pages, so an un-inspected or un-OCR'd image anywhere is never rounded up.
+#: `not_applicable` (no image at all) ranks best -- there is nothing to cover.
+_IMAGE_COVERAGE_RANK = {"unknown": 0, "not_attempted": 1, "attempted": 2, "not_applicable": 3}
+
+#: Document-level image coverage that means "some image content's coverage is not
+#: established", so a `complete` status would overstate what was read (D-F05).
+_IMAGE_COVERAGE_INCOMPLETE = {"unknown", "not_attempted"}
+
+
+def _worse_image_coverage(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """The least-covered of two image-coverage states (None = absent, ignored)."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if _IMAGE_COVERAGE_RANK.get(a, 0) <= _IMAGE_COVERAGE_RANK.get(b, 0) else b
 
 
 def _extraction_receipt(data: Iterable[Document]) -> dict:
@@ -1962,6 +1990,7 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                 "ocr": None,
                 "source": None,
                 "attempted": False,
+                "image_ocr_coverage": None,
             }
             order.append(loc)
         pc = getattr(d, "page_content", None)
@@ -1977,6 +2006,13 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                 units[loc]["ocr_confidence"] = meta["ocr_confidence"]
         if meta.get("text_source") is not None:
             units[loc]["source"] = meta["text_source"]
+        if meta.get("image_ocr_coverage") is not None:
+            # D-F05: worst-case wins per unit. A unit split across several Documents (or a
+            # unit some of whose pages were OCR'd and some not) takes the least-covered
+            # state, so a receipt can never round an un-inspected page up to "attempted".
+            units[loc]["image_ocr_coverage"] = _worse_image_coverage(
+                units[loc].get("image_ocr_coverage"), meta["image_ocr_coverage"]
+            )
         if meta.get(STOPPED_KEY) is not None:
             # Scanned across ALL documents rather than read off the last one: which page
             # carries the marker is an implementation detail of the loader, and a receipt
@@ -2136,6 +2172,44 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             "pages_not_included": extraction_stop["pages_not_included"],
         }
         if receipt["status"] == "complete":
+            receipt["status"] = "partial"
+
+    # --- D-F05: text coverage and image/OCR coverage, recorded SEPARATELY -----------
+    #
+    # Richard's ruling (2026-09-21): a text layer alone does not establish full coverage
+    # of a page containing images. The loader stamps each page's `image_ocr_coverage`
+    # (not_applicable / not_attempted / attempted / unknown); here they roll up to the
+    # WORST across the document, so an un-OCR'd or un-inspected image anywhere is never
+    # rounded up. Present whenever a real embedded image is seen (NOT gated on the OCR
+    # kill switch), so disclosure does not depend on OCR having run.  
+    image_states = [
+        units[loc]["image_ocr_coverage"]
+        for loc in order
+        if units[loc]["image_ocr_coverage"] is not None
+    ]
+    doc_image_coverage = None
+    for st in image_states:
+        doc_image_coverage = _worse_image_coverage(doc_image_coverage, st)
+    # Present the block ONLY when there is real image content to speak to. An imageless
+    # native PDF rolls up to `not_applicable`, and emitting a block for it would break the
+    # kill switch's byte-identical guarantee for the format the feature touches; there is
+    # also nothing to disclose. `attempted`/`not_attempted`/`unknown` all get the block.
+    if doc_image_coverage is not None and doc_image_coverage != "not_applicable":
+        # Text dimension, independent of the image downgrade below: what the text layer /
+        # OCR actually produced across units.
+        text_coverage = (
+            "none" if units_extracted == 0
+            else "complete" if units_extracted == units_total
+            else "partial"
+        )
+        receipt["coverage"] = {"text": text_coverage, "image_ocr": doc_image_coverage}
+        # A page whose image was never OCR'd (or could not be inspected) means the page
+        # may carry text this service did not read. `complete` would claim otherwise on
+        # the exact field consumers gate on, so it is downgraded -- the same rule the
+        # escalation and read-bound signals already enforce for the other ways a document
+        # can be short. `not_applicable` (no image) and `attempted` (image was OCR'd) do
+        # not downgrade. `empty` is left alone (the 422 path).
+        if receipt["status"] == "complete" and doc_image_coverage in _IMAGE_COVERAGE_INCOMPLETE:
             receipt["status"] = "partial"
 
     # PER-PAGE PROVENANCE: which engine produced which page's text. Core needs this at
@@ -2488,6 +2562,11 @@ async def _store_data_in_vector_db_unlocked(
         link,
         subscription_id,
         tenant_id,
+        # F03: a new id for THIS write. Only a write that succeeds leaves rows carrying it:
+        # a failed or abandoned one is rolled back (and a replacement deletes the version
+        # it supersedes only after its own insert succeeded), so a reader always sees the
+        # id that belongs to the content in front of them.
+        str(uuid.uuid4()),
     )
 
     # F04: the rows this file ALREADY had, captured before anything is inserted, so an
@@ -3094,11 +3173,17 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             if doc.metadata.get("user_id") in ent["entity_ids"]
         ]
 
-        # Ensure documents list is not empty
+        # Empty result aligned to [] (200), matching /query and /query/{entity_id}.
+        # Was 404 {"detail":"No documents found for the given query"}; that divergence
+        # was pinned by #52 and is now removed. Core has ZERO call sites of this route
+        # (`git grep query_multiple` == 0 at Core 881a124cf and Candidate B) and asked
+        # Files to unify empty -> []/200 in a separate explicit PR; see
+        # C:/fswt/.coord/CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md (Q3). This branch
+        # covers both "no hits" and "hits all filtered out by entitlement" -- exactly as
+        # /query collapses both into [] -- so no auth/validation error is masked here
+        # (auth is enforced by _require_action above; a genuine fault still raises 500).
         if not documents:
-            raise HTTPException(
-                status_code=404, detail="No documents found for the given query"
-            )
+            return []
 
         return documents
     except HTTPException as http_exc:

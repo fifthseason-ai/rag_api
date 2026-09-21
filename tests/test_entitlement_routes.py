@@ -4,6 +4,7 @@ Negative space: a caller-supplied id outside the token entitlement must never be
 read, embedded or deleted; an action not granted by the token must be refused; a
 document owned by an unauthorized entity must never be returned.
 """
+import uuid
 import io
 import os
 import datetime
@@ -283,8 +284,13 @@ def test_query_multiple_filters_unauthorized():
         json={"query": "q", "file_ids": ["testid1", "testid2"], "k": 2},
         headers=h,
     )
-    # All candidate docs belong to another entity -> nothing authorized -> 404.
-    assert r.status_code == 404
+    # All candidate docs belong to another entity -> filtered out, not leaked -> [] 200.
+    # This is the SAME "no authorized results" outcome /query gives for the identical case
+    # (see test_query_file_id_filters_unauthorized_docs). It was 404 until the Q3 alignment
+    # (CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md); the caller's own authorization is enforced
+    # separately by _require_action (a caller without read still gets 401/403 before this).
+    assert r.status_code == 200
+    assert r.json() == []
 
 
 # --- tenant tag on embed (D-KSPT-1) ----------------------------------------
@@ -296,9 +302,11 @@ def test_embed_stores_tenant_id_in_metadata(monkeypatch):
     def fake_prepare(
         data, file_id, user_id, clean_content, document_origin_type=None,
         filename=None, link=None, subscription_id=None, tenant_id=None,
+        ingest_id=None,
     ):
         captured["tenant_id"] = tenant_id
         captured["user_id"] = user_id
+        captured["ingest_id"] = ingest_id
         return [Document(page_content="x", metadata={"file_id": file_id, "user_id": user_id})]
 
     monkeypatch.setattr(document_routes, "_prepare_documents_sync", fake_prepare)
@@ -310,6 +318,8 @@ def test_embed_stores_tenant_id_in_metadata(monkeypatch):
     assert r.status_code == 200, r.text
     assert captured["tenant_id"] == "tenantXYZ"
     assert captured["user_id"] == "userA"
+    # F03: the route mints and passes an ingest_id (a real UUID, not the stub default None).
+    assert captured["ingest_id"] and uuid.UUID(captured["ingest_id"]).version == 4
 
 
 # --- pgvector debug record routes (reviewer F1) -----------------------------
