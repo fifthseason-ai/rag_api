@@ -125,6 +125,11 @@ PDF_OCR_MAX_PAGES = int(get_env_variable("PDF_OCR_MAX_PAGES", "50"))
 # reports the remaining 87 pages as not attempted. A document needing more OCR than this
 # is reported partial with stopped_reason=time_limit, never silently truncated.
 PDF_OCR_TIME_BUDGET_SECONDS = float(get_env_variable("PDF_OCR_TIME_BUDGET_SECONDS", "60"))
+# How long a write waits for another write of the SAME file_id to finish (FILES-01 F02)
+# before giving up with nothing stored. Core's /embed client timeout -- the same 120 s the
+# OCR budget above is derived from: waiting longer than the caller would is pointless, and
+# a caller that leaves sooner ends the wait itself.
+FILE_WRITE_LOCK_WAIT_SECONDS = float(get_env_variable("FILE_WRITE_LOCK_WAIT_SECONDS", "120"))
 # Bounds page expansion: a page carrying dozens of small images is a figure-heavy page,
 # not a scan, and OCR-ing all of them buys nothing.
 PDF_OCR_MAX_IMAGES_PER_PAGE = int(get_env_variable("PDF_OCR_MAX_IMAGES_PER_PAGE", "8"))
