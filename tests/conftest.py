@@ -69,3 +69,15 @@ class DummyVectorStore:
     def as_retriever(self):
         # Return self or wrap with a dummy retriever if needed.
         return self
+
+
+# -- One writer per file_id (FILES-01 F02) -------------------------------------------
+# The production lock is a Postgres advisory lock on the asyncpg pool, and there is no
+# database here (DSN is a dummy). Every in-memory store double therefore runs WITHOUT
+# serialization, which is stated rather than hidden: tests/utils/test_simultaneous_write.py
+# installs a lock explicitly, and exercises the real advisory lock when RAG_TEST_PG_DSN
+# points at an isolated Postgres.
+from app.routes import document_routes as _document_routes  # noqa: E402
+from app.services.file_write_lock import NoFileWriteLock  # noqa: E402
+
+_document_routes.file_write_lock = NoFileWriteLock()

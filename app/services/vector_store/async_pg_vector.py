@@ -48,6 +48,32 @@ class AsyncPgVector(ExtendedPgVector):
         executor = executor or self._get_thread_pool()
         return await self._run_in_executor(executor, super().get_all_ids)
 
+    async def get_row_uuids(
+        self,
+        file_id: str,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        executor=None,
+    ) -> list[str]:
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor, super().get_row_uuids, file_id, user_id, tenant_id
+        )
+
+    async def delete_rows_by_uuid(self, row_uuids: list[str], executor=None) -> int:
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor, super().delete_rows_by_uuid, row_uuids
+        )
+
+    async def get_ids_for_entities(
+        self, entity_ids: list[str], executor=None
+    ) -> list[str]:
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor, super().get_ids_for_entities, entity_ids
+        )
+
     async def get_filtered_ids(
         self, ids: list[str], user_id: Optional[str] = None, document_origin_type: Optional[str] = None, subscription_id: Optional[str] = None, executor=None
     ) -> list[str]:

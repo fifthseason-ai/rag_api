@@ -125,6 +125,11 @@ PDF_OCR_MAX_PAGES = int(get_env_variable("PDF_OCR_MAX_PAGES", "50"))
 # reports the remaining 87 pages as not attempted. A document needing more OCR than this
 # is reported partial with stopped_reason=time_limit, never silently truncated.
 PDF_OCR_TIME_BUDGET_SECONDS = float(get_env_variable("PDF_OCR_TIME_BUDGET_SECONDS", "60"))
+# How long a write waits for another write of the SAME file_id to finish (FILES-01 F02)
+# before giving up with nothing stored. Core's /embed client timeout -- the same 120 s the
+# OCR budget above is derived from: waiting longer than the caller would is pointless, and
+# a caller that leaves sooner ends the wait itself.
+FILE_WRITE_LOCK_WAIT_SECONDS = float(get_env_variable("FILE_WRITE_LOCK_WAIT_SECONDS", "120"))
 # Bounds page expansion: a page carrying dozens of small images is a figure-heavy page,
 # not a scan, and OCR-ing all of them buys nothing.
 PDF_OCR_MAX_IMAGES_PER_PAGE = int(get_env_variable("PDF_OCR_MAX_IMAGES_PER_PAGE", "8"))
@@ -148,6 +153,29 @@ PDF_OCR_LOW_CONFIDENCE_BELOW = float(
 # being tuned. This matters because a sideways scan loses ~60% of its characters while
 # mean confidence stays HIGH (0.89-0.96 across fixtures): confidence alone cannot see it.
 PDF_OCR_SIDEWAYS_BOX_RATIO = float(get_env_variable("PDF_OCR_SIDEWAYS_BOX_RATIO", "0.6"))
+
+# --- Bounded NATIVE PDF extraction (FILES-01) ---
+#
+# THE MECHANISM IS HERE; THE NUMBERS ARE THE OPERATOR'S. Both bounds default to 0 = OFF, so with
+# no configuration this service reads a native PDF exactly as it did before. That is deliberate:
+# a safe value depends on facts this lane cannot read -- the ECS task's memory limit, the load
+# balancer's idle timeout, and the ingress body cap actually in force -- and a number chosen
+# without them would be a prediction dressed as a measurement. Twice already in this lane a bound
+# justified from the wrong measurement had to be corrected.
+#
+# What the bounds protect against, measured in the shipped lite image: an unbounded native PDF
+# keeps parsing and allocating long after every timeout in the chain has expired, for a response
+# no caller is still waiting for -- and a worker killed for memory produces none of the honest
+# failure contract (retryable 503, actionable 400, log reference), just a dropped connection.
+# See evidence FILES-01 native-pdf-capacity for the measured curve at the size the edge permits.
+#
+# When a bound stops the work, every page already read is KEPT and the receipt reports `partial`
+# with the bound that stopped it. A truncated extraction is never reported as complete, and never
+# as empty.
+PDF_EXTRACT_MAX_PAGES = int(get_env_variable("PDF_EXTRACT_MAX_PAGES", "0"))
+PDF_EXTRACT_TIME_BUDGET_SECONDS = float(
+    get_env_variable("PDF_EXTRACT_TIME_BUDGET_SECONDS", "0")
+)
 
 # --- Hybrid retrieval (VI-436) ---
 # Enable BM25/keyword full-text search alongside the dense vector search and
