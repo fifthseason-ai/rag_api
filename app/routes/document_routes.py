@@ -1501,6 +1501,7 @@ _UNIT_LOCATOR_KEYS = (
     ("page", "page"),           # PDF: 0-indexed page (SafePyPDFLoader / pypdf)
     ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
     ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
+    ("row", "row"),             # CSV: 0-indexed data row (RowCSVLoader / langchain CSVLoader)
 )
 
 
@@ -1573,9 +1574,13 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       never read as `complete` on the field consumers already check --
                       including when every page yielded some text the engine does not
                       vouch for. Nonempty text is not success.
-      locator_kind:   'page' | 'slide' | 'sheet' | 'none'
+      locator_kind:   'page' | 'slide' | 'sheet' | 'row' | 'none'
+                      NEW 2026-09-20: 'row' (CSV). Core's two consumers of this field
+                      (sourceLifecycle.js, ingestionReceipts.js) pass any string through
+                      and default only a NON-string to 'none', so a new member is additive
+                      -- measured at release head e3dbdf296, not assumed.
       units_total / units_extracted / units_empty / units_image_only
-      empty_locators: sorted locators (page ints / slide ints / sheet names) of
+      empty_locators: sorted locators (page ints / slide ints / sheet names / row ints) of
                       every unit that yielded NO extractable text (locator-bearing
                       units only)
       reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
@@ -1921,6 +1926,30 @@ def _assert_extractable_content(
                 f"on the file: pages beyond the bound were never read and may well contain "
                 f"text. Raise PDF_EXTRACT_MAX_PAGES / PDF_EXTRACT_TIME_BUDGET_SECONDS, or "
                 f"split the document. Nothing was stored."
+            )
+        elif receipt.get("locator_kind") == "row":
+            # THE FILE PARSED. Every row it parsed into is present and none of them
+            # yielded a value -- a different fact from a file that could not be read. The
+            # generic message below would accuse it of being empty, image-only, corrupted
+            # or password-protected: four things it demonstrably is not, since we counted
+            # its rows.
+            #
+            # Stated as a fact about the PARSE, not about the file, because those can
+            # differ: a repeated column name collapses in csv.DictReader and its earlier
+            # columns never reach us, so a file with visible data can parse to nothing.
+            # The message says so rather than contradicting what the operator can see.
+            #
+            # This branch is reachable ONLY because of the CSV row locator. Before it, a
+            # file like this returned 200 and indexed its column labels, so this guard was
+            # never reached for it -- a repair that makes a new input class reachable
+            # leaves the guard at the end of that path untested unless someone looks.
+            message = (
+                f"'{name}' parsed as {receipt['units_total']} row(s) and none of them "
+                f"yielded a value, so there is nothing to store. That is a statement "
+                f"about what was READ, not about what the file contains: if it visibly "
+                f"has data, check for repeated column names — a repeated header collapses "
+                f"and only the last column of that name survives the parse. The file is "
+                f"not unreadable and it is not protected. Nothing was stored."
             )
         else:
             message = (
