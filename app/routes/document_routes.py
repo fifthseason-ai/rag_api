@@ -54,6 +54,7 @@ from app.models import (
     StoreDocument,
     QueryRequestBody,
     QueryByEntityBody,
+    QueryHit,
     DocumentResponse,
     QueryMultipleBody,
     DeleteDocumentsBody,
@@ -1092,7 +1093,7 @@ async def _retrieve_documents(
     return await rerank(query, candidates, top_n=top_n)
 
 
-@router.post("/query")
+@router.post("/query", response_model=List[QueryHit])
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
     request: Request,
