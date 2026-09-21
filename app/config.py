@@ -154,6 +154,28 @@ PDF_OCR_LOW_CONFIDENCE_BELOW = float(
 # mean confidence stays HIGH (0.89-0.96 across fixtures): confidence alone cannot see it.
 PDF_OCR_SIDEWAYS_BOX_RATIO = float(get_env_variable("PDF_OCR_SIDEWAYS_BOX_RATIO", "0.6"))
 
+# --- Mixed text/image page OCR (FILES-01 F05) ---
+#
+# A page WITH a text layer may ALSO carry an image holding text the layer lacks (a scanned
+# body under a typed header). #66 disclosed that gap (image_ocr_coverage=not_attempted);
+# this reads it: when ON, a native page's embedded image is OCR'd through the SAME local
+# adapter and budget as a scanned page, and any text it yields that the layer does not
+# already contain is stored as a sibling chunk citing the same page. Coverage then flips to
+# `attempted`.
+#
+# DEFAULT OFF, on purpose. With it off, behaviour is byte-identical to before (native pages
+# are never OCR'd) and the honest disclosure from #66 stands. Turning it ON costs ~1.3 s per
+# text-layer page that carries an image (measured, F05 audit) -- a cost/latency choice that
+# belongs to the operator, not a default this service imposes. It never calls a paid or
+# network provider; the paid fallback stays held.
+PDF_OCR_MIXED_PAGE = get_env_variable("PDF_OCR_MIXED_PAGE", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+    "t",
+)
+
 # --- Bounded NATIVE PDF extraction (FILES-01) ---
 #
 # THE MECHANISM IS HERE; THE NUMBERS ARE THE OPERATOR'S. Both bounds default to 0 = OFF, so with
