@@ -39,12 +39,24 @@ from fastapi.testclient import TestClient
 from main import app
 from app.services.vector_store.async_pg_vector import AsyncPgVector
 from app.utils.document_loader import (
+    EncryptedDocumentError,
+    SheetExcelLoader,
     UnsupportedDocumentError,
+    _OLE2_MAGIC,
+    describe_unsupported_binary,
     get_loader,
     looks_like_binary,
 )
 
 _SECRET = "testsecret"
+
+#: A GENUINE legacy Word-97/Excel-97 workbook (an OLE2 compound file), 5632 bytes, produced by
+#: LibreOffice and audited to carry no author/host/personal metadata — only Calc boilerplate and a
+#: synthetic content marker. It is the one fixture in this suite that is COPIED rather than built at
+#: test time: openpyxl (and every library in the test image) writes the .xlsx ZIP format, not the
+#: OLE2 .xls binary, so a genuinely-PARSING legacy .xls cannot be generated here. It exists so the
+#: control below proves a real .xls keeps PARSING under this change, not merely that it routes.
+_LEGACY_XLS = os.path.join(os.path.dirname(__file__), "fixtures", "legacy.xls")
 
 
 # ===========================================================================
@@ -439,3 +451,156 @@ def test_embed_upload_route_refuses_an_unsupported_file(client, tmp_path):
     assert r.status_code == 422, r.text
     assert r.json()["detail"]["extraction"]["verdict"] == "unsupported"
     assert client.inserted_batches == []
+
+
+# ===========================================================================
+# OLE2 Office binaries (F-OLE2-NAME)
+#
+# An OLE2 compound file (legacy .doc/.xls/.ppt, or an ENCRYPTED OOXML file) that arrives with an
+# UNKNOWN extension and no Office content type falls through to this branch. It was refused CORRECTLY
+# — verdict `unsupported`, zero rows — but named "not a text-based format", the one string the
+# module's own comment says is NOT actionable, because `_BINARY_SIGNATURES` had no OLE2 entry and so
+# `describe_unsupported_binary` returned None. Measured on origin/main through /embed with a genuine
+# OLE2 container: 422, verdict `unsupported`, units_total=0, message ending "is not a text-based
+# format". This section names it as an Office binary WITHOUT making the refusal over-eager, and the
+# controls prove the .xls / .xlsx / .doc branches — which route by extension or content type BEFORE
+# this table is ever consulted — keep their existing verdicts.
+# ===========================================================================
+
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_XLS_MIME = "application/vnd.ms-excel"
+
+
+def make_ole2_office_binary(path, tmp_path):
+    """A GENUINE OLE2 compound file, built at test time: a real encrypted OOXML workbook produced by
+    msoffcrypto's own encryptor. Encryption wraps the package in an OLE2 container, so its first bytes
+    ARE the CFB magic — exactly the shape a legacy .doc/.xls/.ppt or any encrypted Office file has, and
+    the shape that used to be named generically. Not a hand-rolled header: a header with random bytes
+    behind it could pass the weaker UTF-16/chardet text checks by accident, so the fixture must be a
+    real high-entropy container to exhibit the defect through the whole decision."""
+    from openpyxl import Workbook
+    from msoffcrypto.format.ooxml import OOXMLFile
+
+    plain = tmp_path / "plain-source.xlsx"
+    wb = Workbook()
+    wb.active.title = "S1"
+    wb.active["A1"] = "confidential total"
+    wb.save(str(plain))
+    with open(plain, "rb") as src, open(path, "wb") as out:
+        OOXMLFile(src).encrypt("hunter2", out)
+
+
+def test_ole2_head_is_named_as_an_office_binary_not_none(tmp_path):
+    """Unit level: the root cause was `describe_unsupported_binary` returning None for OLE2. It now
+    names the format, and `looks_like_binary` agrees the bytes are binary (they are)."""
+    path = tmp_path / "container.bin"
+    make_ole2_office_binary(path, tmp_path)
+    head = path.read_bytes()[:8192]
+
+    assert head.startswith(_OLE2_MAGIC)  # fixture premise: it really is an OLE2 container
+    described = describe_unsupported_binary(head)
+    assert described is not None
+    assert "office" in described.lower()
+    assert looks_like_binary(head) is True
+
+
+def test_ole2_with_unknown_extension_is_named_as_office_not_generic(tmp_path):
+    """The finding. A genuine OLE2 file with an unknown extension is still REFUSED (`unsupported`,
+    the refusal must not become over-eager the other way), but is now NAMED as an Office binary
+    instead of the un-actionable "not a text-based format"."""
+    path = tmp_path / "container.bin"
+    make_ole2_office_binary(path, tmp_path)
+
+    with pytest.raises(UnsupportedDocumentError) as exc:
+        get_loader("container.bin", "application/octet-stream", str(path))
+
+    message = str(exc.value)
+    assert exc.value.verdict == "unsupported"
+    # Named, not generic — this is the exact string the fix removes for OLE2.
+    assert "not a text-based format" not in message.lower()
+    assert "office" in message.lower()
+    # Still actionable about what WOULD work.
+    assert "upload" in message.lower()
+
+
+def test_embed_refuses_ole2_unknown_extension_named_with_no_rows(client, tmp_path):
+    """Route level, the wire the caller sees. Same 422 / `unsupported` / zero rows as before — the
+    refusal is unchanged — but the message on the wire now names the Office binary."""
+    path = tmp_path / "container.bin"
+    make_ole2_office_binary(path, tmp_path)
+
+    r = client.post(
+        "/embed",
+        data={"file_id": "f-ole2-unknown", "entity_id": "userA"},
+        files={"file": ("container.bin", io.BytesIO(path.read_bytes()), "application/octet-stream")},
+        headers=_hdr(ent=["userA"], act=["write"]),
+    )
+
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["extraction"]["verdict"] == "unsupported"
+    assert detail["extraction"]["status"] == "unsupported"
+    assert detail["extraction"]["units_total"] == 0
+    assert "office" in detail["message"].lower()
+    assert "not a text-based format" not in detail["message"].lower()
+    assert client.inserted_batches == []  # zero rows written for a refused file
+
+
+# --- controls: the .xls / .xlsx / .doc branches are untouched ---------------
+
+
+def test_encrypted_xlsx_keeps_its_encrypted_verdict(tmp_path):
+    """CONTROL. An encrypted .xlsx IS an OLE2 container, but it arrives with its real extension/type
+    and is routed to SheetExcelLoader BEFORE the signature table. It must still get `encrypted`, not
+    be relabelled `unsupported` by the new OLE2 signature."""
+    path = tmp_path / "protected.xlsx"
+    make_ole2_office_binary(path, tmp_path)  # a genuine encrypted OOXML workbook
+
+    loader, known_type, ext = get_loader("protected.xlsx", _XLSX_MIME, str(path))
+    assert isinstance(loader, SheetExcelLoader) and known_type is True and ext == "xlsx"
+
+    with pytest.raises(EncryptedDocumentError) as exc:
+        loader.load()
+    assert exc.value.verdict == "encrypted"
+    assert not isinstance(exc.value, UnsupportedDocumentError)
+
+
+def test_genuine_legacy_xls_still_parses_and_is_not_refused():
+    """CONTROL. A REAL legacy .xls (OLE2), the case the module cannot generate. It routes to
+    SheetExcelLoader by extension, parses, and keeps its sheet-level citation — the OLE2 signature
+    entry does not steal it into an `unsupported` refusal. `describe_unsupported_binary` WOULD name
+    its head as Office, which is exactly why the routing-before-signatures order matters and is
+    asserted here: the file must never reach that function."""
+    loader, known_type, ext = get_loader("legacy.xls", _XLS_MIME, _LEGACY_XLS)
+    assert isinstance(loader, SheetExcelLoader) and known_type is True and ext == "xls"
+
+    docs = loader.load()
+    text = " ".join(d.page_content for d in docs)
+    assert "LEGACY-CONTENT-MARKER-4471" in text  # it genuinely parsed, not refused
+    assert any(d.metadata.get("page_name") == "Sheet1" for d in docs)  # citation preserved
+
+    # The fixture head DOES match the new signature; the .xls branch owning it first is the invariant.
+    with open(_LEGACY_XLS, "rb") as f:
+        assert describe_unsupported_binary(f.read(8192)) is not None
+
+
+def test_doc_branch_is_unchanged_by_the_ole2_signature(tmp_path):
+    """CONTROL. A .doc arrives on the Word branch (Docx2txtLoader) by extension/content type, never
+    through the fallback signature check. Routing it must not raise the OLE2 `unsupported` verdict —
+    whatever the Word loader then does with the bytes is out of this row's scope (see F-LEGACY3)."""
+    path = tmp_path / "memo.doc"
+    make_ole2_office_binary(path, tmp_path)
+
+    # get_loader routes without reading bytes for a signature; it must not raise here.
+    loader, known_type, ext = get_loader("memo.doc", "application/msword", str(path))
+    assert type(loader).__name__ == "Docx2txtLoader"
+    assert ext == "doc"
+
+
+def test_ole2_signature_and_excel_container_check_share_one_literal():
+    """CONTROL for the de-duplication: `SheetExcelLoader`'s container check and the fallback signature
+    table must use the SAME OLE2 literal, or an encrypted-vs-corrupt decision could drift from the
+    naming decision. Pins them to one module-level constant."""
+    assert _OLE2_MAGIC == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+    assert SheetExcelLoader._OLE2_MAGIC is _OLE2_MAGIC
