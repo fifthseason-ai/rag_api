@@ -1249,7 +1249,17 @@ async def query_embeddings_by_file_id(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/query/{entity_id}")
+# response_model as on `/query` (#45, F-QC1): SIBLING ROUTE, MEASURED byte-identical.
+# The non-empty wire of this route is byte-for-byte the same as `/query` -- same envelope
+# `[[document, score], ...]`, same document keys `id`/`metadata`/`page_content`/`type`,
+# same OPEN `metadata` dict -- so the model that describes `/query` describes this one, and
+# publishing it here is the additive close of an asymmetry, not a redesign. `metadata` MUST
+# stay open: FastAPI re-serialises through the model, so naming its keys would DELETE every
+# locator (page/page_label/page_name/slide_number/row/...) a citation is built from while the
+# diff read as purely additive. The empty result of THIS route is `[]` (200), unlike
+# `/query_multiple`, which answers 404 -- that divergence is pinned in the test file, not
+# changed here (changing it would move the wire and is Core/Demian's contract call).
+@router.post("/query/{entity_id}", response_model=List[QueryHit])
 async def query_embeddings_by_entity_id(
     entity_id: str,
     body: QueryByEntityBody,
@@ -3048,7 +3058,16 @@ async def embed_file_upload(
     }
 
 
-@router.post("/query_multiple")
+# response_model as on `/query` (#45, F-QC1): SIBLING ROUTE, MEASURED byte-identical on the
+# SUCCESS path. The model describes only the 2xx body, which this route reaches ONLY with a
+# non-empty list (an empty result raises 404 before returning). That 404 -- `{"detail": ...}` --
+# is produced by the exception handler, NOT the response_model, so declaring the model here does
+# not touch it; byte-identity of both the 200 body and the 404 body was proven before/after (see
+# the test file). Empty-result behaviour therefore DIFFERS from `/query` and `/query/{entity_id}`,
+# which return `[]` 200: that difference is real and undocumented, so it is PINNED in the test
+# file rather than changed here (changing it would move the wire and is Core/Demian's call).
+# `metadata` stays an OPEN dict for the same silent-deletion reason as `/query`.
+@router.post("/query_multiple", response_model=List[QueryHit])
 async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
     # Entitlement (D-KSPT-1): file ids are only filters. Constrain retrieval to
     # the authorized entity set and defensively drop any document owned by an
