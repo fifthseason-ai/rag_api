@@ -1847,6 +1847,25 @@ _OCR_WEAK_REASONS = frozenset({"ocr_low_confidence", "ocr_orientation_suspect"})
 _OCR_STOP_REASONS = frozenset({"page_limit", "time_limit", "cancelled", "budget_exhausted"})
 
 
+#: D-F05 image/OCR coverage states, worst first. The document rollup takes the WORST
+#: across its pages, so an un-inspected or un-OCR'd image anywhere is never rounded up.
+#: `not_applicable` (no image at all) ranks best -- there is nothing to cover.
+_IMAGE_COVERAGE_RANK = {"unknown": 0, "not_attempted": 1, "attempted": 2, "not_applicable": 3}
+
+#: Document-level image coverage that means "some image content's coverage is not
+#: established", so a `complete` status would overstate what was read (D-F05).
+_IMAGE_COVERAGE_INCOMPLETE = {"unknown", "not_attempted"}
+
+
+def _worse_image_coverage(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """The least-covered of two image-coverage states (None = absent, ignored)."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if _IMAGE_COVERAGE_RANK.get(a, 0) <= _IMAGE_COVERAGE_RANK.get(b, 0) else b
+
+
 def _extraction_receipt(data: Iterable[Document]) -> dict:
     """Build the additive extraction receipt for the /embed response (KI-02 WP-G1).
 
@@ -1962,6 +1981,7 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                 "ocr": None,
                 "source": None,
                 "attempted": False,
+                "image_ocr_coverage": None,
             }
             order.append(loc)
         pc = getattr(d, "page_content", None)
@@ -1977,6 +1997,13 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                 units[loc]["ocr_confidence"] = meta["ocr_confidence"]
         if meta.get("text_source") is not None:
             units[loc]["source"] = meta["text_source"]
+        if meta.get("image_ocr_coverage") is not None:
+            # D-F05: worst-case wins per unit. A unit split across several Documents (or a
+            # unit some of whose pages were OCR'd and some not) takes the least-covered
+            # state, so a receipt can never round an un-inspected page up to "attempted".
+            units[loc]["image_ocr_coverage"] = _worse_image_coverage(
+                units[loc].get("image_ocr_coverage"), meta["image_ocr_coverage"]
+            )
         if meta.get(STOPPED_KEY) is not None:
             # Scanned across ALL documents rather than read off the last one: which page
             # carries the marker is an implementation detail of the loader, and a receipt
@@ -2136,6 +2163,44 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             "pages_not_included": extraction_stop["pages_not_included"],
         }
         if receipt["status"] == "complete":
+            receipt["status"] = "partial"
+
+    # --- D-F05: text coverage and image/OCR coverage, recorded SEPARATELY -----------
+    #
+    # Richard's ruling (2026-09-21): a text layer alone does not establish full coverage
+    # of a page containing images. The loader stamps each page's `image_ocr_coverage`
+    # (not_applicable / not_attempted / attempted / unknown); here they roll up to the
+    # WORST across the document, so an un-OCR'd or un-inspected image anywhere is never
+    # rounded up. Present whenever a real embedded image is seen (NOT gated on the OCR
+    # kill switch), so disclosure does not depend on OCR having run.  
+    image_states = [
+        units[loc]["image_ocr_coverage"]
+        for loc in order
+        if units[loc]["image_ocr_coverage"] is not None
+    ]
+    doc_image_coverage = None
+    for st in image_states:
+        doc_image_coverage = _worse_image_coverage(doc_image_coverage, st)
+    # Present the block ONLY when there is real image content to speak to. An imageless
+    # native PDF rolls up to `not_applicable`, and emitting a block for it would break the
+    # kill switch's byte-identical guarantee for the format the feature touches; there is
+    # also nothing to disclose. `attempted`/`not_attempted`/`unknown` all get the block.
+    if doc_image_coverage is not None and doc_image_coverage != "not_applicable":
+        # Text dimension, independent of the image downgrade below: what the text layer /
+        # OCR actually produced across units.
+        text_coverage = (
+            "none" if units_extracted == 0
+            else "complete" if units_extracted == units_total
+            else "partial"
+        )
+        receipt["coverage"] = {"text": text_coverage, "image_ocr": doc_image_coverage}
+        # A page whose image was never OCR'd (or could not be inspected) means the page
+        # may carry text this service did not read. `complete` would claim otherwise on
+        # the exact field consumers gate on, so it is downgraded -- the same rule the
+        # escalation and read-bound signals already enforce for the other ways a document
+        # can be short. `not_applicable` (no image) and `attempted` (image was OCR'd) do
+        # not downgrade. `empty` is left alone (the 422 path).
+        if receipt["status"] == "complete" and doc_image_coverage in _IMAGE_COVERAGE_INCOMPLETE:
             receipt["status"] = "partial"
 
     # PER-PAGE PROVENANCE: which engine produced which page's text. Core needs this at

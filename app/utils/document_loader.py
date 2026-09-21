@@ -876,6 +876,46 @@ class SafePyPDFLoader:
             self._ocr_reader_obj = reader
         return self._ocr_reader_obj
 
+    def _native_page_image_coverage(self, page_index) -> str:
+        """D-F05: image/OCR coverage for a page kept from the NATIVE text layer.
+
+        Returns one of:
+          "not_applicable" — the page carries no embedded raster image, so there is no
+                             image coverage to report;
+          "not_attempted"  — the page carries an image that was NOT OCR'd (the text layer
+                             already produced text), so whether that image holds text the
+                             layer lacks is unknown;
+          "unknown"        — the page could not be inspected, so coverage is undetermined
+                             (never silently reported as `not_applicable`).
+
+        Cheap by construction: it reads the page's `/Resources /XObject` dictionary for a
+        `/Subtype /Image` entry and NEVER decodes pixels or runs OCR, so a native PDF does
+        not pay for the engine. The reader is opened at most once per document and released
+        by `close_ocr_reader`.
+        """
+        try:
+            reader = self._ocr_reader()
+            if not (isinstance(page_index, int) and 0 <= page_index < len(reader.pages)):
+                return "unknown"
+            page = reader.pages[page_index]
+            resources = page.get("/Resources")
+            xobjects = resources.get("/XObject") if resources is not None else None
+            if not xobjects:
+                return "not_applicable"
+            for ref in xobjects.values():
+                obj = ref.get_object()
+                if obj.get("/Subtype") == "/Image":
+                    return "not_attempted"
+            return "not_applicable"
+        except Exception as error:
+            # An inspection failure must not fail the load, and it must not be reported as
+            # "no image" -- coverage is genuinely undetermined here.
+            logger.info(
+                "Could not inspect page %s of %s for images: %s",
+                page_index, self.filepath, error,
+            )
+            return "unknown"
+
     def close_ocr_reader(self) -> None:
         self._ocr_reader_obj = None
         if self._ocr_handle is not None:
@@ -905,6 +945,21 @@ class SafePyPDFLoader:
                     # supposed to be total.
                     if PDF_OCR_ENABLED:
                         metadata.setdefault("text_source", "native")
+                    # D-F05 (Richard, 2026-09-21): a text layer alone does not prove the
+                    # page is fully covered. If this native page ALSO carries an embedded
+                    # image, that image was NOT OCR'd -- native text won, or OCR is off --
+                    # so whether it holds text the layer lacks is unknown; disclose it
+                    # rather than let the receipt read `complete`. This is a COVERAGE fact,
+                    # not OCR output, so it is NOT gated on the kill switch: turning OCR
+                    # off does not make an unread image become fully covered. Detection is
+                    # a cheap resource-dict scan (no pixel decode, no OCR), so a native PDF
+                    # still does not pay for the engine, and an imageless page reports
+                    # `not_applicable` (no receipt block, byte-identical to before). A
+                    # probe that cannot tell says `unknown`, never silently `not_applicable`.
+                    metadata.setdefault(
+                        "image_ocr_coverage",
+                        self._native_page_image_coverage(metadata.get("page")),
+                    )
                     yield document
                     continue
                 if budget is None:
@@ -933,6 +988,10 @@ class SafePyPDFLoader:
                     continue
                 metadata["ocr_reason"] = result.reason
                 metadata["ocr_attempted"] = result.attempted
+                # D-F05: the image content of this page WAS run through OCR. `attempted`
+                # regardless of how well it read -- how well is already carried by
+                # ocr_reason/confidence and rolled into the receipt's ocr/escalation.
+                metadata["image_ocr_coverage"] = "attempted"
                 if result.images_seen:
                     metadata["ocr_images"] = result.images_seen
                 if result.notes:
