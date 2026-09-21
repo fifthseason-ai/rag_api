@@ -2,7 +2,7 @@
 import hashlib
 from enum import Enum
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 
 class DocumentResponse(BaseModel):
@@ -24,6 +24,45 @@ class StoreDocument(BaseModel):
     filename: str
     file_content_type: str
     file_id: str
+
+
+class QueryDocument(BaseModel):
+    """One document as `/query` ALREADY returns it -- a description, not a redesign.
+
+    Every field here was read off the wire before this model existed
+    (`evidence/.../joint-run/F-QC1-WIRE-BEFORE.json`), and the model is deliberately no
+    narrower than what was measured.
+
+    `metadata` IS AN OPEN DICT AND MUST STAY ONE. Its keys differ per format: a spreadsheet
+    carries `page_name`/`page_number`, a PDF `page`/`page_label`/`total_pages`, a presentation
+    `slide_number`/`slide_title`, a CSV `row`. Twenty-seven distinct keys across five formats.
+    FastAPI validates and re-serialises through a response_model, so typing this dict would
+    DELETE every key not named -- including the locators a citation is built from -- and the
+    change would read as additive while removing the field the consumer depends on.
+
+    `id` and `type` are declared for the same reason: LangChain's Document serialises them, and
+    omitting them here would drop them from the response.
+
+    IT ALSO VALIDATES, WHICH IS A CHANGE. Declaring a response_model does not only describe the
+    response -- FastAPI raises `ResponseValidationError` (a 500) where the route previously
+    serialised whatever it was handed. Independent review demonstrated it with a `None` score,
+    which used to come back as `200` with `score: null`.
+
+    That is NOT reachable today: `_hybrid_or_dense_search` calls `round(score, 4)`, which raises on a
+    non-numeric score before any response is built, and `page_content` is always a `str`. The
+    upstream guard is pinned by a test rather than left as a comment, because this paragraph
+    going stale is exactly how a 500 appears later with nothing pointing at the cause.
+    """
+
+    id: Optional[str] = None
+    metadata: dict = {}
+    page_content: str
+    type: Optional[str] = None
+
+
+#: What `/query` returns: a list of (document, similarity score) pairs. The pair is a two-element
+#: JSON array, not an object -- that is the existing wire and this does not change it.
+QueryHit = Tuple[QueryDocument, float]
 
 
 class QueryRequestBody(BaseModel):

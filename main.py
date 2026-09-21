@@ -23,6 +23,7 @@ from app.config import (
     vector_store,
     require_auth_config,
 )
+from app.build_info import build_stamp_middleware, build_summary
 from app.middleware import security_middleware
 from app.routes import document_routes, pgvector_routes
 from app.services.database import PSQLDatabase, ensure_vector_indexes, ensure_file_summaries_table
@@ -88,6 +89,12 @@ app.add_middleware(LogMiddleware)
 
 app.middleware("http")(security_middleware)
 
+# Registered LAST so it runs FIRST (Starlette builds the stack with the most recently added
+# middleware outermost). That ordering is the point: a 401 from the security middleware, a 422
+# from validation and a 404 for an unmatched route all pass back out through this one, so every
+# answer this service gives carries its own identity.
+app.middleware("http")(build_stamp_middleware)
+
 # Set state variables for use in routes
 app.state.CHUNK_SIZE = CHUNK_SIZE
 app.state.CHUNK_OVERLAP = CHUNK_OVERLAP
@@ -101,7 +108,10 @@ if debug_mode:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    # Fallback health route. The router's `/health` is registered first and wins in the deployed
+    # app; both report the same build identity so neither can silently become the uninformative
+    # one. Additive: `status` keeps its existing value and meaning.
+    return {"status": "ok", "build": build_summary()}
 
 
 @app.exception_handler(RequestValidationError)

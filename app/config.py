@@ -149,6 +149,29 @@ PDF_OCR_LOW_CONFIDENCE_BELOW = float(
 # mean confidence stays HIGH (0.89-0.96 across fixtures): confidence alone cannot see it.
 PDF_OCR_SIDEWAYS_BOX_RATIO = float(get_env_variable("PDF_OCR_SIDEWAYS_BOX_RATIO", "0.6"))
 
+# --- Bounded NATIVE PDF extraction (FILES-01) ---
+#
+# THE MECHANISM IS HERE; THE NUMBERS ARE THE OPERATOR'S. Both bounds default to 0 = OFF, so with
+# no configuration this service reads a native PDF exactly as it did before. That is deliberate:
+# a safe value depends on facts this lane cannot read -- the ECS task's memory limit, the load
+# balancer's idle timeout, and the ingress body cap actually in force -- and a number chosen
+# without them would be a prediction dressed as a measurement. Twice already in this lane a bound
+# justified from the wrong measurement had to be corrected.
+#
+# What the bounds protect against, measured in the shipped lite image: an unbounded native PDF
+# keeps parsing and allocating long after every timeout in the chain has expired, for a response
+# no caller is still waiting for -- and a worker killed for memory produces none of the honest
+# failure contract (retryable 503, actionable 400, log reference), just a dropped connection.
+# See evidence FILES-01 native-pdf-capacity for the measured curve at the size the edge permits.
+#
+# When a bound stops the work, every page already read is KEPT and the receipt reports `partial`
+# with the bound that stopped it. A truncated extraction is never reported as complete, and never
+# as empty.
+PDF_EXTRACT_MAX_PAGES = int(get_env_variable("PDF_EXTRACT_MAX_PAGES", "0"))
+PDF_EXTRACT_TIME_BUDGET_SECONDS = float(
+    get_env_variable("PDF_EXTRACT_TIME_BUDGET_SECONDS", "0")
+)
+
 # --- Hybrid retrieval (VI-436) ---
 # Enable BM25/keyword full-text search alongside the dense vector search and
 # fuse the two result sets. When disabled, retrieval behaves exactly as before

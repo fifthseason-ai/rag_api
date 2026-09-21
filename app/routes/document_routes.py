@@ -22,6 +22,7 @@ from fastapi import (
     Query,
     status,
 )
+from fastapi.responses import JSONResponse
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import asyncio
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
     from langchain_community.vectorstores.pgvector import PGVector as PgVector
 
+from app.build_info import build_summary
 from app.config import (
     logger,
     vector_store,
@@ -52,6 +54,7 @@ from app.models import (
     StoreDocument,
     QueryRequestBody,
     QueryByEntityBody,
+    QueryHit,
     DocumentResponse,
     QueryMultipleBody,
     DeleteDocumentsBody,
@@ -73,6 +76,12 @@ from app.utils.document_loader import (
     process_documents,
     cleanup_temp_encoding_file,
     DocumentVerdictError,
+)
+from app.utils.extraction_budget import (
+    ATTEMPTED_KEY,
+    NOT_INCLUDED_KEY,
+    STOPPED_KEY,
+    ExtractionBudget,
 )
 from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget
 from app.utils.health import is_health_ok
@@ -369,6 +378,36 @@ def _is_pandoc_missing(error: BaseException) -> bool:
     )
 
 
+def _is_libreoffice_missing(error: BaseException) -> bool:
+    """Whether this failure is LibreOffice not being installed on the server.
+
+    THE SAME CLASS AS `_is_pandoc_missing`, found by uploading a legacy `.ppt` for the first time.
+    F2 recorded `.xls .ppt .epub .rst .xml` as owned backlog and nobody had ever run one; measured
+    2026-09-20, `.xls` answers a truthful `422 unsupported` with zero rows and `.ppt` answered
+    **503**.
+
+    503 is "the service is unavailable, retry" -- and this file already says, one function up, why
+    that is the wrong answer to a missing server package: no amount of retrying installs it, and a
+    503 tells Core's listener to retry forever a file that cannot work until an operator acts. That
+    guard was written for the dependency that had been hit rather than for the class, so the next
+    one inherited the defect it was built to prevent.
+
+    `unstructured.partition.common.common.convert_office_doc` raises
+    `FileNotFoundError("soffice command was not found. Please install libreoffice ...")` -- read in
+    the shipped image, not assumed. It is the SOLE argument, so the phrase begins at position 0,
+    and `startswith` closes the same caller-influenceable-substring hole an independent review
+    found in the first pandoc version: a filename can only reach an OSError message through the
+    `[Errno N] strerror: 'path'` form, where it is never at position 0.
+
+    Legacy Office formats are the reachable case, and they are exactly the ones a person still has
+    lying in a folder.
+    """
+    return any(
+        isinstance(link, OSError) and str(link).startswith("soffice command was not found")
+        for link in _causes(error)
+    )
+
+
 def is_service_fault(error: BaseException) -> bool:
     """Whether this failure is OURS. Fail-safe direction: when unsure, say no and do not exonerate
     ourselves -- but never accuse the file either (see `describe_failure`).
@@ -421,6 +460,33 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
         return (
             status.HTTP_400_BAD_REQUEST,
             f"{ERROR_MESSAGES.PANDOC_NOT_INSTALLED} Reference: {reference}.",
+        )
+    if _is_libreoffice_missing(error):
+        # Same repair as pandoc's, for the same reason: permanent until an operator acts, so it
+        # must not be a retryable 503. The message names the format family and the action, because
+        # "the cause is not established" told a caller holding a .ppt nothing at all.
+        logger.error(
+            "File processing failed [reference=%s] [file=%s] [attribution=%s] [type=%s]: %s\nTraceback: %s",
+            reference,
+            name,
+            "service:libreoffice_not_installed",
+            type(error).__name__,
+            error,
+            traceback.format_exc(),
+        )
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            # DELIBERATELY NOT A LIST OF EXTENSIONS. The first version said "a legacy Office
+            # format (.doc, .xls, .ppt) and this service cannot read one", and measurement
+            # showed that to be false for `.xls`: a genuine BIFF8 workbook parses with NO
+            # LibreOffice installed (200, rows stored). `.doc` was never tested, so it is not
+            # claimed either. The enumeration was never load-bearing -- this branch fires on the
+            # soffice error whatever raised it -- so dropping it removes a false claim without
+            # weakening either action.
+            f"'{name}' could not be read: it is in an older Office format that needs LibreOffice, "
+            f"which is not installed on this server. Re-saving it in the current format "
+            f"(.docx, .xlsx, .pptx) will work today; installing LibreOffice is the operator fix. "
+            f"Retrying this upload unchanged will not help. Reference: {reference}.",
         )
     if _is_name_too_long(error):
         # SP-01.15 -- we know exactly what is wrong here, so say it instead of "cause not established".
@@ -493,7 +559,13 @@ async def load_file_content(
     stop = threading.Event()
     try:
         loader, known_type, file_ext = get_loader(
-            filename, content_type, file_path, ocr_budget=OcrBudget(should_stop=stop.is_set)
+            filename,
+            content_type,
+            file_path,
+            ocr_budget=OcrBudget(should_stop=stop.is_set),
+            # Unconfigured by default: `ExtractionBudget` with both bounds at 0 is a no-op,
+            # so this call costs and behaves exactly as before until an operator sets a limit.
+            extraction_budget=ExtractionBudget(),
         )
         loop = asyncio.get_running_loop()
         try:
@@ -574,12 +646,38 @@ async def cleanup_temp_file_async(file_path: str) -> None:
 
 @router.get("/ids")
 async def get_all_ids(request: Request):
-    _require_action(request, "read")
+    """File identifiers the CALLER may see. Previously: every identifier in the store.
+
+    Measured on the wire before this change -- tenant B calls /ids and receives tenant A's
+    `acme-merger-2026-confidential`. The route asserted the `read` ACTION and then ran a
+    query with no entity predicate, so a valid token for any tenant returned a complete
+    list of every file the service held.
+
+    A file identifier is not page content, and it is not nothing either: it is the
+    argument every other route takes, it is frequently the customer's own document id or
+    filename, and the full list is a map of what another tenant holds. The sibling routes
+    `GET /documents` and `/documents/{id}/context` already keep only rows whose `user_id`
+    is within the entitlement; this route was the one that did not.
+    """
+    ent = _require_action(request, "read")
     try:
+        if not hasattr(vector_store, "get_ids_for_entities"):
+            # FAIL CLOSED. The alternative -- falling back to the unscoped list -- is the
+            # exact disclosure this change exists to stop, and it would be invisible
+            # because the response shape is identical.
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    "This vector store cannot scope identifiers to the caller, so no "
+                    "identifiers are returned."
+                ),
+            )
         if isinstance(vector_store, AsyncPgVector):
-            ids = await vector_store.get_all_ids(executor=request.app.state.thread_pool)
+            ids = await vector_store.get_ids_for_entities(
+                ent["entity_ids"], executor=request.app.state.thread_pool
+            )
         else:
-            ids = vector_store.get_all_ids()
+            ids = vector_store.get_ids_for_entities(ent["entity_ids"])
 
         return list(set(ids))
     except HTTPException as http_exc:
@@ -590,29 +688,68 @@ async def get_all_ids(request: Request):
         )
         raise http_exc
     except Exception as e:
+        # The exception text stays in the LOG, never in the response. `str(e)` here was
+        # handing the caller internal class and ORM attribute names, and on a database
+        # fault it would carry connection or schema details -- the same disclosure shape
+        # repaired for PyJWT's own diagnoses in the SEPARATE branch #35, which is NOT in
+        # this branch's base -- independent review correctly pointed out that the earlier
+        # wording here read as though that repair were already present in this tree. It is
+        # the same shape and a different change. The reference ties the caller's report to
+        # this log line without telling them anything about the service.
+        reference = uuid.uuid4().hex[:12]
         logger.error(
-            "Failed to get all IDs | Error: %s | Traceback: %s",
+            "Failed to list ids [reference=%s] | Error: %s | Traceback: %s",
+            reference,
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The identifier list could not be produced. Quote reference "
+                f"{reference} to an operator."
+            ),
+        )
 
 
 @router.get("/health")
 async def health_check():
+    # A FastAPI route that RETURNS a (body, status) tuple does not send that status. The tuple is
+    # serialised as the body, so the caller receives `200 [{"status":"DOWN"},503]` -- a JSON ARRAY,
+    # HTTP 200, on the path that exists to say the service is unwell. Measured on the wire at
+    # 36d4fb6, not inferred: every DOWN answer this service has ever given has been an HTTP 200.
+    #
+    # Two things fail at once and both matter:
+    #   - anything reading the STATUS CODE (a load balancer, an orchestrator, a probe) is told the
+    #     service is healthy while its vector store is unreachable -- failure wearing success's
+    #     clothes, which is the one shape this lane exists to remove;
+    #   - anything reading the BODY gets an array, so `body.status` is undefined and a consumer's
+    #     own "is it up" check silently answers no-to-everything.
+    #
+    # `JSONResponse` sends the status. The body stays an object with the same `status` key and the
+    # same two values, so a caller that was reading `status` correctly on the UP path is unaffected.
     try:
         if await is_health_ok():
-            return {"status": "UP"}
-        else:
-            logger.error("Health check failed")
-            return {"status": "DOWN"}, 503
+            # `build` is additive: `status` keeps its exact existing value and meaning, so a
+            # caller that only reads `status` is unaffected. It is here because this is the route
+            # that actually answers in the deployed app, and a health check that cannot say WHICH
+            # build is healthy leaves the only question a deployment receipt needs unanswerable.
+            return {"status": "UP", "build": build_summary()}
+        logger.error("Health check failed")
+        return JSONResponse(status_code=503, content={"status": "DOWN"})
     except Exception as e:
         logger.error(
             "Error during health check | Error: %s | Traceback: %s",
             str(e),
             traceback.format_exc(),
         )
-        return {"status": "DOWN", "error": str(e)}, 503
+        # `str(e)` is NOT echoed. /health is reachable WITHOUT a token -- the fail-closed identity
+        # middleware exempts it -- so whatever this returns is unauthenticated output, and asyncpg
+        # exceptions carry host names, ports and database names. The operator already has the whole
+        # exception and its traceback in the log line above; the wire gets the verdict only. Same
+        # fix this lane already made on /text (#26), applied to the one route that has no token in
+        # front of it.
+        return JSONResponse(status_code=503, content={"status": "DOWN"})
 
 
 @router.get("/documents", response_model=list[DocumentResponse])
@@ -956,7 +1093,7 @@ async def _retrieve_documents(
     return await rerank(query, candidates, top_n=top_n)
 
 
-@router.post("/query")
+@router.post("/query", response_model=List[QueryHit])
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
     request: Request,
@@ -1079,6 +1216,7 @@ async def _process_documents_async_pipeline(
     file_id: str,
     vector_store: "AsyncPgVector",
     executor: "ThreadPoolExecutor",
+    protected_row_uuids: Optional[List[str]] = None,
 ) -> List[str]:
     """
     Process documents using async producer-consumer pattern for batched embedding and insertion.
@@ -1228,8 +1366,29 @@ async def _process_documents_async_pipeline(
         if all_ids:
             try:
                 logger.warning("Performing rollback of file %s", file_id)
-                await vector_store.delete(ids=[file_id], executor=executor)
-                logger.info("Rollback completed for file %s", file_id)
+                if protected_row_uuids:
+                    # A REPLACEMENT IS IN FLIGHT AND THE OLD VERSION IS STILL THE ONLY GOOD
+                    # COPY. The plain rollback below deletes by custom_id, i.e. EVERY row for
+                    # this file -- which here means the rows this call was supposed to
+                    # supersede, not merely the ones it wrote. Independent review demonstrated
+                    # it end to end: with the production default EMBEDDING_BATCH_SIZE=500, a
+                    # failure on any batch after the first left the file with ZERO rows and
+                    # answered 400, so a caller retrying only on 5xx would treat the document
+                    # as done while the only good copy was gone.
+                    #
+                    # Roll back only what THIS call inserted: everything present now that was
+                    # not present at capture.
+                    protected = set(protected_row_uuids)
+                    current = await vector_store.get_row_uuids(file_id, executor=executor)
+                    inserted = [u for u in current if u not in protected]
+                    await vector_store.delete_rows_by_uuid(inserted, executor=executor)
+                    logger.info(
+                        "Rollback completed for file %s: removed %d newly inserted row(s), "
+                        "kept %d pre-existing", file_id, len(inserted), len(protected),
+                    )
+                else:
+                    await vector_store.delete(ids=[file_id], executor=executor)
+                    logger.info("Rollback completed for file %s", file_id)
             except Exception as cleanup_error:
                 logger.error("Rollback failed for file %s: %s", file_id, cleanup_error)
 
@@ -1242,6 +1401,7 @@ async def _process_documents_batched_sync(
     file_id: str,
     vector_store: "PgVector",
     executor: "ThreadPoolExecutor",
+    protected_row_uuids: Optional[List[str]] = None,
 ) -> List[str]:
     """
     Process documents in batches using synchronous vector store operations.
@@ -1305,10 +1465,29 @@ async def _process_documents_batched_sync(
             ):  # any batch succeeded (i.e., any chunks for this file were inserted)
                 logger.warning("Rolling back file %s due to batch failure", file_id)
                 try:
-                    await loop.run_in_executor(
-                        executor, lambda: vector_store.delete(ids=[file_id])
-                    )
-                    logger.info("Rollback completed for file %s", file_id)
+                    if protected_row_uuids:
+                        # See the same guard in _process_documents_async_pipeline: under a
+                        # replacement, a delete-by-file_id removes the version this call was
+                        # superseding, which is still the only good copy while the new one
+                        # has failed. Roll back only what THIS call inserted.
+                        protected = set(protected_row_uuids)
+                        current = await loop.run_in_executor(
+                            executor, lambda: vector_store.get_row_uuids(file_id)
+                        )
+                        inserted = [u for u in current if u not in protected]
+                        await loop.run_in_executor(
+                            executor, lambda: vector_store.delete_rows_by_uuid(inserted)
+                        )
+                        logger.info(
+                            "Rollback completed for file %s: removed %d newly inserted "
+                            "row(s), kept %d pre-existing",
+                            file_id, len(inserted), len(protected),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            executor, lambda: vector_store.delete(ids=[file_id])
+                        )
+                        logger.info("Rollback completed for file %s", file_id)
                 except Exception as rollback_error:
                     logger.error(
                         "Rollback failed for file %s: %s", file_id, rollback_error
@@ -1349,22 +1528,50 @@ def _prepare_documents_sync(
             doc.page_content = clean_text(doc.page_content)
 
     # Preparing documents with page content and metadata for insertion.
+    #
+    # ORDER IS LOAD-BEARING. The loader's metadata goes FIRST and this service's fields
+    # go LAST, so the service always wins a collision. It used to be the other way round.
+    #
+    # The visible consequence was a wrong filename: `UnstructuredExcelLoader` writes its
+    # own `filename` from the path it was handed -- our unique temp path -- so an XLSX
+    # chunk carried `book_f8af9976fbc44873bd34c21c359c686b.xlsx` for a file uploaded as
+    # `book.xlsx`, and a citation would have shown the user a name they never chose.
+    # PPTX, PDF, CSV and DOCX kept the real one; spreadsheets were the single format that
+    # did not, which is why it was easy to miss.
+    #
+    # The consequence that matters more was never visible: `file_id`, `user_id`,
+    # `tenant_id`, `digest` and `document_origin_type` were equally overridable, and
+    # `user_id`/`tenant_id` are the fields `/ids`, `GET /documents`,
+    # `/documents/{id}/context`, `/query` and `get_ids_for_entities` all filter on. No
+    # shipped loader emits those keys today -- checked, not assumed -- so nothing was
+    # breached. What was wrong is that PARSER OUTPUT, derived from an uploaded file,
+    # could take over an authorization field, and a dependency upgrade would have done it
+    # silently. Identity is not something a document gets to assert about itself.
+    #
+    # Everything the loader contributes that we do NOT set -- the locator keys
+    # (`page`, `page_label`, `slide_number`, `slide_title`, `page_name`, `page_number`,
+    # `row`), `text_source`, `filetype`, `text_as_html` and the rest -- is preserved
+    # exactly, because it comes first and nothing below collides with it.
+    service_fields = lambda doc: {
+        "file_id": file_id,
+        "user_id": user_id,
+        "digest": generate_digest(doc.page_content),
+        "document_origin_type": document_origin_type,
+        # Tenant tag (D-KSPT-1): stored on every embed path so a later
+        # increment can filter by tenant. rag_api has no tenant column
+        # today, so this lives in cmetadata.
+        **({"tenant_id": tenant_id} if tenant_id else {}),
+        **({"filename": filename} if filename else {}),
+        **({"link": link} if link else {}),
+        **({"subscription_id": subscription_id} if subscription_id else {}),
+    }
+
     return [
         Document(
             page_content=doc.page_content,
             metadata={
-                "file_id": file_id,
-                "user_id": user_id,
-                "digest": generate_digest(doc.page_content),
-                "document_origin_type": document_origin_type,
-                # Tenant tag (D-KSPT-1): stored on every embed path so a later
-                # increment can filter by tenant. rag_api has no tenant column
-                # today, so this lives in cmetadata.
-                **({"tenant_id": tenant_id} if tenant_id else {}),
-                **({"filename": filename} if filename else {}),
-                **({"link": link} if link else {}),
-                **({"subscription_id": subscription_id} if subscription_id else {}),
                 **(doc.metadata or {}),
+                **service_fields(doc),
             },
         )
         for doc in documents
@@ -1380,6 +1587,7 @@ _UNIT_LOCATOR_KEYS = (
     ("page", "page"),           # PDF: 0-indexed page (SafePyPDFLoader / pypdf)
     ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
     ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
+    ("row", "row"),             # CSV: 0-indexed data row (RowCSVLoader / langchain CSVLoader)
 )
 
 
@@ -1452,9 +1660,13 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       never read as `complete` on the field consumers already check --
                       including when every page yielded some text the engine does not
                       vouch for. Nonempty text is not success.
-      locator_kind:   'page' | 'slide' | 'sheet' | 'none'
+      locator_kind:   'page' | 'slide' | 'sheet' | 'row' | 'none'
+                      NEW 2026-09-20: 'row' (CSV). Core's two consumers of this field
+                      (sourceLifecycle.js, ingestionReceipts.js) pass any string through
+                      and default only a NON-string to 'none', so a new member is additive
+                      -- measured at release head e3dbdf296, not assumed.
       units_total / units_extracted / units_empty / units_image_only
-      empty_locators: sorted locators (page ints / slide ints / sheet names) of
+      empty_locators: sorted locators (page ints / slide ints / sheet names / row ints) of
                       every unit that yielded NO extractable text (locator-bearing
                       units only)
       reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
@@ -1476,6 +1688,20 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       locators}. rag_api states what it could not read well; it never
                       calls, chooses or pays for the fallback and owns no policy about
                       whether escalating is worth it.
+      extraction_bound: PRESENT ONLY when a configured read bound stopped the loader
+                      before the end of the document (FILES-01) —
+                      {stopped_reason: 'page_limit' | 'time_limit',
+                       pages_read: int,
+                       pages_not_included: int | null    (null = the file's own page
+                                                          count could not be established).
+                                                          NOT "not opened": one page beyond the
+                                                          bound is pulled and discarded, so this
+                                                          counts pages ABSENT FROM THIS RECEIPT}
+                      `status` is forced to `partial` whenever this is present: a
+                      stopped read is never a finished one. The pages that were never
+                      opened have no locators, so they cannot appear in
+                      `empty_locators` — this block is the only place their absence is
+                      visible.
       text_sources:   Per-page provenance grouped by producer —
                       {'native': [...], 'ocr': [...], 'none': [...]} — so a citation
                       can say WHICH pages came from the text layer and which from OCR.
@@ -1513,6 +1739,9 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     # receipt must say so rather than let a "Total" row arrive silently blank.
     formula_scan: Optional[str] = None
     uncached_cells: dict = {}
+    #: Set when a configured read bound stopped the extraction early (FILES-01). Absent means the
+    #: whole document was read -- never "we did not check".
+    extraction_stop: Optional[dict] = None
     for d in docs:
         meta = getattr(d, "metadata", None) or {}
         loc = meta.get(meta_key) if meta_key is not None else None
@@ -1538,6 +1767,15 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                 units[loc]["ocr_confidence"] = meta["ocr_confidence"]
         if meta.get("text_source") is not None:
             units[loc]["source"] = meta["text_source"]
+        if meta.get(STOPPED_KEY) is not None:
+            # Scanned across ALL documents rather than read off the last one: which page
+            # carries the marker is an implementation detail of the loader, and a receipt
+            # that depended on it would go quietly wrong the day that changed.
+            extraction_stop = {
+                "stopped_reason": meta[STOPPED_KEY],
+                "pages_read": meta.get(ATTEMPTED_KEY),
+                "pages_not_included": meta.get(NOT_INCLUDED_KEY),
+            }
         if meta.get("formula_scan") is not None:
             formula_scan = meta["formula_scan"]
         cells = meta.get("formula_uncached_cells")
@@ -1670,6 +1908,26 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
         if escalate and receipt["status"] == "complete":
             receipt["status"] = "partial"
 
+    # --- a read that was STOPPED is never a read that FINISHED ----------------------
+    #
+    # The same rule the escalation signal enforces, for the other way a document can be
+    # short: a configured bound stopped the loader before the end of the file. Every page
+    # already read is kept and stored -- this is not a refusal -- but `complete` would be a
+    # false statement about coverage on the exact field consumers gate on, and the pages
+    # that were never opened have no locators to appear in `empty_locators`, so without
+    # this block a truncated document could look flawless.
+    if extraction_stop is not None:
+        receipt["extraction_bound"] = {
+            "stopped_reason": extraction_stop["stopped_reason"],
+            "pages_read": extraction_stop["pages_read"],
+            # None means the file's own page count could not be established. Reported as
+            # unknown rather than zero: "we did not open any more" and "there were no more"
+            # are different claims.
+            "pages_not_included": extraction_stop["pages_not_included"],
+        }
+        if receipt["status"] == "complete":
+            receipt["status"] = "partial"
+
     # PER-PAGE PROVENANCE: which engine produced which page's text. Core needs this at
     # page granularity, not as one document-level label, because a citation has to be
     # able to say that page 3 came from OCR and page 4 from the native text layer.
@@ -1735,16 +1993,59 @@ def _assert_extractable_content(
     receipt = _extraction_receipt(data)
     if receipt["units_extracted"] == 0:
         name = filename or "uploaded file"
+        bound = receipt.get("extraction_bound")
+        if bound is not None:
+            # A CONFIGURED LIMIT STOPPED THE READ, so the file is not the thing that went wrong
+            # and must not be described as though it were. Measured in review: a ten-page document
+            # whose first page is a cover sheet, with PDF_EXTRACT_MAX_PAGES=1, was refused with
+            # "the file may be empty, image-only/scanned, corrupted, or password-protected" --
+            # four accusations about a perfectly readable file, none of them true, and the real
+            # cause was our own setting. The same nine pages extract fine unbounded.
+            #
+            # The refusal itself stands: nothing was extracted, so there is nothing to store and
+            # a 200 would be the fake success this guard exists to prevent. What changes is that
+            # it says WHOSE limit stopped it and which knob moves it.
+            message = (
+                f"No text was extracted from '{name}' before a configured read bound stopped "
+                f"the service after {bound['pages_read']} page(s) "
+                f"({bound['stopped_reason']}). This is a limit on THIS SERVICE, not a verdict "
+                f"on the file: pages beyond the bound were never read and may well contain "
+                f"text. Raise PDF_EXTRACT_MAX_PAGES / PDF_EXTRACT_TIME_BUDGET_SECONDS, or "
+                f"split the document. Nothing was stored."
+            )
+        elif receipt.get("locator_kind") == "row":
+            # THE FILE PARSED. Every row it parsed into is present and none of them
+            # yielded a value -- a different fact from a file that could not be read. The
+            # generic message below would accuse it of being empty, image-only, corrupted
+            # or password-protected: four things it demonstrably is not, since we counted
+            # its rows.
+            #
+            # Stated as a fact about the PARSE, not about the file, because those can
+            # differ: a repeated column name collapses in csv.DictReader and its earlier
+            # columns never reach us, so a file with visible data can parse to nothing.
+            # The message says so rather than contradicting what the operator can see.
+            #
+            # This branch is reachable ONLY because of the CSV row locator. Before it, a
+            # file like this returned 200 and indexed its column labels, so this guard was
+            # never reached for it -- a repair that makes a new input class reachable
+            # leaves the guard at the end of that path untested unless someone looks.
+            message = (
+                f"'{name}' parsed as {receipt['units_total']} row(s) and none of them "
+                f"yielded a value, so there is nothing to store. That is a statement "
+                f"about what was READ, not about what the file contains: if it visibly "
+                f"has data, check for repeated column names — a repeated header collapses "
+                f"and only the last column of that name survives the parse. The file is "
+                f"not unreadable and it is not protected. Nothing was stored."
+            )
+        else:
+            message = (
+                f"No extractable text found in '{name}'. The file may be empty, "
+                f"image-only/scanned, corrupted, or password-protected. Nothing "
+                f"was stored."
+            )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": (
-                    f"No extractable text found in '{name}'. The file may be empty, "
-                    f"image-only/scanned, corrupted, or password-protected. Nothing "
-                    f"was stored."
-                ),
-                "extraction": receipt,
-            },
+            detail={"message": message, "extraction": receipt},
         )
     return receipt
 
@@ -1760,7 +2061,96 @@ async def store_data_in_vector_db(
     link: str = None,
     subscription_id: str = None,
     tenant_id: str = None,
+    replace: bool = False,
 ) -> dict:
+    """Store one file's chunks. With `replace`, supersede the file's current rows.
+
+    REPLACEMENT SEMANTICS (FILES-01 F3, contract agreed with Core 2026-09-20).
+
+    Measured before this existed: a second upload under the same file_id ADDED rows. Both
+    versions stayed retrievable under one identity, a query returned the old limit and the
+    new limit side by side, and nothing on either row said which was current. The scoped
+    delete that handles the OCR->native swap keys on `text_source`, a PRODUCER axis, so it
+    cannot separate two versions from the same producer -- two .txt uploads both carry
+    `text_source = None`.
+
+    `replace` captures the file's CURRENT row primary keys BEFORE the insert, inserts, and
+    then deletes exactly those captured rows. Three properties, in the order they matter:
+
+    1. The capture is taken BEFORE the insert and is a list of ROW identities, not "delete
+       everything except what I just wrote". Those are not the same instruction. If the new
+       version produces a chunk byte-identical to an old one -- the ordinary case when a
+       document is edited in one place -- an "except what I wrote" rule either deletes the
+       row it just created or spares a superseded one. The primary key cannot be confused
+       this way, and it is why the identity is the row and not its content or digest.
+    2. Insert first, delete second, so the document never passes through zero rows. A
+       reader querying during the swap sees the old version or both, never nothing. This is
+       the same ordering the OCR escalation path already uses.
+    3. A failed insert never removes the old version. Two different mechanisms, and the
+       second was missing until independent review demonstrated the loss: the single-shot
+       path RAISES before `delete_rows_by_uuid` is reached, and the BATCHED paths (the
+       production default is EMBEDDING_BATCH_SIZE=500) roll back only the rows this call
+       inserted instead of deleting by file_id. The earlier wording here claimed the first
+       mechanism covered both. It did not: a failure on any batch after the first left the
+       file with ZERO rows and answered 400, so a caller retrying only on 5xx would have
+       treated the document as done with the only good copy gone.
+
+    The count removed is reported, never assumed. A replacement that did not remove what it
+    superseded leaves stale content retrievable, which is a fact the caller has to receive
+    rather than infer from a 200.
+    """
+    superseded_rows = None
+    if replace:
+        if not hasattr(vector_store, "get_row_uuids"):
+            # Refuse rather than silently ingest without replacing. A caller that asked to
+            # supersede and got a 200 would believe the old version is gone.
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    "replace is not supported by this vector store; nothing was stored. "
+                    "The previous version would have remained retrievable."
+                ),
+            )
+        if isinstance(vector_store, AsyncPgVector):
+            superseded_rows = await vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, tenant_id=tenant_id, executor=executor
+            )
+            all_rows_before = await vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, executor=executor
+            )
+        else:
+            superseded_rows = vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, tenant_id=tenant_id
+            )
+            all_rows_before = vector_store.get_row_uuids(file_id, user_id=user_id or None)
+        # ROWS OF THIS CALLER'S OWN FILE that the TENANT filter cannot see, and therefore
+        # cannot supersede. Counted because independent review found the silent case:
+        # rows written before `tenant_id` was populated carry no such key, so a
+        # tenant-scoped capture returns NOTHING for them. The delete then removes 0 of 0
+        # captured rows and `removed == len(captured)` reads as a complete replacement --
+        # while the old version is still there and still retrievable.
+        #
+        # SCOPED BY `user_id`, and that scoping is the whole correctness of this number.
+        # It was unscoped at first, which swept in rows belonging to ANY tenant that
+        # happened to use the same `file_id` -- and `file_id` arrives in the form body,
+        # so a caller chooses it. Measured 2026-09-20: tenant B held 4 rows under
+        # `quarterly-board-pack`; tenant A uploaded its own file under that name and
+        # replaced it, and got back `out_of_scope_rows: 4` with `status: incomplete`
+        # against a control of 0 and `complete`. Three defects in one number -- an
+        # existence oracle for a caller-chosen id, the exact row count of a document the
+        # caller is not entitled to, and a FALSE ALARM about the caller's own data that
+        # a consumer renders to a person as "a previous version may still be
+        # retrievable".
+        #
+        # `user_id` keeps exactly the case this field exists for -- same owner, missing
+        # tenant key -- and excludes a stranger's rows, whose `user_id` differs. Same
+        # shape as the `/ids` disclosure fixed in #38: an unscoped primitive reachable
+        # from a request.
+        #
+        # A count, never content: the caller already named this file_id, and a number is
+        # what it takes to stop a 200 meaning "the old version is gone" when it is not.
+        out_of_scope_rows = max(0, len(all_rows_before) - len(superseded_rows))
+
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     docs = await loop.run_in_executor(
@@ -1793,15 +2183,44 @@ async def store_data_in_vector_db(
 
             if isinstance(vector_store, AsyncPgVector):
                 ids = await _process_documents_async_pipeline(
-                    docs, file_id, vector_store, executor
+                    docs, file_id, vector_store, executor,
+                    protected_row_uuids=superseded_rows,
                 )
             else:
                 # Fallback to batched processing for sync vector stores
                 ids = await _process_documents_batched_sync(
-                    docs, file_id, vector_store, executor
+                    docs, file_id, vector_store, executor,
+                    protected_row_uuids=superseded_rows,
                 )
 
-        return {"message": "Documents added successfully", "ids": ids, "docs": docs}
+        result = {"message": "Documents added successfully", "ids": ids, "docs": docs}
+
+        if superseded_rows is not None:
+            # Only now -- the new rows exist, so removing the old ones cannot empty the
+            # document. Reached only on the success path; the except below re-raises.
+            if isinstance(vector_store, AsyncPgVector):
+                removed = await vector_store.delete_rows_by_uuid(
+                    superseded_rows, executor=executor
+                )
+            else:
+                removed = vector_store.delete_rows_by_uuid(superseded_rows)
+            result["replacement"] = {
+                "superseded_rows": len(superseded_rows),
+                "removed": removed,
+                # Rows for this file that the caller's own scope could not see and
+                # therefore could not supersede. Zero is the ordinary case.
+                "out_of_scope_rows": out_of_scope_rows,
+                # `complete` requires BOTH: every captured row gone, AND nothing left
+                # behind outside the capture's scope. Either shortfall means superseded
+                # content is still retrievable, and saying `complete` would be the fake
+                # success this receipt exists to prevent.
+                "status": (
+                    "complete"
+                    if removed == len(superseded_rows) and out_of_scope_rows == 0
+                    else "incomplete"
+                ),
+            }
+        return result
 
     except Exception as e:
         logger.error(
@@ -1990,12 +2409,14 @@ async def embed_file(
     document_owner_type: Optional[DocumentOwnerType] = Form(DocumentOwnerType.AGENT),
     document_origin_type: DocumentOriginType = Form(DocumentOriginType.ORGANIC),
     link: Optional[str] = Form(None),
-    subscription_id: Optional[str] = Form(None)
+    subscription_id: Optional[str] = Form(None),
+    replace: bool = Form(False),
 ):
     response_status = True
     response_message = "File processed successfully."
     known_type = None
     extraction_receipt = None
+    replacement_receipt = None
 
     user_id = get_user_id(request, entity_id)
     logger.info(
@@ -2041,6 +2462,7 @@ async def embed_file(
             link=link,
             subscription_id=subscription_id,
             tenant_id=tenant_id,
+            replace=replace,
         )
 
         if not result:
@@ -2051,9 +2473,12 @@ async def embed_file(
                 detail="Failed to process/store the file data.",
             )
 
+        replacement_receipt = result.get("replacement")
+
         logger.info(
-            "[embed_file] stored [file_id=%s][chunks=%d]",
-            file_id, len(result.get("docs", [])),
+            "[embed_file] stored [file_id=%s][chunks=%d][replace=%s][superseded=%s]",
+            file_id, len(result.get("docs", [])), replace,
+            (replacement_receipt or {}).get("removed"),
         )
 
         if "error" in result:
@@ -2111,6 +2536,9 @@ async def embed_file(
         "filename": file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        # PRESENT ONLY when the caller asked to replace, so every existing response keeps
+        # its exact shape. Absent means "nothing was superseded", never "we did not check".
+        **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
     }
 
 
@@ -2169,6 +2597,7 @@ async def embed_file_upload(
     file_id: str = Form(...),
     uploaded_file: UploadFile = File(...),
     entity_id: str = Form(None),
+    replace: bool = Form(False),
 ):
     user_id = get_user_id(request, entity_id)
 
@@ -2188,6 +2617,7 @@ async def embed_file_upload(
     ent = _require_entity(request, "write", user_id)
     tenant_id = ent["tenant_id"]
     extraction_receipt = None
+    replacement_receipt = None
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
@@ -2211,6 +2641,7 @@ async def embed_file_upload(
             executor=request.app.state.thread_pool,
             filename=uploaded_file.filename,
             tenant_id=tenant_id,
+            replace=replace,
         )
 
         if not result:
@@ -2218,6 +2649,8 @@ async def embed_file_upload(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
             )
+
+        replacement_receipt = result.get("replacement")
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in embed_file_upload | Status: %d | Detail: %s",
@@ -2240,6 +2673,7 @@ async def embed_file_upload(
         "filename": uploaded_file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
     }
 
 
