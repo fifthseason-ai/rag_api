@@ -1940,6 +1940,12 @@ async def store_data_in_vector_db(
     becomes a 499. So a caller that timed out, and told its user the upload failed, never
     finds the file retrievable afterwards. See `CallerGone` for the measurement.
 
+    That guarantee needs a store that can list its rows (`get_row_uuids`) -- pgvector,
+    which is what runs in production. On Atlas (no row listing) the write still STOPS at
+    the next check, but rows already inserted by an additive upload stay, and the 499
+    reports `rows_removed: null` (unknown) rather than claiming they were removed.
+    (`replace` is already refused there with a 501.)
+
     REPLACEMENT SEMANTICS (FILES-01 F3, contract agreed with Core 2026-09-20).
 
     Measured before this existed: a second upload under the same file_id ADDED rows. Both
