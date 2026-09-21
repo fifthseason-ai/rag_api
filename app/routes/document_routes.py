@@ -40,6 +40,7 @@ from app.config import (
     CHUNK_OVERLAP,
     EMBEDDING_BATCH_SIZE,
     EMBEDDING_MAX_QUEUE_SIZE,
+    FILE_WRITE_LOCK_WAIT_SECONDS,
     VECTOR_DB_TYPE,
     VectorDBType,
     HYBRID_SEARCH_ENABLED,
@@ -65,6 +66,12 @@ from app.services.summary_store import (
     delete_summaries_by_file_ids,
 )
 from app.services.vector_store.async_pg_vector import AsyncPgVector
+from app.services.database import PSQLDatabase
+from app.services.file_write_lock import (
+    FileWriteBusy,
+    NoFileWriteLock,
+    PgAdvisoryFileLock,
+)
 from app.services.hybrid_search import keyword_search, reciprocal_rank_fusion
 from app.services.reranker import rerank
 from app.utils.document_loader import (
@@ -1900,10 +1907,11 @@ async def _undo_abandoned_insert(
     present before it inserted. Returns how many, or None when the store cannot list rows
     (then nothing can be removed safely, and the log says so rather than claiming 0).
 
-    Known limit, recorded rather than hidden: a DIFFERENT request writing the same
-    file_id at the same moment also has rows absent from the capture, and they would be
-    removed too. Two writers racing on one file_id is F02 (simultaneous replacement), and
-    has no defined winner yet either way."""
+    Why this cannot remove ANOTHER request's rows: it runs inside the file_id's write
+    lock (F02, `store_data_in_vector_db`), so no other write of this file_id is between
+    the capture and now. That holds on pgvector; a store with NoFileWriteLock (Atlas, the
+    in-memory test models) has no such guarantee, and there a concurrent writer's rows
+    would be removed too."""
     if rows_before_insert is None:
         return None
     before = set(rows_before_insert)
@@ -1916,7 +1924,81 @@ async def _undo_abandoned_insert(
     return vector_store.delete_rows_by_uuid(added)
 
 
+#: One writer per file_id (FILES-01 F02). Only pgvector has a shared database to lock in;
+#: tests/conftest.py installs NoFileWriteLock for the in-memory table models.
+file_write_lock = (
+    PgAdvisoryFileLock(PSQLDatabase.get_pool)
+    if VECTOR_DB_TYPE == VectorDBType.PGVECTOR
+    else NoFileWriteLock()
+)
+
+#: HTTP 409 when another write of the same file_id did not finish in time.
+FILE_BUSY_STATUS = 409
+
+
 async def store_data_in_vector_db(
+    data: Iterable[Document],
+    file_id: str,
+    user_id: str = "",
+    clean_content: bool = False,
+    executor=None,
+    document_origin_type: str = DocumentOriginType.ORGANIC.value,
+    filename: str = None,
+    link: str = None,
+    subscription_id: str = None,
+    tenant_id: str = None,
+    replace: bool = False,
+    still_wanted: Optional[StillWanted] = None,
+) -> dict:
+    """Store one file's chunks while holding that file_id's write lock.
+
+    SIMULTANEOUS WRITES (FILES-01 F02). Without the lock, two `replace` uploads of one
+    file_id both captured the same original rows, both inserted, and each deleted only
+    its own capture -- leaving BOTH new versions retrievable, with the first reporting
+    `complete`. Measured through the real route; see app/services/file_write_lock.py.
+    Held from before the captures to after the last delete, so the second writer
+    supersedes the first. Everything else is `_store_data_in_vector_db_unlocked`.
+    """
+
+    async def _stop_waiting():
+        await _stop_if_caller_gone(still_wanted, "waiting for another write of this file")
+
+    try:
+        async with file_write_lock.hold(
+            file_id, stop_waiting=_stop_waiting, max_wait=FILE_WRITE_LOCK_WAIT_SECONDS
+        ):
+            return await _store_data_in_vector_db_unlocked(
+                data, file_id, user_id, clean_content, executor, document_origin_type,
+                filename, link, subscription_id, tenant_id, replace, still_wanted,
+            )
+    except CallerGone as gone:
+        # Only reachable while WAITING: inside the section the unlocked body turns
+        # CallerGone into its own 499 after undoing what it wrote. Here nothing was.
+        logger.warning(
+            "Caller stopped waiting for the write lock | File ID: %s | nothing written",
+            file_id,
+        )
+        raise HTTPException(
+            status_code=CALLER_GONE_STATUS,
+            detail={
+                "message": "The caller stopped waiting before the file was stored; "
+                "nothing from this request was kept.",
+                "stage": gone.stage,
+                "rows_removed": 0,
+            },
+        ) from gone
+    except FileWriteBusy as busy:
+        raise HTTPException(
+            status_code=FILE_BUSY_STATUS,
+            detail=(
+                f"Another upload of this file was still being stored after "
+                f"{busy.waited:.0f}s; nothing from this request was stored. "
+                "Retry once it has finished."
+            ),
+        ) from busy
+
+
+async def _store_data_in_vector_db_unlocked(
     data: Iterable[Document],
     file_id: str,
     user_id: str = "",
