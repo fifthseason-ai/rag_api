@@ -10,13 +10,19 @@ jobs:
     runs-on: ubuntu-latest
 
     # A real, disposable Postgres for the tests that exercise the per-file write lock
-    # (tests/utils/test_simultaneous_write.py). Without it those tests SKIP -- which is
-    # what they did in CI when #55 landed: the lock was proven only on a developer's
-    # isolated container. RAG_TEST_PG_REQUIRED below turns a missing database into a
-    # failure here instead of a quiet skip.
+    # (tests/utils/test_simultaneous_write.py) and the entitlement query path against a
+    # real vector store (tests/utils/test_empty_entitlement_query_path.py). Without it
+    # those tests SKIP -- which is what the lock tests did when #55 landed: proven only on
+    # a developer's isolated container. RAG_TEST_PG_REQUIRED below turns a missing database
+    # into a failure here instead of a quiet skip.
+    #
+    # pgvector/pgvector:pg16, NOT plain postgres:16: it IS postgres 16 plus the `vector`
+    # extension, so the advisory-lock tests are unaffected while a real vector store can be
+    # built (CREATE EXTENSION vector). Plain postgres:16 failed the query-path test with
+    # 'extension "vector" is not available'.
     services:
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: ci
         ports:
