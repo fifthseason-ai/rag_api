@@ -11,6 +11,7 @@ test releases only after the client has given up, so "the caller left during OCR
 arranged, not hoped for.
 """
 
+import asyncio
 import datetime
 import io
 import os
@@ -57,6 +58,18 @@ def server(monkeypatch):
     # The loader imports ocr_page from the module at call time, so this reaches it.
     monkeypatch.setattr(ocr_module, "ocr_page", gated_ocr_page)
 
+    # Record the request's disconnect probe with its server loop, so the test can ask the
+    # server whether it has seen the caller leave (a fixed sleep is not a synchronisation).
+    probes = []
+    real_probe_factory = document_routes.caller_still_waiting
+
+    def recording_probe_factory(request):
+        probe = real_probe_factory(request)
+        probes.append((probe, asyncio.get_running_loop()))
+        return probe
+
+    monkeypatch.setattr(document_routes, "caller_still_waiting", recording_probe_factory)
+
     srv = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="off")
     )
@@ -68,7 +81,7 @@ def server(monkeypatch):
         time.sleep(0.02)
     base = f"http://127.0.0.1:{srv.servers[0].sockets[0].getsockname()[1]}"
     try:
-        yield base, store, gate, first_page_started, completed
+        yield base, store, gate, first_page_started, completed, probes
     finally:
         gate.set()
         srv.should_exit = True
@@ -101,11 +114,18 @@ def _wait_for(predicate, seconds):
 
 
 def test_ocr_stops_after_the_page_in_flight_once_the_caller_has_gone(server):
-    base, store, gate, first_page_started, completed = server
+    base, store, gate, first_page_started, completed, probes = server
     with pytest.raises(httpx.ReadTimeout):
         _post(base, timeout=1.0)
     assert first_page_started.is_set(), "the request never reached OCR"
-    time.sleep(0.8)  # the disconnect probe polls every 0.25 s
+    assert _wait_for(
+        lambda: any(
+            asyncio.run_coroutine_threadsafe(p(), loop).result(5) is False
+            for p, loop in list(probes)
+        ),
+        10,
+    ), "the server never noticed the disconnect"
+    time.sleep(0.4)  # one poll period (0.25 s) of the extraction stop-watcher, plus margin
     gate.set()
 
     # Give the remaining pages every chance to run if the stop did not work.
@@ -119,7 +139,7 @@ def test_ocr_stops_after_the_page_in_flight_once_the_caller_has_gone(server):
 
 
 def test_a_caller_who_waits_gets_every_page(server):
-    base, store, gate, first_page_started, completed = server
+    base, store, gate, first_page_started, completed, probes = server
     gate.set()
     r = _post(base, timeout=120)
     assert r.status_code == 200, r.text
