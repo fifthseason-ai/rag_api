@@ -592,10 +592,21 @@ def test_doc_branch_is_unchanged_by_the_ole2_signature(tmp_path):
     path = tmp_path / "memo.doc"
     make_ole2_office_binary(path, tmp_path)
 
-    # get_loader routes without reading bytes for a signature; it must not raise here.
-    loader, known_type, ext = get_loader("memo.doc", "application/msword", str(path))
-    assert type(loader).__name__ == "Docx2txtLoader"
-    assert ext == "doc"
+    # Two correct answers, depending on whether F-LEGACY3 (#49) is present -- and the composed
+    # Candidate B showed the first version of this test asserted only the pre-#49 one:
+    #   * without #49, the Word branch hands the bytes to Docx2txtLoader;
+    #   * with #49, the Word branch refuses them as a legacy WORD document, naming .docx.
+    # Both are the Word branch answering. What this row forbids is the OTHER outcome: the
+    # fallback's generic OLE2 naming ("a legacy Microsoft Office file ...") reaching a .doc.
+    try:
+        loader, known_type, ext = get_loader("memo.doc", "application/msword", str(path))
+    except UnsupportedDocumentError as refused:
+        message = str(refused)
+        assert "legacy Word document" in message and ".docx" in message, message
+        assert "legacy Microsoft Office file" not in message, message
+    else:
+        assert type(loader).__name__ == "Docx2txtLoader"
+        assert ext == "doc"
 
 
 def test_ole2_signature_and_excel_container_check_share_one_literal():
