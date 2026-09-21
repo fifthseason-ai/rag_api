@@ -10,6 +10,7 @@ import aiofiles.os
 from shutil import copyfileobj
 from typing import Awaitable, Callable, List, Iterable, Optional, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AsyncExitStack
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -810,6 +811,48 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
 _DELETABLE_TEXT_SOURCES = frozenset({"native", "ocr"})
 
 
+async def _hold_file_locks(
+    file_ids: Optional[List[str]], still_wanted: "Optional[StillWanted]"
+) -> AsyncExitStack:
+    """Hold the write lock of every named file_id (F02B), in SORTED order so two
+    multi-file deletes can never wait on each other in a cycle. The caller closes the
+    returned stack when done. Nothing has been deleted if this raises: a 499 when the
+    caller left while waiting, a 409 when another write outlasted the wait."""
+
+    async def _stop_waiting():
+        await _stop_if_caller_gone(still_wanted, "waiting for a write of this file")
+
+    stack = AsyncExitStack()
+    try:
+        for file_id in sorted(set(file_ids or [])):
+            await stack.enter_async_context(
+                file_write_lock.hold(
+                    file_id, stop_waiting=_stop_waiting,
+                    max_wait=FILE_WRITE_LOCK_WAIT_SECONDS,
+                )
+            )
+    except CallerGone as gone:
+        await stack.aclose()
+        raise HTTPException(
+            status_code=CALLER_GONE_STATUS,
+            detail={"message": "The caller stopped waiting; nothing was deleted.",
+                    "stage": gone.stage},
+        ) from gone
+    except FileWriteBusy as busy:
+        await stack.aclose()
+        raise HTTPException(
+            status_code=FILE_BUSY_STATUS,
+            detail=(
+                f"A write of file {busy.file_id!r} was still in progress after "
+                f"{busy.waited:.0f}s; nothing was deleted. Retry once it has finished."
+            ),
+        ) from busy
+    except BaseException:
+        await stack.aclose()
+        raise
+    return stack
+
+
 @router.delete("/documents")
 async def delete_documents(
     body: DeleteDocumentsBody,
@@ -845,6 +888,13 @@ async def delete_documents(
         raise HTTPException(
             status_code=403, detail="Not authorized for the requested entity"
         )
+
+    # F02B: take each file's write lock before touching its rows. Measured 2026-09-21:
+    # a delete that landed between two batches of an in-flight upload removed batch 1,
+    # the upload then wrote batches 2..7, and BOTH calls answered success -- leaving a
+    # partial document (6 of 7 chunks) that neither caller knew about. Waiting for the
+    # upload makes the delete apply to the whole file it finished writing.
+    file_locks = await _hold_file_locks(document_ids, caller_still_waiting(request))
 
     try:
         origin_type_value = document_origin_type.value if document_origin_type else None
@@ -942,6 +992,8 @@ async def delete_documents(
             traceback.format_exc(),
         )
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await file_locks.aclose()
 
 
 # The embedding function is wrapped with the Redis cache in app.config, so
