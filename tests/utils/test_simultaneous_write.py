@@ -172,8 +172,12 @@ def test_a_write_that_cannot_get_the_lock_in_time_is_a_409_with_nothing_stored(m
 # The real advisory lock -- needs Postgres
 # ---------------------------------------------------------------------------
 
+# RAG_TEST_PG_REQUIRED (set in CI, which provides a Postgres service) makes a missing
+# database a FAILURE rather than a skip: a skip there would read as "covered" while the
+# real lock never ran.
 needs_pg = pytest.mark.skipif(
-    not PG_DSN, reason="RAG_TEST_PG_DSN not set: no isolated Postgres for the real advisory lock"
+    not PG_DSN and not os.environ.get("RAG_TEST_PG_REQUIRED"),
+    reason="RAG_TEST_PG_DSN not set: no isolated Postgres for the real advisory lock",
 )
 
 
