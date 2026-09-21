@@ -641,3 +641,85 @@ def test_ENAMETOOLONG_wins_across_a_wrapper_too():
         drive(outer)
     assert caught.value.status_code == 400
     assert "too long" in detail_text(caught.value).lower()
+
+
+# ---------------------------------------------------------------------------------------
+# A missing LibreOffice must not be a retryable 503.
+#
+# Found by uploading a legacy `.ppt` for the first time. F2 recorded `.xls .ppt .epub .rst
+# .xml` as owned backlog and nobody had ever run one. Measured 2026-09-20 against the real
+# service: `.xls` answered a truthful `422 unsupported` with zero rows, and `.ppt` answered
+# **503** -- "the service is unavailable, retry" -- for a file that cannot work until an
+# operator installs LibreOffice.
+#
+# This module already carries the same repair for pandoc, with the reason written out: a
+# missing server package is infrastructure but it is not TRANSIENT, and a 503 tells Core's
+# listener to retry forever. That guard was written for the dependency that had been hit
+# rather than for the class, so the next one inherited the defect it existed to prevent.
+# ---------------------------------------------------------------------------------------
+
+_SOFFICE_MESSAGE = (
+    "soffice command was not found. Please install libreoffice\n"
+    "on your system and try again.\n\n"
+    "- Install instructions: https://www.libreoffice.org/get-help/install-howto/"
+)
+
+
+def test_a_missing_libreoffice_is_permanent_not_a_retryable_503():
+    """The defect itself. 503 tells a caller to retry something that can never succeed."""
+    from app.routes.document_routes import describe_failure
+
+    code, message = describe_failure(FileNotFoundError(_SOFFICE_MESSAGE), "quarterly.ppt")
+    assert code == 400, (
+        "a missing server package answered %s; 503 tells Core's listener to retry forever a "
+        "file that cannot work until an operator acts" % code
+    )
+    assert "quarterly.ppt" in message
+    assert "LibreOffice" in message, "the operator action must be named"
+    assert ".pptx" in message, "the caller's own fix -- re-save in the current format -- must be named"
+    assert "soffice" not in message, "the library's internal command name is not a caller's business"
+    # MEASURED F-LEGACY2: a genuine BIFF8 .xls parses with NO LibreOffice installed (200, rows
+    # stored). The first version of this message said "a legacy Office format (.doc, .xls, .ppt)
+    # and this service cannot read one", which told a reader this service cannot read a format it
+    # reads. The enumeration was never load-bearing -- the branch fires on the soffice error
+    # whatever raised it.
+    assert ".xls" not in message.replace(".xlsx", ""), (
+        "the message claims .xls is unreadable; measured, a genuine .xls parses without "
+        "LibreOffice at all: %r" % message
+    )
+
+
+def test_a_filename_cannot_forge_the_libreoffice_verdict():
+    """The injection an independent review found in the first version of the pandoc guard.
+
+    A save-path `OSError` carries the temp path, and that path is built from the UPLOADER'S
+    filename. If the match were a substring over the whole message, a file named
+    `soffice command was not found.txt` would turn a genuine, retryable storage outage into a
+    permanent 400 -- the exact inverse harm. Pinned to position 0 instead.
+    """
+    from app.routes.document_routes import _is_libreoffice_missing
+
+    forged = OSError(2, "No such file or directory",
+                     "/tmp/uploads/userA/soffice command was not found.txt")
+    assert not _is_libreoffice_missing(forged), (
+        "a caller's filename reached the verdict: %r" % str(forged)
+    )
+    assert _is_libreoffice_missing(FileNotFoundError(_SOFFICE_MESSAGE))
+
+
+def test_the_installed_library_still_raises_the_phrase_this_guard_matches():
+    """Pins the fixture to the parser, not to my memory of it.
+
+    The guard matches a literal from `unstructured`. If a version bump reworded it, every test
+    above would keep passing against a message the library no longer produces, and a real `.ppt`
+    would quietly go back to 503. This is the test that fails instead.
+    """
+    import inspect
+
+    common = pytest.importorskip("unstructured.partition.common.common")
+    source = inspect.getsource(common.convert_office_doc)
+    assert '"""soffice command was not found' in source, (
+        "unstructured no longer raises the message this guard is pinned to; the 503 repair is "
+        "silently inert and the fixtures above are describing a defect that no longer occurs "
+        "in this form"
+    )

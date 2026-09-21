@@ -57,9 +57,29 @@ def override_vector_store(monkeypatch):
 
     # Override get_all_ids as an async function - patch at CLASS level to bypass run_in_executor
     async def dummy_get_all_ids(self, executor=None):
-        return ["testid1", "testid2"]
+        # `othertenantfile` is here ON PURPOSE. Without it, the unscoped primitive and the
+        # scoped one return the same list, and `test_get_all_ids`'s exclusion assertion
+        # cannot fail however the route is rewired -- measured: reverting /ids to
+        # get_all_ids left that test green until this row existed.
+        return ["testid1", "testid2", "othertenantfile"]
 
     monkeypatch.setattr(AsyncPgVector, "get_all_ids", dummy_get_all_ids)
+
+    # `GET /ids` no longer calls get_all_ids: that returned every identifier in the store
+    # to every authenticated caller. It now asks for the identifiers owned by the entities
+    # in the token, and the double honours that predicate rather than ignoring it -- a
+    # double that returned the same list for any entity would let the scoping be deleted
+    # without a single test noticing.
+    _OWNERS = {"testid1": "testuser", "testid2": "testuser", "othertenantfile": "someoneelse"}
+
+    async def dummy_get_ids_for_entities(self, entity_ids, executor=None):
+        if not entity_ids:
+            return []
+        return [fid for fid, owner in _OWNERS.items() if owner in entity_ids]
+
+    monkeypatch.setattr(
+        AsyncPgVector, "get_ids_for_entities", dummy_get_ids_for_entities
+    )
 
     # Override get_filtered_ids as an async function. Accept the scoping kwargs the
     # delete/list routes now pass (user_id / document_origin_type / subscription_id).
@@ -163,6 +183,10 @@ def test_get_all_ids(auth_headers):
     json_data = response.json()
     assert isinstance(json_data, list)
     assert "testid1" in json_data
+    # ASSERT WHAT IS EXCLUDED, not only what is contained. The previous version of this
+    # test checked only that the caller's own id was present, which is equally true of a
+    # route that returns the entire store -- and that is exactly what this route did.
+    assert "othertenantfile" not in json_data, json_data
 
 
 def test_get_documents_by_ids(auth_headers):

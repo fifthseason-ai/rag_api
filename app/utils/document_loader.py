@@ -2,6 +2,7 @@
 
 import os
 import codecs
+import csv
 import tempfile
 import zipfile
 
@@ -11,6 +12,11 @@ from pypdf import PdfReader
 
 from langchain_core.documents import Document
 
+from app.utils.extraction_budget import (
+    ATTEMPTED_KEY,
+    NOT_INCLUDED_KEY,
+    STOPPED_KEY,
+)
 from app.config import (
     known_source_ext,
     PDF_EXTRACT_IMAGES,
@@ -78,6 +84,11 @@ class UnsupportedDocumentError(DocumentVerdictError):
     verdict = "unsupported"
 
 
+#: Compound File Binary (OLE2) header. A legacy .doc/.xls/.ppt is an OLE2 container, and so is an
+#: ENCRYPTED OOXML file (.docx/.xlsx/.pptx). Defined once here and reused by `SheetExcelLoader`, which
+#: needs the same literal to tell an encrypted workbook from a corrupt one on the .xls/.xlsx branch.
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
 #: Leading byte signatures for formats this service has no text extractor for. Named rather than
 #: lumped into "binary" because "we do not read images" is actionable and "unsupported file" is not.
 _BINARY_SIGNATURES = (
@@ -98,6 +109,13 @@ _BINARY_SIGNATURES = (
     (b"MZ", "a Windows executable"),
     (b"\x7fELF", "a Linux executable"),
     (b"SQLite format 3\x00", "a SQLite database"),
+    # An OLE2 file reaching THIS table came through the fallback branch — an unknown extension and no
+    # Office content type — so no earlier branch claimed it as a workbook or a Word document. Naming it
+    # "a legacy Microsoft Office file ... or an encrypted Office document" is the actionable truth; the
+    # generic "not a text-based format" was not. A .xls/.xlsx or .doc arriving with its real extension
+    # or content type never reaches here — it is routed to SheetExcelLoader / Docx2txtLoader first — so
+    # this entry cannot relabel the `encrypted` verdict a password-protected .xlsx already earns there.
+    (_OLE2_MAGIC, "a legacy Microsoft Office file (.doc, .xls or .ppt) or an encrypted Office document"),
 )
 
 
@@ -282,6 +300,58 @@ def raise_if_unsupported_binary(filepath: str, filename: str) -> None:
     )
 
 
+#: OLE2 compound-file magic. This is the container the pre-2007 Office binaries use (.doc, .xls,
+#: .ppt) and also what an ENCRYPTED OOXML file is. `SheetExcelLoader` reads it to separate encrypted
+#: from corrupt; the Word branch reads it to refuse a legacy .doc with a verdict instead of letting
+#: `docx2txt` die on the zip check.
+OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def refuse_legacy_word_binary(filepath: str, filename: str) -> None:
+    """Refuse a pre-2007 binary `.doc` with a verdict, before `Docx2txtLoader` sees it.
+
+    `.doc` and `.docx` share one branch, and that branch hands both to `Docx2txtLoader`. But
+    `docx2txt` reads an OOXML package -- a ZIP -- while a Word 97 `.doc` is an OLE2 compound file,
+    so the legacy half of the branch could only ever fail. MEASURED on 36d4fb6 with a genuine Word
+    97 document (LibreOffice Writer 25.2.3.2, filter "MS Word 97"): `get_loader` returned
+    `Docx2txtLoader` with `known_type=True`, `load()` raised `zipfile.BadZipFile("File is not a zip
+    file")`, and `/embed` answered 400 "The cause is not established - it may be the file or this
+    service." with zero rows.
+
+    Nothing was stored and nothing claimed to succeed, so this is not the garbage-extraction defect
+    SP-01.6a closed. It is the other half of that charter: the service can tell exactly what this
+    file is, and said it could not tell. `attribution=undetermined` on a format we positively
+    recognise is a non-answer to someone who can fix their file in ten seconds.
+
+    This is ALSO the gap #42 left explicitly open. That guard turns a missing-LibreOffice failure
+    into an actionable 400, but it fires on `OSError("soffice command was not found")` -- and a
+    `.doc` never reaches soffice at all, because the Word branch claims it first and dies in
+    `zipfile`. So `.ppt` gets the actionable answer and `.doc` cannot, which is why #42's comment
+    records that `.doc` "was never tested, so it is not claimed either".
+
+    The message deliberately does NOT offer the LibreOffice operator fix that #42's does. Installing
+    LibreOffice would not make THIS path work: `Docx2txtLoader` would still be handed the same OLE2
+    bytes. Claiming it would is the same false family claim #42 removed once already, and this lane
+    does not re-add it on the strength of a neighbouring format's behaviour.
+
+    A `.docx` is untouched: it is a ZIP, so the header never matches.
+    """
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(len(OLE2_MAGIC))
+    except OSError:
+        # Unreadable here means unreadable for the loader a line later, and its error is the
+        # truthful report. Never convert an I/O fault into a verdict about the FORMAT.
+        return
+    if not head.startswith(OLE2_MAGIC):
+        return
+    raise UnsupportedDocumentError(
+        f"'{filename}' is a legacy Word document (the pre-2007 .doc format), which this service "
+        f"cannot read. Open it in Word and re-save it as .docx, then upload that.",
+        filename=filename,
+    )
+
+
 def detect_file_encoding(filepath: str) -> str:
     """
     Detect the encoding of a file using BOM markers and chardet for broader support.
@@ -326,12 +396,22 @@ def cleanup_temp_encoding_file(loader) -> None:
             logger.warning(f"Failed to remove temporary UTF-8 file: {e}")
 
 
-def get_loader(filename: str, file_content_type: str, filepath: str, ocr_budget=None):
+def get_loader(
+    filename: str,
+    file_content_type: str,
+    filepath: str,
+    ocr_budget=None,
+    extraction_budget=None,
+):
     """Get the appropriate document loader based on file type and\or content type.
 
     `ocr_budget` is the caller's bounded allowance for reading SCANNED PDF pages
     locally (FILES-01). It is optional and PDF-only: omitting it leaves every loader
     behaving exactly as it did before OCR existed.
+
+    `extraction_budget` bounds how much of a NATIVE PDF is read at all (FILES-01). Also
+    optional, also PDF-only, and OFF unless an operator configures a limit -- so omitting
+    it, or passing an unconfigured budget, changes nothing about cost or behaviour.
     """
     file_ext = filename.split(".")[-1].lower()
     known_type = True
@@ -340,7 +420,10 @@ def get_loader(filename: str, file_content_type: str, filepath: str, ocr_budget=
     # ref.: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types/Common_types
     if file_ext == "pdf" or file_content_type == "application/pdf":
         loader = SafePyPDFLoader(
-            filepath, extract_images=PDF_EXTRACT_IMAGES, ocr_budget=ocr_budget
+            filepath,
+            extract_images=PDF_EXTRACT_IMAGES,
+            ocr_budget=ocr_budget,
+            extraction_budget=extraction_budget,
         )
     elif file_ext == "csv" or file_content_type == "text/csv":
         # Detect encoding for CSV files
@@ -365,14 +448,14 @@ def get_loader(filename: str, file_content_type: str, filepath: str, ocr_budget=
 
                     temp_filepath = temp_file.name
 
-                loader = CSVLoader(temp_filepath)
+                loader = RowCSVLoader(temp_filepath)
                 loader._temp_filepath = temp_filepath
             except Exception as e:
                 if temp_file and os.path.exists(temp_file.name):
                     os.unlink(temp_file.name)
                 raise e
         else:
-            loader = CSVLoader(filepath)
+            loader = RowCSVLoader(filepath)
     elif file_ext == "rst":
         loader = UnstructuredRSTLoader(filepath, mode="elements")
     elif file_ext == "xml" or file_content_type in [
@@ -405,6 +488,8 @@ def get_loader(filename: str, file_content_type: str, filepath: str, ocr_budget=
         "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ]:
+        # A legacy binary .doc can never be read by docx2txt (see refuse_legacy_word_binary).
+        refuse_legacy_word_binary(filepath, filename)
         loader = Docx2txtLoader(filepath)
     elif file_ext in ["xls", "xlsx"] or file_content_type in [
         "application/vnd.ms-excel",
@@ -519,10 +604,21 @@ class SafePyPDFLoader:
     ref.: https://github.com/langchain-ai/langchain/issues/26652
     """
 
-    def __init__(self, filepath: str, extract_images: bool = False, ocr_budget=None):
+    def __init__(
+        self,
+        filepath: str,
+        extract_images: bool = False,
+        ocr_budget=None,
+        extraction_budget=None,
+    ):
         self.filepath = filepath
         self.extract_images = extract_images
         self._temp_filepath = None  # For compatibility with cleanup function
+        #: How much of this document may be READ at all (FILES-01). Separate from the OCR
+        #: allowance on purpose: that one caps work we choose to do on a page, this one caps
+        #: how far into the file we go. `None`, or a budget with neither bound configured,
+        #: leaves the previous behaviour and cost exactly unchanged.
+        self.extraction_budget = extraction_budget
         #: One document's OCR allowance, supplied by the route. `None` means "do not
         #: OCR at all" -- so every existing direct construction of this loader keeps
         #: exactly its previous behaviour and cost.
@@ -588,26 +684,161 @@ class SafePyPDFLoader:
         loader = PyPDFLoader(self.filepath, extract_images=self.extract_images)
 
         if not self.extract_images:
-            # No image extraction: no fallback needed, stream directly
-            yield from self._with_ocr(loader.lazy_load())
+            # No image extraction: no fallback needed, stream directly.
+            # The read bound is applied BEFORE OCR so a page that will be dropped is never
+            # OCR'd -- otherwise the expensive work would happen and then be thrown away.
+            yield from self._with_ocr(self._within_budget(loader.lazy_load()))
             return
 
         # extract_images=True: must collect eagerly so that a mid-stream
         # KeyError doesn't leave already-yielded pages duplicated by the
         # fallback (yield from + try/except would deliver partial + full).
+        #
+        # THE BOUND WRAPS THE PRODUCER, NOT THE RESULT. Applying it to an already-materialised
+        # list -- which is what this did before review -- costs the full parse of every page and
+        # then throws the surplus away: measured at 10 pages parsed for a 3-page bound with
+        # `extract_images=True`, i.e. the exact exhaustion this exists to prevent, plus seven
+        # pages of data loss for nothing. Wrapping the generator means the pages past the bound
+        # are never produced.
         try:
-            pages = list(loader.lazy_load())
+            pages = list(self._within_budget(loader.lazy_load()))
         except KeyError as e:
             if "/Filter" in str(e):
                 logger.warning(
                     f"PDF image extraction failed for {self.filepath}, falling back to text-only: {e}"
                 )
                 fallback_loader = PyPDFLoader(self.filepath, extract_images=False)
-                pages = list(fallback_loader.lazy_load())
+                # A FRESH budget. The first attempt spent the original one, and a spent budget
+                # yields nothing at all -- which would turn a recoverable image-extraction failure
+                # into an empty document. The fallback is a retry of the same work, so it gets the
+                # same allowance, not the remains of the allowance the failed attempt consumed.
+                pages = list(
+                    self._within_budget(
+                        fallback_loader.lazy_load(), budget=self._fresh_budget()
+                    )
+                )
             else:
                 # Re-raise if it's a different error
                 raise
         yield from self._with_ocr(iter(pages))
+
+    # -- bounded reading of a native PDF (FILES-01) ---------------------------------
+    #
+    # Nothing else in the chain protects this service from a large native PDF: the edge
+    # permits more than the service can parse before every timeout above it has expired,
+    # and an unbounded parse keeps allocating for a response no caller is waiting for. A
+    # worker killed for memory cannot deliver the honest failure contract at all -- the
+    # uploader just sees a dropped connection.
+    #
+    # Stopping is not truncating silently: the pages already read are KEPT, the LAST of
+    # them carries which bound stopped the work and how many pages were never opened, and
+    # the receipt turns that into `partial`. A stopped read is never `complete`, and -- the
+    # case that matters most -- never `empty`, which is a refusal meaning something else.
+
+    def _remaining_page_count(self, pages_read: int):
+        """How many pages were never opened. `None` when the file's own page count cannot be
+        established -- reported as unknown rather than guessed as zero.
+
+        The file is re-opened only on the truncation path, so an unbounded read (and every
+        read that finishes inside its bounds) pays nothing for this.
+
+        WHAT THE TRUNCATION PATH PAYS, measured 2026-09-20 rather than reasoned about. Raised in
+        review as a SUSPECTED finding and left unmeasured by both the reviewer and me until now;
+        300-page fixture, median of 5, inside the test image:
+
+            healthy xref   open + 2 pages = 21.5 ms   this call adds 16.9 ms   (+79%)
+            damaged xref   open + 2 pages = 41.9 ms   this call adds 43.2 ms  (+103%)
+
+        So this call is ~100% of the overhead a bounded read adds over the floor, and on a file
+        whose cross-reference table is damaged pypdf rebuilds it by scanning, which roughly
+        doubles that again.
+
+        THE BOUND STILL BOUNDS -- that was worth checking before calling this a defect. Against
+        reading all 300 pages the bounded read saves 56% (healthy) and 29% (damaged). The first
+        version of this measurement compared bounded against unbounded with no FLOOR and read
+        "68% of unbounded" as "the bound is not bounding"; most of that 68% is the unavoidable
+        cost of opening a 300-page document at all, which no bound can avoid.
+
+        WHY IT IS STILL DONE THIS WAY. The alternative -- counting pages up front -- moves the
+        cost onto EVERY read, including the unbounded ones that are the common case, to benefit
+        the truncated ones that are rare. Charging the rare path is the better trade. It is
+        written down here so the next person does not have to re-measure it, and so the trade is
+        visible as a choice rather than looking like an oversight.
+        """
+        try:
+            with open(self.filepath, "rb") as handle:
+                total = len(PdfReader(handle).pages)
+        except Exception as error:  # a malformed tail is exactly when this can fail
+            logger.info("Could not count pages of %s: %s", self.filepath, error)
+            return None
+        return max(0, total - pages_read)
+
+    def _fresh_budget(self):
+        """A new budget with the same limits and none of the spending.
+
+        Only the retry path needs this: a budget counts pages for ONE pass over ONE document, and
+        handing a second pass the remains of the first makes the retry read less than the operator
+        configured -- or, once the first pass has used the whole allowance, nothing at all.
+        """
+        budget = self.extraction_budget
+        if budget is None:
+            return None
+        return ExtractionBudget(
+            max_pages=budget.max_pages,
+            time_budget_seconds=budget.time_budget_seconds,
+        )
+
+    def _within_budget(self, pages: Iterator[Document], budget=None) -> Iterator[Document]:
+        """Yield pages while the read budget allows, stamping the last one when it does not."""
+        budget = budget if budget is not None else self.extraction_budget
+        if budget is None or not budget.enabled:
+            yield from pages
+            return
+
+        held = None
+        stopped = False
+        for page in pages:
+            if not budget.may_read_page():
+                stopped = True
+                break
+            if held is not None:
+                yield held
+            held = page
+
+        if held is None and stopped:
+            # A budget that was already spent before the first page: nothing to yield, and -- far
+            # worse -- nothing to STAMP, so the receipt would say `empty` with no `extraction_bound`
+            # at all and the caller would be told their readable file has no text. Unreachable on
+            # the live path (each load builds its own budget, and the retry above takes a fresh
+            # one), which is exactly why it must be loud rather than silent: the day it becomes
+            # reachable, a crash naming the cause is honest and an empty receipt is not.
+            raise RuntimeError(
+                "extraction budget was already spent before this pass began "
+                "(stopped_reason=%s, pages_read=%d): a budget counts one pass over one "
+                "document -- build a fresh ExtractionBudget per load."
+                % (budget.stopped_reason, budget.pages_read)
+            )
+
+        if held is not None:
+            if stopped:
+                # Stamped on the last page actually read, so the receipt can find it without
+                # the loader having to invent a synthetic page for the ones it never opened.
+                not_included = self._remaining_page_count(budget.pages_read)
+                held.metadata[STOPPED_KEY] = budget.stopped_reason
+                held.metadata[ATTEMPTED_KEY] = budget.pages_read
+                held.metadata[NOT_INCLUDED_KEY] = not_included
+                # "not included", not "not opened": the generator holds a page back so it can stamp
+                # the last one it keeps, so one page beyond the bound was pulled from the producer
+                # and discarded. The count is right for "absent from this receipt" and was wrong by
+                # one for "never opened", which is what the sentence used to say.
+                logger.warning(
+                    "Stopped reading %s after %d page(s): %s (%s page(s) not included)",
+                    self.filepath,
+                    budget.pages_read,
+                    budget.stopped_reason,
+                    "unknown" if not_included is None else not_included,
+                )
+            yield held
 
     # -- local-first OCR (FILES-01, FS-CONTINUE-R3) ---------------------------------
     #
@@ -762,7 +993,9 @@ class SheetExcelLoader:
 
     #: Compound File Binary header. An .xlsx is a ZIP; an ENCRYPTED .xlsx is an
     #: OLE2 container holding the encrypted package. Legacy .xls is also OLE2.
-    _OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+    #: The literal lives at module scope (`_OLE2_MAGIC`) so the fallback-branch
+    #: signature table and this container check can never drift apart.
+    _OLE2_MAGIC = _OLE2_MAGIC
     _ZIP_MAGIC = b"PK\x03\x04"
 
     #: Cap on the per-sheet sample of uncached-formula cell references carried in
@@ -1127,3 +1360,74 @@ class SlidePowerPointLoader:
 
     def load(self) -> List[Document]:
         return list(self.lazy_load())
+
+
+class RowCSVLoader(CSVLoader):
+    """CSVLoader plus the one fact CSVLoader cannot express: a row with no values.
+
+    CSVLoader already numbers every data row (`row`, 0-indexed) and rag_api already
+    stored that number on every chunk -- so a CSV citation could always have named a
+    row. What it could NOT do is say that a row is blank, because CSVLoader renders a
+    value-less row as its COLUMN LABELS ALONE:
+
+        region: \nrevenue:
+
+    which is not empty text. Left alone, every row of every CSV counted as extracted,
+    a gappy file and a complete file produced byte-identical receipts, and the label
+    scaffolding was indexed as if it were content.
+
+    The decision is made HERE, from the parsed field VALUES, and deliberately not by
+    pattern-matching the rendered text: a cell whose content is "revenue: 4200000"
+    renders indistinguishably from the scaffolding, so a text-shaped rule would call a
+    real value empty. The values are only knowable at the parse, which is why this
+    lives in the loader and not in the receipt.
+
+    A blank row is yielded with EMPTY page_content and its `row` metadata intact --
+    the same shape, for the same reason, as an image-only PPTX slide. Keeping the
+    Document rather than dropping it is load-bearing: dropping it would shift every
+    later row's citation by one, so a citation would point at the wrong record while
+    looking correct.
+    """
+
+    def _blank_rows(self) -> set:
+        """Indices of rows whose every field value is blank, read from the file.
+
+        Uses the same `csv_args` and `encoding` the base loader parses with, so the
+        indices refer to the same rows.
+
+        A failure here is never fatal: it reports no blanks rather than inventing a
+        coverage claim, which is the safe direction -- a real row is never wrongly
+        blanked. It is NOT a general guarantee that blanks are always found, and the
+        earlier wording here claimed that it was. Independent review found the case:
+        this pass has no `autodetect_encoding` fallback, so a caller constructing this
+        loader with `autodetect_encoding=True`, on a file the BASE loader recovers by
+        re-detecting, would load successfully with its blank rows missed. `get_loader`
+        never does that -- it converts non-UTF-8 to a UTF-8 temp file first and leaves
+        autodetect off -- so through the route both passes read the same bytes or both
+        fail together, which was measured. The claim was true as CONSTRUCTED and false
+        as stated, which is the more dangerous of the two.
+        """
+        blank = set()
+        try:
+            with open(self.file_path, newline="", encoding=self.encoding) as fh:
+                for i, row in enumerate(csv.DictReader(fh, **self.csv_args)):
+                    values = []
+                    for v in row.values():
+                        # DictReader puts overflow fields in a LIST under the restkey.
+                        if isinstance(v, list):
+                            values.extend(x for x in v if x is not None)
+                        elif v is not None:
+                            values.append(v)
+                    if not any(str(v).strip() for v in values):
+                        blank.add(i)
+        except Exception as e:  # noqa: BLE001 - diagnostic pass, never fatal
+            logger.warning("CSV blank-row scan failed for %s: %s", self.file_path, e)
+            return set()
+        return blank
+
+    def lazy_load(self) -> Iterator[Document]:
+        blank = self._blank_rows()
+        for doc in super().lazy_load():
+            if doc.metadata.get("row") in blank:
+                doc.page_content = ""
+            yield doc
