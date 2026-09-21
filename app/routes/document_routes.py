@@ -93,7 +93,7 @@ from app.utils.extraction_budget import (
     ExtractionBudget,
 )
 from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget, OcrCancelled
-from app.utils.health import is_health_ok
+from app.utils.health import is_health_ok, keyword_search_health
 
 router = APIRouter()
 
@@ -775,7 +775,14 @@ async def health_check():
             # caller that only reads `status` is unaffected. It is here because this is the route
             # that actually answers in the deployed app, and a health check that cannot say WHICH
             # build is healthy leaves the only question a deployment receipt needs unanswerable.
-            return {"status": "UP", "build": build_summary()}
+            # `keyword_search` is additive too (F-HYBRID-HEALTH): the keyword arm fails per query
+            # into a dense-only answer, so without this an operator never learns it is gone.
+            # It never flips `status` -- dense retrieval still serves.
+            return {
+                "status": "UP",
+                "build": build_summary(),
+                "keyword_search": await keyword_search_health(),
+            }
         logger.error("Health check failed")
         return JSONResponse(status_code=503, content={"status": "DOWN"})
     except Exception as e:

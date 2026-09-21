@@ -178,3 +178,47 @@ def reciprocal_rank_fusion(
             [round(score, 6) for _doc, score in fused[:k]],
         )
     return fused[:k]
+
+
+# F-HYBRID-HEALTH: the keyword arm degrades SILENTLY. When `document_tsv` (tempo migration 10081)
+# is missing, `retrieve()` catches the failure per query, logs a warning and answers dense-only --
+# correct for the caller, invisible to an operator, because /health only ran `SELECT 1`. This probe
+# is read-only catalog SQL: it creates nothing and never touches `document_tsv` (TEMPO owns it).
+# `to_regclass` resolves the table through the same search_path the query path uses.
+_TSV_COLUMN_SQL = """
+    SELECT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass('langchain_pg_embedding')
+          AND attname = 'document_tsv' AND NOT attisdropped
+    )
+"""
+_TSV_GIN_SQL = """
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_am am ON am.oid = ic.relam
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = to_regclass('langchain_pg_embedding')
+          AND am.amname = 'gin' AND a.attname = 'document_tsv'
+    )
+"""
+
+
+async def keyword_search_state() -> Dict[str, str]:
+    """Whether the keyword arm can run: `available`, `degraded` (with a fixed reason) or `unknown`.
+
+    Never raises: a health surface that throws on the thing it reports is not a surface. The
+    reasons are fixed strings, never exception text -- /health is unauthenticated.
+    """
+    try:
+        pool = await PSQLDatabase.get_pool()
+        async with pool.acquire() as conn:
+            if not await conn.fetchval(_TSV_COLUMN_SQL):
+                return {"state": "degraded", "reason": "document_tsv column absent"}
+            if not await conn.fetchval(_TSV_GIN_SQL):
+                return {"state": "degraded", "reason": "document_tsv GIN index absent"}
+        return {"state": "available"}
+    except Exception as exc:  # the probe itself failing is not evidence either way
+        logger.warning("[keyword_search_state] probe failed: %s", exc)
+        return {"state": "unknown", "reason": "keyword search probe failed"}
