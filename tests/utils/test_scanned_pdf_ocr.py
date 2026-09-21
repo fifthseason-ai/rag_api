@@ -537,10 +537,11 @@ def test_a_text_layer_page_with_an_unread_image_is_a_known_coverage_gap(client):
     real text layer -- even a one-line header or footer -- is stamped `native` and its
     embedded image is NEVER read, however much text that image holds. Here the text
     layer is a single header line and the image holds the whole INVOICE. Only the header
-    reaches the store, yet the receipt reports `status: complete` with no `ocr` block and
-    no escalation: a consumer is told the page was fully covered when most of it was
-    never read. This is precisely the case A07 warns about -- text on the page is not
-    proof the page was read.
+    reaches the store, and the receipt now reports `status: partial` with `image_ocr:
+    not_attempted` and no `ocr` block: since #66 the gap is DISCLOSED rather than hidden
+    behind `complete`. The gap itself is unchanged -- the image is still never read --
+    which is precisely the case A07 warns about: text on the page is not proof the page
+    was read.
 
     Whether to OCR images on pages that already have a text layer is an OPEN PRODUCT
     DECISION (cost/latency), NOT decided here: measured cost is ~1.3 s/page steady-state
@@ -558,8 +559,9 @@ def test_a_text_layer_page_with_an_unread_image_is_a_known_coverage_gap(client):
 
     assert response.status_code == 200, response.text
     receipt = _receipt(response)
-    # The page reads as fully covered on the field consumers check...
-    assert receipt["status"] == "complete", receipt
+    # The page declares the gap on the field consumers check...
+    assert receipt["status"] == "partial", receipt
+    assert receipt["coverage"]["image_ocr"] == "not_attempted", receipt
     # ...because the text layer made it `native`, so OCR never looked at the image.
     assert "ocr" not in receipt, "the image must not have been OCR'd on a text-layer page"
     assert "escalation" not in receipt
