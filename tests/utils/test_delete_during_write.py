@@ -19,6 +19,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 import httpx
 import jwt
@@ -73,7 +74,26 @@ def _headers():
     return {"Authorization": f"Bearer {tok}"}
 
 
+class _WatchedLock:
+    """Wraps a lock and signals when a SECOND holder (the delete) has reached it, so the test
+    can release the paused upload at a known point instead of after a fixed sleep."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.second_holder_arrived = threading.Event()
+        self._calls = 0
+
+    @asynccontextmanager
+    async def hold(self, file_id, stop_waiting=None, max_wait=0):
+        self._calls += 1
+        if self._calls >= 2:
+            self.second_holder_arrived.set()
+        async with self.inner.hold(file_id, stop_waiting=stop_waiting, max_wait=max_wait):
+            yield
+
+
 def _run(monkeypatch, lock):
+    lock = _WatchedLock(lock)
     store = PausingStore()
     monkeypatch.setattr(document_routes, "vector_store", store)
     monkeypatch.setattr(document_routes, "EMBEDDING_BATCH_SIZE", 1, raising=False)
@@ -110,7 +130,10 @@ def _run(monkeypatch, lock):
         assert store.first_batch_done.wait(20), "the upload never reached its first batch"
         dl = threading.Thread(target=delete)
         dl.start()
-        time.sleep(0.5)  # give the delete its chance to run before the upload resumes
+        assert lock.second_holder_arrived.wait(20), "the delete never reached the file lock"
+        # Without a real lock the delete now runs to completion; with one it stays blocked,
+        # and this join simply times out. Either way the state below is settled.
+        dl.join(2)
         out["rows_while_upload_paused"] = len(store.documents_for(FID))
         store.go_on.set()
         up.join(30)
