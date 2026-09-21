@@ -475,8 +475,15 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
         )
         return (
             status.HTTP_400_BAD_REQUEST,
-            f"'{name}' is a legacy Office format (.doc, .xls, .ppt) and this service cannot read "
-            f"one: LibreOffice is not installed on the server. Re-saving it in the modern format "
+            # DELIBERATELY NOT A LIST OF EXTENSIONS. The first version said "a legacy Office
+            # format (.doc, .xls, .ppt) and this service cannot read one", and measurement
+            # showed that to be false for `.xls`: a genuine BIFF8 workbook parses with NO
+            # LibreOffice installed (200, rows stored). `.doc` was never tested, so it is not
+            # claimed either. The enumeration was never load-bearing -- this branch fires on the
+            # soffice error whatever raised it -- so dropping it removes a false claim without
+            # weakening either action.
+            f"'{name}' could not be read: it is in an older Office format that needs LibreOffice, "
+            f"which is not installed on this server. Re-saving it in the current format "
             f"(.docx, .xlsx, .pptx) will work today; installing LibreOffice is the operator fix. "
             f"Retrying this upload unchanged will not help. Reference: {reference}.",
         )

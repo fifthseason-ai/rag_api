@@ -676,8 +676,17 @@ def test_a_missing_libreoffice_is_permanent_not_a_retryable_503():
     )
     assert "quarterly.ppt" in message
     assert "LibreOffice" in message, "the operator action must be named"
-    assert ".pptx" in message, "the caller's own fix -- re-save in the modern format -- must be named"
+    assert ".pptx" in message, "the caller's own fix -- re-save in the current format -- must be named"
     assert "soffice" not in message, "the library's internal command name is not a caller's business"
+    # MEASURED F-LEGACY2: a genuine BIFF8 .xls parses with NO LibreOffice installed (200, rows
+    # stored). The first version of this message said "a legacy Office format (.doc, .xls, .ppt)
+    # and this service cannot read one", which told a reader this service cannot read a format it
+    # reads. The enumeration was never load-bearing -- the branch fires on the soffice error
+    # whatever raised it.
+    assert ".xls" not in message.replace(".xlsx", ""), (
+        "the message claims .xls is unreadable; measured, a genuine .xls parses without "
+        "LibreOffice at all: %r" % message
+    )
 
 
 def test_a_filename_cannot_forge_the_libreoffice_verdict():
