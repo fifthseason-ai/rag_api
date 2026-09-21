@@ -4,6 +4,7 @@ Negative space: a caller-supplied id outside the token entitlement must never be
 read, embedded or deleted; an action not granted by the token must be refused; a
 document owned by an unauthorized entity must never be returned.
 """
+import uuid
 import io
 import os
 import datetime
@@ -296,9 +297,11 @@ def test_embed_stores_tenant_id_in_metadata(monkeypatch):
     def fake_prepare(
         data, file_id, user_id, clean_content, document_origin_type=None,
         filename=None, link=None, subscription_id=None, tenant_id=None,
+        ingest_id=None,
     ):
         captured["tenant_id"] = tenant_id
         captured["user_id"] = user_id
+        captured["ingest_id"] = ingest_id
         return [Document(page_content="x", metadata={"file_id": file_id, "user_id": user_id})]
 
     monkeypatch.setattr(document_routes, "_prepare_documents_sync", fake_prepare)
@@ -310,6 +313,8 @@ def test_embed_stores_tenant_id_in_metadata(monkeypatch):
     assert r.status_code == 200, r.text
     assert captured["tenant_id"] == "tenantXYZ"
     assert captured["user_id"] == "userA"
+    # F03: the route mints and passes an ingest_id (a real UUID, not the stub default None).
+    assert captured["ingest_id"] and uuid.UUID(captured["ingest_id"]).version == 4
 
 
 # --- pgvector debug record routes (reviewer F1) -----------------------------

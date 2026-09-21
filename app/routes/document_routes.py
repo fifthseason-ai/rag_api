@@ -1722,6 +1722,7 @@ def _prepare_documents_sync(
     link: str = None,
     subscription_id: str = None,
     tenant_id: str = None,
+    ingest_id: str = None,
 ) -> List[Document]:
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
@@ -1774,6 +1775,14 @@ def _prepare_documents_sync(
         **({"filename": filename} if filename else {}),
         **({"link": link} if link else {}),
         **({"subscription_id": subscription_id} if subscription_id else {}),
+        # FILES-01 F03 / Core C05 (CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md, Q1). One id
+        # per write, on every chunk of it. A citation records the id it was taken from; if
+        # the file is later replaced, the current rows carry a DIFFERENT id, so Core can say
+        # "this source has changed since it was cited" instead of silently opening new text.
+        # A service field, so it wins over anything a loader emits: a document must not be
+        # able to assert which version it is. Absent on rows written before this existed,
+        # and Core reads absent as UNKNOWN, never as unchanged.
+        **({"ingest_id": ingest_id} if ingest_id else {}),
     }
 
     return [
@@ -2488,6 +2497,11 @@ async def _store_data_in_vector_db_unlocked(
         link,
         subscription_id,
         tenant_id,
+        # F03: a new id for THIS write. Only a write that succeeds leaves rows carrying it:
+        # a failed or abandoned one is rolled back (and a replacement deletes the version
+        # it supersedes only after its own insert succeeded), so a reader always sees the
+        # id that belongs to the content in front of them.
+        str(uuid.uuid4()),
     )
 
     # F04: the rows this file ALREADY had, captured before anything is inserted, so an
