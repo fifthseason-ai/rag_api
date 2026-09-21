@@ -192,6 +192,59 @@ def _text_page(writer, lines, size=12):
     return page
 
 
+def _text_and_image_page(writer, text_lines, image, text_size=12):
+    """One page carrying BOTH a real text layer AND an embedded image.
+
+    This is what a page looks like when a small caption/header/footer is typed over
+    a scanned body: pypdf reads the text operators, so `page_content` is non-empty and
+    the OCR path (which only fires on an EMPTY page) never looks at the image. Used to
+    pin the text-first coverage limitation, not to exercise OCR.
+    """
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=80)
+    data = buffer.getvalue()
+    width, height = image.size
+    page_w, page_h = 612, 792
+
+    xobject = DecodedStreamObject()
+    xobject.set_data(data)
+    xobject[NameObject("/Type")] = NameObject("/XObject")
+    xobject[NameObject("/Subtype")] = NameObject("/Image")
+    xobject[NameObject("/Width")] = NumberObject(width)
+    xobject[NameObject("/Height")] = NumberObject(height)
+    xobject[NameObject("/ColorSpace")] = NameObject("/DeviceRGB")
+    xobject[NameObject("/BitsPerComponent")] = NumberObject(8)
+    xobject[NameObject("/Filter")] = NameObject("/DCTDecode")
+    reference = writer._add_object(xobject)
+
+    page = writer.add_blank_page(width=page_w, height=page_h)
+    named = DictionaryObject()
+    named[NameObject("/Im0")] = reference
+
+    font = DictionaryObject()
+    font[NameObject("/Type")] = NameObject("/Font")
+    font[NameObject("/Subtype")] = NameObject("/Type1")
+    font[NameObject("/BaseFont")] = NameObject("/Helvetica")
+    fonts = DictionaryObject()
+    fonts[NameObject("/F1")] = writer._add_object(font)
+
+    resources = DictionaryObject()
+    resources[NameObject("/XObject")] = named
+    resources[NameObject("/Font")] = fonts
+    page[NameObject("/Resources")] = resources
+
+    operators = ["q %d 0 0 %d 0 0 cm /Im0 Do Q" % (page_w, page_h), "BT /F1 %d Tf" % text_size]
+    y = 760
+    for line in text_lines:
+        operators.append(f"1 0 0 1 72 {y} Tm ({line}) Tj")
+        y -= int(text_size * 1.6)
+    operators.append("ET")
+    content = DecodedStreamObject()
+    content.set_data(" ".join(operators).encode("latin-1"))
+    page[NameObject("/Contents")] = writer._add_object(content)
+    return page
+
+
 def _bytes(writer):
     buffer = io.BytesIO()
     writer.write(buffer)
@@ -474,6 +527,53 @@ def test_upside_down_scan_is_a_known_blind_spot(client):
     )
     assert _receipt(response)["escalation"]["recommended"] is False, (
         "still undetected locally -- this is the documented gap, reported to Core"
+    )
+
+
+def test_a_text_layer_page_with_an_unread_image_is_a_known_coverage_gap(client):
+    """PINNED, NOT CELEBRATED. The text-first coverage limitation, measured.
+
+    OCR fires only on a page whose `page_content` is empty. So a page that carries a
+    real text layer -- even a one-line header or footer -- is stamped `native` and its
+    embedded image is NEVER read, however much text that image holds. Here the text
+    layer is a single header line and the image holds the whole INVOICE. Only the header
+    reaches the store, yet the receipt reports `status: complete` with no `ocr` block and
+    no escalation: a consumer is told the page was fully covered when most of it was
+    never read. This is precisely the case A07 warns about -- text on the page is not
+    proof the page was read.
+
+    Whether to OCR images on pages that already have a text layer is an OPEN PRODUCT
+    DECISION (cost/latency), NOT decided here: measured cost is ~1.3 s/page steady-state
+    in this image (first page ~4.5 s incl. engine warm-up). See the F05 coverage receipt.
+
+    This test exists so the gap is visible and cannot change silently. If a later change
+    starts OCR-ing text-layer pages (or flags the unread image), the image text will
+    reach the store / an `ocr` block will appear and this test will fail -- forcing a
+    conscious update of the contract and Richard's open question rather than a silent
+    semantic drift.
+    """
+    writer = PdfWriter()
+    _text_and_image_page(writer, ["Page 1 header"], _render(INVOICE), text_size=12)
+    response = _embed(client, "textlayer_over_scan.pdf", _bytes(writer))
+
+    assert response.status_code == 200, response.text
+    receipt = _receipt(response)
+    # The page reads as fully covered on the field consumers check...
+    assert receipt["status"] == "complete", receipt
+    # ...because the text layer made it `native`, so OCR never looked at the image.
+    assert "ocr" not in receipt, "the image must not have been OCR'd on a text-layer page"
+    assert "escalation" not in receipt
+    assert receipt["text_sources"] == {"native": [0]}, receipt.get("text_sources")
+
+    stored = _stored(client)
+    assert "Page 1 header" in stored, "the text layer must be stored"
+    # THE GAP: the image's text is absent from the store. If this recall climbs, the gap
+    # is closing (someone started reading text-layer images) and the contract/question
+    # above must be revisited.
+    assert char_recall(stored, INVOICE) < 0.3, (
+        f"the image's text is now reaching the store (recall {char_recall(stored, INVOICE):.2f}) "
+        "-- the text-first coverage gap may have been closed; update the F05 receipt and "
+        "Core's contract before relaxing this guard"
     )
 
 
