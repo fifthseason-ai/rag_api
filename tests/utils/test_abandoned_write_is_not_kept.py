@@ -195,6 +195,42 @@ def test_batched_path_stops_inserting_once_the_caller_has_gone(server, monkeypat
     assert store.documents_for(FID) == []
 
 
+def _seed_prior_version(store):
+    store.rows.append(FakeRow(FID, V1, {"user_id": "userA", "tenant_id": "tenantA",
+                                        "filename": "policy-v1.txt"}))
+    prior = store.uuids_for(FID)
+    assert prior, "precondition: a prior version exists"
+    return prior
+
+
+def test_batched_abandoned_additive_upload_keeps_the_earlier_rows(server, monkeypatch):
+    """Review MINOR-2. The batched pipeline has its OWN file-wide rollback
+    (`delete(ids=[file_id])`); if it ever ran on an abandoned write it would destroy the
+    rows an earlier upload left. Only the capture-based undo may run here."""
+    store, base, finished = server
+    monkeypatch.setattr(document_routes, "EMBEDDING_BATCH_SIZE", 1, raising=False)
+    prior = _seed_prior_version(store)
+
+    _abandon_during_insert(store, base, finished, V2 * 3, filename="policy-v2.txt")
+
+    assert store.inserts == 1, "precondition: the batched path ran and was stopped"
+    assert store.uuids_for(FID) == prior
+    assert "delete-by-file_id" not in store.calls, store.calls
+
+
+def test_batched_abandoned_replacement_keeps_the_superseded_version(server, monkeypatch):
+    store, base, finished = server
+    monkeypatch.setattr(document_routes, "EMBEDDING_BATCH_SIZE", 1, raising=False)
+    prior = _seed_prior_version(store)
+
+    _abandon_during_insert(store, base, finished, V2 * 3, replace=True,
+                           filename="policy-v2.txt")
+
+    assert store.inserts == 1, "precondition: the batched path ran and was stopped"
+    assert store.uuids_for(FID) == prior, "the version being superseded was not kept intact"
+    assert "delete-by-file_id" not in store.calls, store.calls
+
+
 def test_a_caller_who_waits_still_gets_the_file_stored(server):
     """The gate must not cost the ordinary case anything."""
     store, base, finished = server
