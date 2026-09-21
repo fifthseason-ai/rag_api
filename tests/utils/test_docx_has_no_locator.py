@@ -5,6 +5,16 @@ which metadata key means "this chunk can be cited at a page / slide / sheet":
 
     (("page", "page"), ("slide", "slide_number"), ("sheet", "page_name"))
 
+THAT LITERAL IS A SNAPSHOT OF THIS BRANCH AND WILL DRIFT. #36 adds
+("row", "row") -- so on any tree containing it the tuple has FOUR families and
+the line above is stale. An independent review read this file against the
+composed candidate and reported the count as wrong; it is correct here and wrong
+there, which is the same "true on one base, asserted about another" mistake this
+lane has made in its own work several times. The prose is the only thing that
+drifts: every assertion below reads the tuple from the module, so a family added
+later is checked against DOCX automatically and this paragraph going stale cannot
+weaken the test. Do not re-type the tuple anywhere else.
+
 DOCX has no such unit. `Docx2txtLoader` flattens the whole document to ONE
 Document whose metadata is exactly `{'source': ...}` (measured, both routings),
 so every DOCX folds into a single `none` unit with nothing finer to cite. If a
