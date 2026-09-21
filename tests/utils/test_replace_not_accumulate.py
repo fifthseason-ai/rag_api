@@ -294,10 +294,11 @@ def test_the_capture_happens_before_the_insert_and_the_delete_after_it(client, s
     assert _embed(client, V1, "policy-v1.txt").status_code == 200
     store.calls.clear()
     assert _embed(client, V2, "policy-v2.txt", replace=True).status_code == 200
-    # Two captures: the scoped one whose rows will be deleted, and an unscoped one that
-    # counts what this caller's scope cannot see (see `out_of_scope_rows`). Both are
-    # reads and both must precede the insert.
-    assert store.calls == ["capture", "capture", "insert", "delete"], store.calls
+    # Three captures: the scoped one whose rows will be deleted, the owner-scoped one that
+    # counts what this caller's scope cannot see (see `out_of_scope_rows`), and the
+    # file-wide one F04 uses to undo exactly this call's rows if the caller leaves before
+    # the write is final. All are reads and all must precede the insert.
+    assert store.calls == ["capture", "capture", "capture", "insert", "delete"], store.calls
 
 
 def test_the_document_is_never_empty_at_any_moment_of_the_swap(client, store):
@@ -670,9 +671,10 @@ def test_capture_precedes_every_insert_and_delete_follows_the_last(client, store
     assert all(c == "capture" for c in calls[:first_insert]), (
         "something other than the capture ran before the first insert: %r" % calls
     )
-    assert calls[:first_insert].count("capture") == 2, (
-        "both captures must precede the first insert -- the scoped one that feeds the "
-        "delete and the owner-scoped one behind out_of_scope_rows: %r" % calls
+    assert calls[:first_insert].count("capture") == 3, (
+        "every capture must precede the first insert -- the scoped one that feeds the "
+        "delete, the owner-scoped one behind out_of_scope_rows, and F04's file-wide one "
+        "behind the abandoned-write undo: %r" % calls
     )
     assert delete_at > last_insert, (
         "the delete ran before the last insert, so a later batch lands after it and "
