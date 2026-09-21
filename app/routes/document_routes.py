@@ -439,6 +439,33 @@ def is_service_fault(error: BaseException) -> bool:
     return False
 
 
+def client_safe_error(exc: BaseException, context: str, status_code: int = 500) -> HTTPException:
+    """Log an unexpected error under a reference and return a caller-safe HTTPException.
+
+    The read/delete routes (`/documents`, `/documents/{id}/context`, `/query`,
+    `/query/{entity_id}`, `/query_multiple`) used to `raise HTTPException(detail=str(e))`,
+    handing the caller the raw exception text. The intake surfaces and the auth middleware
+    already stopped doing that (#26/#34/#35): the operator gets the exception, its traceback
+    and the route context in the LOG under a reference; the caller gets a generic sentence
+    and that reference. This extends the same rule to the routes that still leaked.
+
+    Why it matters even though these routes are authenticated: this is a multi-tenant
+    service, and an exception string can carry store internals or another tenant's data
+    (a DB error quoting a row, a path built from a filename). One authenticated tenant must
+    not receive another's internals. `status_code` is left to the caller so a route keeps
+    the status it already returned -- this changes only what text crosses the wire.
+    """
+    reference = uuid.uuid4().hex[:12]
+    logger.error("%s [reference=%s]: %s\n%s", context, reference, exc, traceback.format_exc())
+    return HTTPException(
+        status_code=status_code,
+        detail=(
+            "An internal error occurred processing this request. "
+            f"Quote reference {reference} to an operator."
+        ),
+    )
+
+
 def describe_failure(error: BaseException, filename: str) -> tuple:
     """Turn a non-verdict failure into `(status_code, caller_message)` and log the real detail.
 
@@ -829,13 +856,7 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error getting documents by IDs | IDs: %s | Error: %s | Traceback: %s",
-            ids,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Error getting documents by IDs | IDs: {ids}")
 
 
 #: The producers a delete may be narrowed to. These are the exact values the PDF loader
@@ -1018,13 +1039,7 @@ async def delete_documents(
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Failed to delete documents | IDs: %s | Error: %s | Traceback: %s",
-            document_ids,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Failed to delete documents | IDs: {document_ids}")
     finally:
         await file_locks.aclose()
 
@@ -1240,14 +1255,7 @@ async def query_embeddings_by_file_id(
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error in query embeddings | File ID: %s | Query: %s | Error: %s | Traceback: %s",
-            body.file_id,
-            body.query,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Error in query embeddings | File ID: {body.file_id}")
 
 
 # response_model as on `/query` (#45, F-QC1): SIBLING ROUTE, MEASURED byte-identical.
@@ -1303,14 +1311,7 @@ async def query_embeddings_by_entity_id(
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error in query by entity | Entity ID: %s | Query: %s | Error: %s | Traceback: %s",
-            entity_id,
-            body.query,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Error in query by entity | Entity ID: {entity_id}")
 
 
 #: HTTP 499 ("client closed request"). Nobody reads this response -- the caller has gone --
@@ -3058,15 +3059,11 @@ async def load_document_context(request: Request, id: str):
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error loading document context | Document ID: %s | Error: %s | Traceback: %s",
-            id,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(
+        # Kept at 400 (the status this route already returned) -- this change removes the
+        # raw exception text, not the status contract.
+        raise client_safe_error(
+            e, f"Error loading document context | Document ID: {id}",
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
 
@@ -3215,14 +3212,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error in query multiple embeddings | File IDs: %s | Query: %s | Error: %s | Traceback: %s",
-            body.file_ids,
-            body.query,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Error in query multiple embeddings | File IDs: {body.file_ids}")
 
 
 @router.post("/text")
