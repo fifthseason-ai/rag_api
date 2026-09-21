@@ -50,6 +50,7 @@ from app.config import (
     RERANK_ENABLED,
     RERANK_CANDIDATES,
     RERANK_TOP_N, SUM_UP_KNOWLEDGE_FILES,
+    SUMMARY_TIMEOUT_SECONDS,
 )
 from app.constants import ERROR_MESSAGES
 from app.models import (
@@ -2819,6 +2820,21 @@ async def embed_local_file(
         raise HTTPException(status_code=status_code, detail=message) from e
 
 
+async def _summarize_within_timeout(loop, executor, llm_instance, grouped):
+    """Run the summarizer worker under a wall-clock bound (FILES-01 F04).
+
+    `summarize_files` makes a synchronous LLM call; on a slow/hung model it would otherwise
+    hold a pool thread and its request forever. `asyncio.wait_for` bounds the AWAIT, so the
+    caller is freed after SUMMARY_TIMEOUT_SECONDS with `asyncio.TimeoutError`. It does NOT
+    kill the worker thread (the future is cancelled; the thread runs on) -- documented in
+    app/config.py -- but it stops a request hanging indefinitely, which is the reachable half.
+    """
+    return await asyncio.wait_for(
+        loop.run_in_executor(executor, summarize_files, llm_instance, grouped),
+        timeout=SUMMARY_TIMEOUT_SECONDS,
+    )
+
+
 async def _generate_summary_background(
     file_id: str,
     user_id: str,
@@ -2833,11 +2849,8 @@ async def _generate_summary_background(
             return
 
         loop = asyncio.get_running_loop()
-        summary = await loop.run_in_executor(
-            executor,
-            summarize_files,
-            llm_instance,
-            {file_id: docs},
+        summary = await _summarize_within_timeout(
+            loop, executor, llm_instance, {file_id: docs}
         )
         if summary:
             s = summary[0]
@@ -2847,6 +2860,14 @@ async def _generate_summary_background(
                 file_id,
                 s["chunk_count"],
             )
+    except asyncio.TimeoutError:
+        # A background task has no caller to answer; bounding it just stops one hung model
+        # call from holding a pool thread's request past the limit. The embeddings are
+        # already stored, so the file is fully usable without the summary.
+        logger.warning(
+            "Background summary timed out after %ss for file %s (embeddings preserved)",
+            SUMMARY_TIMEOUT_SECONDS, file_id,
+        )
     except Exception as e:
         logger.warning(
             "Background summary failed for file %s: %s (embeddings preserved)",
@@ -3374,12 +3395,25 @@ async def summarize_entity_files(
         # Compute on-the-fly summaries for files without cache
         if files_to_summarize:
             loop = asyncio.get_running_loop()
-            on_the_fly = await loop.run_in_executor(
-                request.app.state.thread_pool,
-                summarize_files,
-                llm,
-                files_to_summarize,
-            )
+            try:
+                on_the_fly = await _summarize_within_timeout(
+                    loop, request.app.state.thread_pool, llm, files_to_summarize
+                )
+            except asyncio.TimeoutError as timeout_error:
+                # F04: bound the request rather than hang it. A retryable 503 -- the model
+                # did not answer in time; this is not the file's fault and not a fake
+                # success (we return no summary rather than an empty/invented one).
+                logger.warning(
+                    "On-the-fly summary timed out after %ss for entity %s (%d file(s))",
+                    SUMMARY_TIMEOUT_SECONDS, entity_id, len(files_to_summarize),
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        "Summary generation timed out; nothing was summarised. Retry, or "
+                        "request fewer files."
+                    ),
+                ) from timeout_error
             summaries.extend(on_the_fly)
 
             # Persist newly computed summaries to DB for future requests

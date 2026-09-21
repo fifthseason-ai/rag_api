@@ -575,6 +575,17 @@ SUM_UP_KNOWLEDGE_FILES = get_env_variable("SUM_UP_KNOWLEDGE_FILES", "False").low
     "t",
 )
 
+# FILES-01 F04 (worker resource protection): the summarizer runs an LLM call
+# (`summarize_files` -> `.invoke`) inside a thread-pool worker. Unbounded, a slow or hung
+# model call holds one of the pool's (max 8) threads and blocks its request indefinitely;
+# enough of them wedge the service. This bounds the summary REQUEST. Default 60 s, matching
+# the OCR time budget's derivation from Core's 120 s client timeout (half the window).
+# Note the limit this cannot cross: it frees the awaiting request, not the worker thread --
+# `wait_for` cancels the future, the thread runs to completion (same as the OCR path). A
+# request timeout on the LLM CLIENT is the operator's deeper control and is not set here,
+# because it would change behaviour for every LLM consumer, not just the summarizer.
+SUMMARY_TIMEOUT_SECONDS = float(get_env_variable("SUMMARY_TIMEOUT_SECONDS", "60"))
+
 # Vector store
 if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
     vector_store = get_vector_store(
