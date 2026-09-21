@@ -614,9 +614,29 @@ def _batched(monkeypatch):
     monkeypatch.setattr(document_routes, "EMBEDDING_BATCH_SIZE", 1, raising=False)
 
 
+def _assert_really_batched(calls):
+    """Each test's OWN precondition, not a sibling's.
+
+    Independent review confirmed under mutation that forcing the single-shot branch reddens the
+    dedicated precondition test and leaves the two payload tests GREEN -- passing, on the very
+    path they were written to avoid. A test that depends on a sibling for its meaning is one
+    edit away from vacuous, and the edit will look unrelated to it.
+    """
+    inserts = [c for c in calls if c == "insert"]
+    assert len(inserts) > 1, (
+        "only %d insert(s): the batched branch was not taken, so this test is measuring the "
+        "single-shot path it exists to avoid. calls=%r" % (len(inserts), calls)
+    )
+
+
 def test_the_batched_path_is_really_taken(client, store, monkeypatch):
-    """PRECONDITION. If only one insert happens the batched branch was not exercised and
-    both assertions below are true of the single-shot path they were written to avoid."""
+    """PRECONDITION, kept even though both payload tests now assert it themselves.
+
+    It fails FIRST and with the clearest message when the branch stops being reachable -- a
+    batch-size default change, or `calculate_num_batches` returning 1 -- so the suite says "the
+    batched path was not taken" rather than three tests each reporting something subtler about
+    ordering or receipts. The duplication is deliberate: this one names the cause.
+    """
     assert _embed(client, V1, "policy-v1.txt").status_code == 200
     _batched(monkeypatch)
     store.calls.clear()
@@ -641,6 +661,7 @@ def test_capture_precedes_every_insert_and_delete_follows_the_last(client, store
     assert _embed(client, V2, "policy-v2.txt", replace=True).status_code == 200
 
     calls = store.calls
+    _assert_really_batched(calls)
     assert "delete" in calls and "insert" in calls, calls
     first_insert = calls.index("insert")
     last_insert = len(calls) - 1 - calls[::-1].index("insert")
@@ -666,8 +687,10 @@ def test_the_receipt_is_still_exact_on_the_batched_path(client, store, monkeypat
     assert v1_rows > 1, "fixture must produce several chunks for batching to mean anything"
 
     _batched(monkeypatch)
+    store.calls.clear()
     r = _embed(client, V2, "policy-v2.txt", replace=True)
     assert r.status_code == 200, r.text
+    _assert_really_batched(store.calls)
     rep = r.json()["replacement"]
     assert rep == {
         "superseded_rows": v1_rows,
