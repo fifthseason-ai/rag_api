@@ -1116,6 +1116,7 @@ async def _process_documents_async_pipeline(
     file_id: str,
     vector_store: "AsyncPgVector",
     executor: "ThreadPoolExecutor",
+    protected_row_uuids: Optional[List[str]] = None,
 ) -> List[str]:
     """
     Process documents using async producer-consumer pattern for batched embedding and insertion.
@@ -1265,8 +1266,29 @@ async def _process_documents_async_pipeline(
         if all_ids:
             try:
                 logger.warning("Performing rollback of file %s", file_id)
-                await vector_store.delete(ids=[file_id], executor=executor)
-                logger.info("Rollback completed for file %s", file_id)
+                if protected_row_uuids:
+                    # A REPLACEMENT IS IN FLIGHT AND THE OLD VERSION IS STILL THE ONLY GOOD
+                    # COPY. The plain rollback below deletes by custom_id, i.e. EVERY row for
+                    # this file -- which here means the rows this call was supposed to
+                    # supersede, not merely the ones it wrote. Independent review demonstrated
+                    # it end to end: with the production default EMBEDDING_BATCH_SIZE=500, a
+                    # failure on any batch after the first left the file with ZERO rows and
+                    # answered 400, so a caller retrying only on 5xx would treat the document
+                    # as done while the only good copy was gone.
+                    #
+                    # Roll back only what THIS call inserted: everything present now that was
+                    # not present at capture.
+                    protected = set(protected_row_uuids)
+                    current = await vector_store.get_row_uuids(file_id, executor=executor)
+                    inserted = [u for u in current if u not in protected]
+                    await vector_store.delete_rows_by_uuid(inserted, executor=executor)
+                    logger.info(
+                        "Rollback completed for file %s: removed %d newly inserted row(s), "
+                        "kept %d pre-existing", file_id, len(inserted), len(protected),
+                    )
+                else:
+                    await vector_store.delete(ids=[file_id], executor=executor)
+                    logger.info("Rollback completed for file %s", file_id)
             except Exception as cleanup_error:
                 logger.error("Rollback failed for file %s: %s", file_id, cleanup_error)
 
@@ -1279,6 +1301,7 @@ async def _process_documents_batched_sync(
     file_id: str,
     vector_store: "PgVector",
     executor: "ThreadPoolExecutor",
+    protected_row_uuids: Optional[List[str]] = None,
 ) -> List[str]:
     """
     Process documents in batches using synchronous vector store operations.
@@ -1342,10 +1365,29 @@ async def _process_documents_batched_sync(
             ):  # any batch succeeded (i.e., any chunks for this file were inserted)
                 logger.warning("Rolling back file %s due to batch failure", file_id)
                 try:
-                    await loop.run_in_executor(
-                        executor, lambda: vector_store.delete(ids=[file_id])
-                    )
-                    logger.info("Rollback completed for file %s", file_id)
+                    if protected_row_uuids:
+                        # See the same guard in _process_documents_async_pipeline: under a
+                        # replacement, a delete-by-file_id removes the version this call was
+                        # superseding, which is still the only good copy while the new one
+                        # has failed. Roll back only what THIS call inserted.
+                        protected = set(protected_row_uuids)
+                        current = await loop.run_in_executor(
+                            executor, lambda: vector_store.get_row_uuids(file_id)
+                        )
+                        inserted = [u for u in current if u not in protected]
+                        await loop.run_in_executor(
+                            executor, lambda: vector_store.delete_rows_by_uuid(inserted)
+                        )
+                        logger.info(
+                            "Rollback completed for file %s: removed %d newly inserted "
+                            "row(s), kept %d pre-existing",
+                            file_id, len(inserted), len(protected),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            executor, lambda: vector_store.delete(ids=[file_id])
+                        )
+                        logger.info("Rollback completed for file %s", file_id)
                 except Exception as rollback_error:
                     logger.error(
                         "Rollback failed for file %s: %s", file_id, rollback_error
@@ -1862,7 +1904,96 @@ async def store_data_in_vector_db(
     link: str = None,
     subscription_id: str = None,
     tenant_id: str = None,
+    replace: bool = False,
 ) -> dict:
+    """Store one file's chunks. With `replace`, supersede the file's current rows.
+
+    REPLACEMENT SEMANTICS (FILES-01 F3, contract agreed with Core 2026-09-20).
+
+    Measured before this existed: a second upload under the same file_id ADDED rows. Both
+    versions stayed retrievable under one identity, a query returned the old limit and the
+    new limit side by side, and nothing on either row said which was current. The scoped
+    delete that handles the OCR->native swap keys on `text_source`, a PRODUCER axis, so it
+    cannot separate two versions from the same producer -- two .txt uploads both carry
+    `text_source = None`.
+
+    `replace` captures the file's CURRENT row primary keys BEFORE the insert, inserts, and
+    then deletes exactly those captured rows. Three properties, in the order they matter:
+
+    1. The capture is taken BEFORE the insert and is a list of ROW identities, not "delete
+       everything except what I just wrote". Those are not the same instruction. If the new
+       version produces a chunk byte-identical to an old one -- the ordinary case when a
+       document is edited in one place -- an "except what I wrote" rule either deletes the
+       row it just created or spares a superseded one. The primary key cannot be confused
+       this way, and it is why the identity is the row and not its content or digest.
+    2. Insert first, delete second, so the document never passes through zero rows. A
+       reader querying during the swap sees the old version or both, never nothing. This is
+       the same ordering the OCR escalation path already uses.
+    3. A failed insert never removes the old version. Two different mechanisms, and the
+       second was missing until independent review demonstrated the loss: the single-shot
+       path RAISES before `delete_rows_by_uuid` is reached, and the BATCHED paths (the
+       production default is EMBEDDING_BATCH_SIZE=500) roll back only the rows this call
+       inserted instead of deleting by file_id. The earlier wording here claimed the first
+       mechanism covered both. It did not: a failure on any batch after the first left the
+       file with ZERO rows and answered 400, so a caller retrying only on 5xx would have
+       treated the document as done with the only good copy gone.
+
+    The count removed is reported, never assumed. A replacement that did not remove what it
+    superseded leaves stale content retrievable, which is a fact the caller has to receive
+    rather than infer from a 200.
+    """
+    superseded_rows = None
+    if replace:
+        if not hasattr(vector_store, "get_row_uuids"):
+            # Refuse rather than silently ingest without replacing. A caller that asked to
+            # supersede and got a 200 would believe the old version is gone.
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    "replace is not supported by this vector store; nothing was stored. "
+                    "The previous version would have remained retrievable."
+                ),
+            )
+        if isinstance(vector_store, AsyncPgVector):
+            superseded_rows = await vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, tenant_id=tenant_id, executor=executor
+            )
+            all_rows_before = await vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, executor=executor
+            )
+        else:
+            superseded_rows = vector_store.get_row_uuids(
+                file_id, user_id=user_id or None, tenant_id=tenant_id
+            )
+            all_rows_before = vector_store.get_row_uuids(file_id, user_id=user_id or None)
+        # ROWS OF THIS CALLER'S OWN FILE that the TENANT filter cannot see, and therefore
+        # cannot supersede. Counted because independent review found the silent case:
+        # rows written before `tenant_id` was populated carry no such key, so a
+        # tenant-scoped capture returns NOTHING for them. The delete then removes 0 of 0
+        # captured rows and `removed == len(captured)` reads as a complete replacement --
+        # while the old version is still there and still retrievable.
+        #
+        # SCOPED BY `user_id`, and that scoping is the whole correctness of this number.
+        # It was unscoped at first, which swept in rows belonging to ANY tenant that
+        # happened to use the same `file_id` -- and `file_id` arrives in the form body,
+        # so a caller chooses it. Measured 2026-09-20: tenant B held 4 rows under
+        # `quarterly-board-pack`; tenant A uploaded its own file under that name and
+        # replaced it, and got back `out_of_scope_rows: 4` with `status: incomplete`
+        # against a control of 0 and `complete`. Three defects in one number -- an
+        # existence oracle for a caller-chosen id, the exact row count of a document the
+        # caller is not entitled to, and a FALSE ALARM about the caller's own data that
+        # a consumer renders to a person as "a previous version may still be
+        # retrievable".
+        #
+        # `user_id` keeps exactly the case this field exists for -- same owner, missing
+        # tenant key -- and excludes a stranger's rows, whose `user_id` differs. Same
+        # shape as the `/ids` disclosure fixed in #38: an unscoped primitive reachable
+        # from a request.
+        #
+        # A count, never content: the caller already named this file_id, and a number is
+        # what it takes to stop a 200 meaning "the old version is gone" when it is not.
+        out_of_scope_rows = max(0, len(all_rows_before) - len(superseded_rows))
+
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     docs = await loop.run_in_executor(
@@ -1895,15 +2026,44 @@ async def store_data_in_vector_db(
 
             if isinstance(vector_store, AsyncPgVector):
                 ids = await _process_documents_async_pipeline(
-                    docs, file_id, vector_store, executor
+                    docs, file_id, vector_store, executor,
+                    protected_row_uuids=superseded_rows,
                 )
             else:
                 # Fallback to batched processing for sync vector stores
                 ids = await _process_documents_batched_sync(
-                    docs, file_id, vector_store, executor
+                    docs, file_id, vector_store, executor,
+                    protected_row_uuids=superseded_rows,
                 )
 
-        return {"message": "Documents added successfully", "ids": ids, "docs": docs}
+        result = {"message": "Documents added successfully", "ids": ids, "docs": docs}
+
+        if superseded_rows is not None:
+            # Only now -- the new rows exist, so removing the old ones cannot empty the
+            # document. Reached only on the success path; the except below re-raises.
+            if isinstance(vector_store, AsyncPgVector):
+                removed = await vector_store.delete_rows_by_uuid(
+                    superseded_rows, executor=executor
+                )
+            else:
+                removed = vector_store.delete_rows_by_uuid(superseded_rows)
+            result["replacement"] = {
+                "superseded_rows": len(superseded_rows),
+                "removed": removed,
+                # Rows for this file that the caller's own scope could not see and
+                # therefore could not supersede. Zero is the ordinary case.
+                "out_of_scope_rows": out_of_scope_rows,
+                # `complete` requires BOTH: every captured row gone, AND nothing left
+                # behind outside the capture's scope. Either shortfall means superseded
+                # content is still retrievable, and saying `complete` would be the fake
+                # success this receipt exists to prevent.
+                "status": (
+                    "complete"
+                    if removed == len(superseded_rows) and out_of_scope_rows == 0
+                    else "incomplete"
+                ),
+            }
+        return result
 
     except Exception as e:
         logger.error(
@@ -2092,12 +2252,14 @@ async def embed_file(
     document_owner_type: Optional[DocumentOwnerType] = Form(DocumentOwnerType.AGENT),
     document_origin_type: DocumentOriginType = Form(DocumentOriginType.ORGANIC),
     link: Optional[str] = Form(None),
-    subscription_id: Optional[str] = Form(None)
+    subscription_id: Optional[str] = Form(None),
+    replace: bool = Form(False),
 ):
     response_status = True
     response_message = "File processed successfully."
     known_type = None
     extraction_receipt = None
+    replacement_receipt = None
 
     user_id = get_user_id(request, entity_id)
     logger.info(
@@ -2143,6 +2305,7 @@ async def embed_file(
             link=link,
             subscription_id=subscription_id,
             tenant_id=tenant_id,
+            replace=replace,
         )
 
         if not result:
@@ -2153,9 +2316,12 @@ async def embed_file(
                 detail="Failed to process/store the file data.",
             )
 
+        replacement_receipt = result.get("replacement")
+
         logger.info(
-            "[embed_file] stored [file_id=%s][chunks=%d]",
-            file_id, len(result.get("docs", [])),
+            "[embed_file] stored [file_id=%s][chunks=%d][replace=%s][superseded=%s]",
+            file_id, len(result.get("docs", [])), replace,
+            (replacement_receipt or {}).get("removed"),
         )
 
         if "error" in result:
@@ -2213,6 +2379,9 @@ async def embed_file(
         "filename": file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        # PRESENT ONLY when the caller asked to replace, so every existing response keeps
+        # its exact shape. Absent means "nothing was superseded", never "we did not check".
+        **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
     }
 
 
@@ -2271,6 +2440,7 @@ async def embed_file_upload(
     file_id: str = Form(...),
     uploaded_file: UploadFile = File(...),
     entity_id: str = Form(None),
+    replace: bool = Form(False),
 ):
     user_id = get_user_id(request, entity_id)
 
@@ -2290,6 +2460,7 @@ async def embed_file_upload(
     ent = _require_entity(request, "write", user_id)
     tenant_id = ent["tenant_id"]
     extraction_receipt = None
+    replacement_receipt = None
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
@@ -2313,6 +2484,7 @@ async def embed_file_upload(
             executor=request.app.state.thread_pool,
             filename=uploaded_file.filename,
             tenant_id=tenant_id,
+            replace=replace,
         )
 
         if not result:
@@ -2320,6 +2492,8 @@ async def embed_file_upload(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
             )
+
+        replacement_receipt = result.get("replacement")
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in embed_file_upload | Status: %d | Detail: %s",
@@ -2342,6 +2516,7 @@ async def embed_file_upload(
         "filename": uploaded_file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
     }
 
 
