@@ -42,6 +42,16 @@ class QueryDocument(BaseModel):
 
     `id` and `type` are declared for the same reason: LangChain's Document serialises them, and
     omitting them here would drop them from the response.
+
+    IT ALSO VALIDATES, WHICH IS A CHANGE. Declaring a response_model does not only describe the
+    response -- FastAPI raises `ResponseValidationError` (a 500) where the route previously
+    serialised whatever it was handed. Independent review demonstrated it with a `None` score,
+    which used to come back as `200` with `score: null`.
+
+    That is NOT reachable today: `_hybrid_or_dense_search` calls `round(score, 4)`, which raises on a
+    non-numeric score before any response is built, and `page_content` is always a `str`. The
+    upstream guard is pinned by a test rather than left as a comment, because this paragraph
+    going stale is exactly how a 500 appears later with nothing pointing at the cause.
     """
 
     id: Optional[str] = None

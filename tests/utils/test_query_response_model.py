@@ -47,6 +47,18 @@ UNMODELLED = {
     "row": 7,
     "text_source": "ocr",
     "a_key_invented_after_this_model_was_written": "must survive",
+    # PROVENANCE, added after review. The first version carried only the locator family, so a
+    # narrowing that dropped just these would have passed the guard -- the guard would have been
+    # correct about the keys it named and silent about the rest. They are not citation-critical,
+    # which is exactly why they are the ones a careless model would omit first.
+    "creator": "PyPDF",
+    "producer": "pypdf",
+    "category": "Table",
+    "filetype": "application/pdf",
+    "file_directory": "/tmp/uploads/userA",
+    "creationdate": "",
+    "languages": ["eng"],
+    "text_as_html": "<table><tr><td>a</td></tr></table>",
 }
 
 
@@ -117,6 +129,36 @@ def test_the_envelope_is_still_a_pair_not_an_object(client):
         "the response envelope changed shape: %r" % (hit,)
     )
     assert isinstance(hit[1], (int, float)), "the score is no longer a number: %r" % (hit[1],)
+
+
+def test_strict_validation_is_a_new_failure_mode_and_is_written_down(client):
+    """The semantic change #45 introduces, which the PR did not mention.
+
+    A `response_model` does not only DESCRIBE the response -- it VALIDATES it. Before #45 a
+    malformed hit was serialised as-is; now it raises `ResponseValidationError` and the caller
+    gets a **500** instead of a 200 carrying an odd value.
+
+    Independent review demonstrated this with a `None` score. It is **not reachable today**:
+    `_retrieve_documents` calls `round(score, 4)`, which raises on `None` long before the
+    response is built, and LangChain guarantees `page_content` is a `str`. So this test asserts
+    the GUARD UPSTREAM rather than the 500 -- pinning the thing that makes the failure mode
+    unreachable, instead of pinning the failure mode itself.
+
+    If that `round()` is ever removed, this reddens and says why, rather than a 500 appearing in
+    production with no explanation attached to it.
+    """
+    import inspect
+
+    from app.routes import document_routes as dr
+
+    source = inspect.getsource(dr._hybrid_or_dense_search)
+    assert "round(score" in source, (
+        "`round(score, 4)` has gone from _hybrid_or_dense_search. It is what makes a non-numeric "
+        "score fail EARLY with a clear error; without it a None score reaches the response "
+        "model and the caller gets a bare 500 ResponseValidationError instead. If this was "
+        "removed deliberately, #45's strict validation now has a reachable failure mode and "
+        "needs its own handling."
+    )
 
 
 def test_the_document_still_carries_id_and_type(client):
