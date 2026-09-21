@@ -111,6 +111,19 @@ def server(monkeypatch):
 
     monkeypatch.setattr(document_routes, "store_data_in_vector_db", observed)
 
+    # Record each request's disconnect probe with the server loop it lives on, so a test can
+    # ASK the server whether it has seen the caller leave instead of sleeping and hoping.
+    # (A fixed 0.3 s sleep here failed intermittently under full-suite load.)
+    store.probes = []
+    real_probe_factory = document_routes.caller_still_waiting
+
+    def recording_probe_factory(request):
+        probe = real_probe_factory(request)
+        store.probes.append((probe, asyncio.get_running_loop()))
+        return probe
+
+    monkeypatch.setattr(document_routes, "caller_still_waiting", recording_probe_factory)
+
     srv = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="off")
     )
@@ -142,12 +155,23 @@ def _post(base, text, *, timeout, replace=None, filename="policy.txt"):
     )
 
 
+def _server_saw_the_caller_leave(store, seconds):
+    """True once the request's own probe (run on the server's loop) reports the caller gone."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        for probe, loop in list(store.probes):
+            if asyncio.run_coroutine_threadsafe(probe(), loop).result(5) is False:
+                return True
+        time.sleep(0.02)
+    return False
+
+
 def _abandon_during_insert(store, base, finished, text, **kw):
     """Client gives up while the insert is blocked; then the insert is allowed to commit."""
     with pytest.raises(httpx.ReadTimeout):
         _post(base, text, timeout=1.0, **kw)
     assert store.insert_started.is_set(), "the request never reached the insert"
-    time.sleep(0.3)  # let the server's connection_lost land before the commit
+    assert _server_saw_the_caller_leave(store, 10), "the server never noticed the disconnect"
     store.release.set()
     assert finished.wait(15), "the handler never finished"
 
