@@ -282,6 +282,58 @@ def raise_if_unsupported_binary(filepath: str, filename: str) -> None:
     )
 
 
+#: OLE2 compound-file magic. This is the container the pre-2007 Office binaries use (.doc, .xls,
+#: .ppt) and also what an ENCRYPTED OOXML file is. `SheetExcelLoader` reads it to separate encrypted
+#: from corrupt; the Word branch reads it to refuse a legacy .doc with a verdict instead of letting
+#: `docx2txt` die on the zip check.
+OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def refuse_legacy_word_binary(filepath: str, filename: str) -> None:
+    """Refuse a pre-2007 binary `.doc` with a verdict, before `Docx2txtLoader` sees it.
+
+    `.doc` and `.docx` share one branch, and that branch hands both to `Docx2txtLoader`. But
+    `docx2txt` reads an OOXML package -- a ZIP -- while a Word 97 `.doc` is an OLE2 compound file,
+    so the legacy half of the branch could only ever fail. MEASURED on 36d4fb6 with a genuine Word
+    97 document (LibreOffice Writer 25.2.3.2, filter "MS Word 97"): `get_loader` returned
+    `Docx2txtLoader` with `known_type=True`, `load()` raised `zipfile.BadZipFile("File is not a zip
+    file")`, and `/embed` answered 400 "The cause is not established - it may be the file or this
+    service." with zero rows.
+
+    Nothing was stored and nothing claimed to succeed, so this is not the garbage-extraction defect
+    SP-01.6a closed. It is the other half of that charter: the service can tell exactly what this
+    file is, and said it could not tell. `attribution=undetermined` on a format we positively
+    recognise is a non-answer to someone who can fix their file in ten seconds.
+
+    This is ALSO the gap #42 left explicitly open. That guard turns a missing-LibreOffice failure
+    into an actionable 400, but it fires on `OSError("soffice command was not found")` -- and a
+    `.doc` never reaches soffice at all, because the Word branch claims it first and dies in
+    `zipfile`. So `.ppt` gets the actionable answer and `.doc` cannot, which is why #42's comment
+    records that `.doc` "was never tested, so it is not claimed either".
+
+    The message deliberately does NOT offer the LibreOffice operator fix that #42's does. Installing
+    LibreOffice would not make THIS path work: `Docx2txtLoader` would still be handed the same OLE2
+    bytes. Claiming it would is the same false family claim #42 removed once already, and this lane
+    does not re-add it on the strength of a neighbouring format's behaviour.
+
+    A `.docx` is untouched: it is a ZIP, so the header never matches.
+    """
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(len(OLE2_MAGIC))
+    except OSError:
+        # Unreadable here means unreadable for the loader a line later, and its error is the
+        # truthful report. Never convert an I/O fault into a verdict about the FORMAT.
+        return
+    if not head.startswith(OLE2_MAGIC):
+        return
+    raise UnsupportedDocumentError(
+        f"'{filename}' is a legacy Word document (the pre-2007 .doc format), which this service "
+        f"cannot read. Open it in Word and re-save it as .docx, then upload that.",
+        filename=filename,
+    )
+
+
 def detect_file_encoding(filepath: str) -> str:
     """
     Detect the encoding of a file using BOM markers and chardet for broader support.
@@ -405,6 +457,8 @@ def get_loader(filename: str, file_content_type: str, filepath: str, ocr_budget=
         "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ]:
+        # A legacy binary .doc can never be read by docx2txt (see refuse_legacy_word_binary).
+        refuse_legacy_word_binary(filepath, filename)
         loader = Docx2txtLoader(filepath)
     elif file_ext in ["xls", "xlsx"] or file_content_type in [
         "application/vnd.ms-excel",
@@ -762,7 +816,8 @@ class SheetExcelLoader:
 
     #: Compound File Binary header. An .xlsx is a ZIP; an ENCRYPTED .xlsx is an
     #: OLE2 container holding the encrypted package. Legacy .xls is also OLE2.
-    _OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+    #: One definition, module level, shared with the Word branch.
+    _OLE2_MAGIC = OLE2_MAGIC
     _ZIP_MAGIC = b"PK\x03\x04"
 
     #: Cap on the per-sheet sample of uncached-formula cell references carried in
