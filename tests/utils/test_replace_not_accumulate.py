@@ -592,3 +592,90 @@ def test_the_callers_own_pre_tenant_rows_ARE_still_counted(client, store):
         "reported as a complete replacement" % (rep,)
     )
     assert rep["status"] == "incomplete", rep
+
+
+# ---------------------------------------------------------------------------------------
+# The SUCCESS path at the production batch size. F-BATCH1.
+#
+# `EMBEDDING_BATCH_SIZE=500` is the production default and selects the batched insert
+# paths. The fixture above pins it to 0, which takes the single-shot branch — so every
+# ordering and receipt assertion in this file has only ever run on the branch production
+# does NOT use. The failure case was covered when a review found the rollback defect; the
+# success case never was.
+#
+# The ordering is the whole contract: capture BEFORE any insert, delete AFTER every one.
+# On the batched path there are several inserts, so "delete after the insert" becomes
+# "delete after the LAST insert" — a distinction the single-shot branch cannot express.
+# ---------------------------------------------------------------------------------------
+
+
+def _batched(monkeypatch):
+    """Several batches, not one. Batch size 1 guarantees it for any multi-chunk fixture."""
+    monkeypatch.setattr(document_routes, "EMBEDDING_BATCH_SIZE", 1, raising=False)
+
+
+def test_the_batched_path_is_really_taken(client, store, monkeypatch):
+    """PRECONDITION. If only one insert happens the batched branch was not exercised and
+    both assertions below are true of the single-shot path they were written to avoid."""
+    assert _embed(client, V1, "policy-v1.txt").status_code == 200
+    _batched(monkeypatch)
+    store.calls.clear()
+    assert _embed(client, V2, "policy-v2.txt", replace=True).status_code == 200
+    inserts = [c for c in store.calls if c == "insert"]
+    assert len(inserts) > 1, (
+        "only %d insert(s): the batched branch was not taken, so the tests below are "
+        "measuring the single-shot path. calls=%r" % (len(inserts), store.calls)
+    )
+
+
+def test_capture_precedes_every_insert_and_delete_follows_the_last(client, store, monkeypatch):
+    """The ordering contract, on the branch production actually runs.
+
+    Capture before ANY insert, or the capture includes rows this call just wrote and the
+    delete removes the new version. Delete after the LAST insert, or a later batch lands
+    after the delete and survives as a second copy.
+    """
+    assert _embed(client, V1, "policy-v1.txt").status_code == 200
+    _batched(monkeypatch)
+    store.calls.clear()
+    assert _embed(client, V2, "policy-v2.txt", replace=True).status_code == 200
+
+    calls = store.calls
+    assert "delete" in calls and "insert" in calls, calls
+    first_insert = calls.index("insert")
+    last_insert = len(calls) - 1 - calls[::-1].index("insert")
+    delete_at = calls.index("delete")
+
+    assert all(c == "capture" for c in calls[:first_insert]), (
+        "something other than the capture ran before the first insert: %r" % calls
+    )
+    assert calls[:first_insert].count("capture") == 2, (
+        "both captures must precede the first insert -- the scoped one that feeds the "
+        "delete and the owner-scoped one behind out_of_scope_rows: %r" % calls
+    )
+    assert delete_at > last_insert, (
+        "the delete ran before the last insert, so a later batch lands after it and "
+        "survives as a second copy: %r" % calls
+    )
+
+
+def test_the_receipt_is_still_exact_on_the_batched_path(client, store, monkeypatch):
+    """The receipt is what a consumer branches on, and it had never been read on this path."""
+    assert _embed(client, V1, "policy-v1.txt").status_code == 200
+    v1_rows = len(store.uuids_for(FID))
+    assert v1_rows > 1, "fixture must produce several chunks for batching to mean anything"
+
+    _batched(monkeypatch)
+    r = _embed(client, V2, "policy-v2.txt", replace=True)
+    assert r.status_code == 200, r.text
+    rep = r.json()["replacement"]
+    assert rep == {
+        "superseded_rows": v1_rows,
+        "removed": v1_rows,
+        "out_of_scope_rows": 0,
+        "status": "complete",
+    }, rep
+    # And the old version is genuinely gone, not merely reported gone.
+    assert not any("500 EUR" in (d or "") for d in store.documents_for(FID)), (
+        "superseded text is still retrievable after a batched replacement"
+    )
