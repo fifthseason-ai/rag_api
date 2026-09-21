@@ -284,8 +284,13 @@ def test_query_multiple_filters_unauthorized():
         json={"query": "q", "file_ids": ["testid1", "testid2"], "k": 2},
         headers=h,
     )
-    # All candidate docs belong to another entity -> nothing authorized -> 404.
-    assert r.status_code == 404
+    # All candidate docs belong to another entity -> filtered out, not leaked -> [] 200.
+    # This is the SAME "no authorized results" outcome /query gives for the identical case
+    # (see test_query_file_id_filters_unauthorized_docs). It was 404 until the Q3 alignment
+    # (CORE-TO-FILES-CONTRACT-ANSWERS-20260921.md); the caller's own authorization is enforced
+    # separately by _require_action (a caller without read still gets 401/403 before this).
+    assert r.status_code == 200
+    assert r.json() == []
 
 
 # --- tenant tag on embed (D-KSPT-1) ----------------------------------------
