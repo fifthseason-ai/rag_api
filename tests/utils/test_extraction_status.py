@@ -460,3 +460,116 @@ def test_embed_xlsx_sheet_receipt(rec_client, tmp_path):
     assert rec["locator_kind"] == "sheet"
     assert rec["status"] in {"complete", "partial"}
     assert rec["units_extracted"] >= 1
+
+
+# ===========================================================================
+# F-ROUTES1 -- count/write parity on EVERY intake route, not just /embed
+#
+# `test_embed_partial_pdf_reports_partial_and_counts_match_writes` above proves
+# the receipt describes the store -- for /embed. THREE routes build a receipt
+# through the same `_assert_extractable_content` (/local/embed, /embed,
+# /embed-upload), and a shared producer is exactly the reason not to read one
+# route's result as the others': each route owns its own
+# `store_data_in_vector_db` call, its own response assembly and its own
+# `extraction` key, so the receipt and the rows can only be compared per route,
+# at that route's own exit.
+#
+# Parametrized rather than looped over routes inside one test. A loop stops at
+# the first failing assertion, so one route's defect would surface as "the test
+# failed" with the remaining routes never exercised -- and a loop that `break`s
+# or returns early on the first route it finds would pass while proving nothing
+# about the other two. One test id per route means a per-route over-claim
+# reddens exactly that route and leaves the others green, which is the property
+# the failure control below actually measures.
+# ===========================================================================
+
+
+def _embed_upload(client, filename, content, content_type):
+    return client.post(
+        "/embed-upload",
+        data={"file_id": "f-recv-upload", "entity_id": "userA"},
+        files={"uploaded_file": (filename, io.BytesIO(content), content_type)},
+        headers=_hdr(),
+    )
+
+
+def _local_embed(client, filename, content, content_type):
+    """/local/embed takes a PATH inside RAG_UPLOAD_DIR, not bytes, so the same
+    fixture has to be handed over a different way for this to stay the same
+    comparison."""
+    from app.config import RAG_UPLOAD_DIR
+
+    os.makedirs(RAG_UPLOAD_DIR, exist_ok=True)
+    path = os.path.join(RAG_UPLOAD_DIR, filename)
+    with open(path, "wb") as fh:
+        fh.write(content)
+    try:
+        return client.post(
+            "/local/embed",
+            json={
+                "file_id": "f-recv-local",
+                "filename": filename,
+                "filepath": filename,
+                "file_content_type": content_type,
+            },
+            params={"entity_id": "userA"},
+            headers=_hdr(),
+        )
+    finally:
+        # the route has finished loading the file by the time it answers
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+_INTAKE_ROUTES = {
+    "/embed": _embed,
+    "/embed-upload": _embed_upload,
+    "/local/embed": _local_embed,
+}
+
+
+@pytest.mark.parametrize("route", sorted(_INTAKE_ROUTES))
+def test_intake_route_receipt_matches_what_that_route_stored(
+    route, rec_client, tmp_path
+):
+    """Per route: `units_extracted` must equal the number of pages that actually
+    produced stored chunks, and no page the receipt calls EMPTY may hold rows.
+
+    Both directions are asserted because they fail differently. Over-claiming is
+    the dangerous one -- a unit reported extracted with no row behind it is a
+    citation that resolves to nothing. Under-claiming is the quiet one -- a page
+    listed empty while its rows exist tells a consumer content is missing when it
+    is not.
+    """
+    path = tmp_path / "partial.pdf"
+    make_partial_pdf(str(path))
+
+    r = _INTAKE_ROUTES[route](
+        rec_client, "partial.pdf", path.read_bytes(), "application/pdf"
+    )
+    assert r.status_code == 200, f"{route}: {r.text}"
+
+    rec = r.json()["extraction"]
+    stored_pages = {d.metadata.get("page") for d in _stored_docs(rec_client)}
+
+    # PRECONDITIONS -- the fixture must be able to express the defect on THIS
+    # route. If every unit extracted, or nothing reached the store, the equality
+    # below would hold for reasons that have nothing to do with truthfulness.
+    assert rec["locator_kind"] == "page", f"{route}: {rec}"
+    assert rec["status"] == "partial", f"{route}: {rec}"
+    assert stored_pages == {0, 1, 2}, f"{route}: stored {sorted(stored_pages)}"
+    assert rec["empty_locators"] == [3, 4], f"{route}: {rec['empty_locators']}"
+
+    assert rec["units_extracted"] == len(stored_pages), (
+        f"{route} misreports its own write: receipt claims "
+        f"{rec['units_extracted']} unit(s) extracted, the store holds rows for "
+        f"{len(stored_pages)} page(s) {sorted(stored_pages)}"
+    )
+
+    leaked = sorted(set(rec["empty_locators"]) & stored_pages)
+    assert not leaked, (
+        f"{route}: page(s) {leaked} are reported EMPTY by the receipt but hold "
+        f"stored rows"
+    )
