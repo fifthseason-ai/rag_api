@@ -148,6 +148,44 @@ async def test_empty_ent_403():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ent",
+    [
+        [""],                 # a single empty string
+        ["   "],              # whitespace only
+        ["\t\n"],             # other whitespace
+        [None],               # non-string
+        [123],                # non-string
+        ["kbA", ""],          # mixed valid + empty: still refused, never dropped-and-widened
+        ["kbA", "  "],
+        ["", ""],
+    ],
+)
+async def test_malformed_entitlement_entry_403(ent):
+    """D-ENT-EMPTY: an empty/whitespace/non-string entitlement entry is malformed and the
+    whole token is refused (403). It must never grant access or silently widen scope."""
+    request = DummyRequest(
+        "/protected", {"Authorization": f"Bearer {_token(_full_payload(ent=ent))}"}
+    )
+    response = await security_middleware(request, dummy_call_next)
+    assert response.status_code == 403
+    assert not hasattr(request.state, "entitlement"), (
+        "a malformed entitlement must not populate request.state.entitlement"
+    )
+
+
+@pytest.mark.asyncio
+async def test_valid_entitlement_alongside_the_empty_check_still_passes():
+    """The guard must not reject a real entitlement -- control against over-rejection."""
+    request = DummyRequest(
+        "/protected", {"Authorization": f"Bearer {_token(_full_payload(ent=['kbA', 'kbB']))}"}
+    )
+    response = await security_middleware(request, dummy_call_next)
+    assert response.status_code == 200
+    assert request.state.entitlement["entity_ids"] == {"kbA", "kbB"}
+
+
+@pytest.mark.asyncio
 async def test_missing_ent_403():
     payload = _full_payload()
     del payload["ent"]
