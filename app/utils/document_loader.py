@@ -21,6 +21,7 @@ from app.config import (
     known_source_ext,
     PDF_EXTRACT_IMAGES,
     PDF_OCR_ENABLED,
+    PDF_OCR_MIXED_PAGE,
     CHUNK_OVERLAP,
     logger,
 )
@@ -916,6 +917,60 @@ class SafePyPDFLoader:
             )
             return "unknown"
 
+    @staticmethod
+    def _ocr_adds_new_text(ocr_text: str, native_text: str) -> bool:
+        """True when the OCR'd image text is NOT already in the native layer (F05).
+
+        Conservative dedup: compares on alphanumerics only (lowercased), so spacing and
+        punctuation differences between a text layer and its OCR do not read as new text.
+        If the OCR content is contained in the native text -- the case where the image is a
+        flattened copy of the same words -- it adds nothing and is dropped, so the page is
+        never double-stored. Text the layer lacks is not contained, so it is kept."""
+        import re
+
+        def norm(s):
+            return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+        o, n = norm(ocr_text), norm(native_text)
+        return bool(o) and o not in n
+
+    def _ocr_mixed_page_image(self, metadata, native_text, budget):
+        """OCR the embedded image of a text-layer page (F05, opt-in). Returns
+        (sibling_document_or_None, coverage_state). The page is OCR'd through the same
+        adapter/budget as a scanned page; if it yields text the native layer lacks, that
+        text is returned as a sibling Document citing the same page. Coverage is `attempted`
+        once the image was actually run (even if it yielded nothing or a duplicate), because
+        it WAS read; `unknown` only when the page could not be opened to try."""
+        from app.utils.ocr import ocr_page
+
+        page_index = metadata.get("page")
+        try:
+            reader = self._ocr_reader()
+            if not (isinstance(page_index, int) and 0 <= page_index < len(reader.pages)):
+                return None, "unknown"
+            page = reader.pages[page_index]
+        except Exception as error:
+            logger.info("Mixed-page OCR could not open %s: %s", self.filepath, error)
+            return None, "unknown"
+
+        result = ocr_page(page, budget)
+        if result.reason == "disabled":
+            # Kill switch flipped mid-run: leave the page as the disclosure case.
+            return None, "not_attempted"
+        if not result.text.strip() or not self._ocr_adds_new_text(result.text, native_text):
+            # Read, but nothing NEW to store (blank/duplicate). Still attempted.
+            return None, "attempted"
+
+        sibling_meta = dict(metadata)
+        sibling_meta["text_source"] = "ocr"          # provenance the receipt already knows
+        sibling_meta["image_ocr_coverage"] = "attempted"
+        sibling_meta["ocr_reason"] = result.reason
+        sibling_meta["ocr_attempted"] = result.attempted
+        sibling_meta["ocr_confidence"] = round(result.confidence, 4)
+        sibling_meta["ocr_chars"] = len(result.text.strip())
+        sibling_meta["mixed_page_image"] = True       # this chunk is the image, not the layer
+        return Document(page_content=result.text, metadata=sibling_meta), "attempted"
+
     def close_ocr_reader(self) -> None:
         self._ocr_reader_obj = None
         if self._ocr_handle is not None:
@@ -956,11 +1011,23 @@ class SafePyPDFLoader:
                     # still does not pay for the engine, and an imageless page reports
                     # `not_applicable` (no receipt block, byte-identical to before). A
                     # probe that cannot tell says `unknown`, never silently `not_applicable`.
-                    metadata.setdefault(
-                        "image_ocr_coverage",
-                        self._native_page_image_coverage(metadata.get("page")),
-                    )
+                    coverage = self._native_page_image_coverage(metadata.get("page"))
+                    # F05 EXTRACTION (opt-in, PDF_OCR_MIXED_PAGE): #66 only DISCLOSED the
+                    # unread image; when the operator turns this on, actually read it. The
+                    # image is OCR'd through the same local adapter and budget as a scanned
+                    # page, and any text it yields that the layer does not already contain
+                    # is emitted as a SIBLING chunk citing this page (so nothing the native
+                    # layer holds is duplicated). Coverage becomes `attempted`. Default off,
+                    # so a native PDF is untouched unless an operator opts in.
+                    sibling = None
+                    if PDF_OCR_MIXED_PAGE and coverage == "not_attempted" and budget is not None:
+                        sibling, coverage = self._ocr_mixed_page_image(
+                            metadata, document.page_content, budget
+                        )
+                    metadata.setdefault("image_ocr_coverage", coverage)
                     yield document
+                    if sibling is not None:
+                        yield sibling
                     continue
                 if budget is None:
                     yield document
