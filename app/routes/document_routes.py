@@ -93,7 +93,7 @@ from app.utils.extraction_budget import (
     ExtractionBudget,
 )
 from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget, OcrCancelled
-from app.utils.health import is_health_ok
+from app.utils.health import is_health_ok, keyword_search_health
 
 router = APIRouter()
 
@@ -775,7 +775,14 @@ async def health_check():
             # caller that only reads `status` is unaffected. It is here because this is the route
             # that actually answers in the deployed app, and a health check that cannot say WHICH
             # build is healthy leaves the only question a deployment receipt needs unanswerable.
-            return {"status": "UP", "build": build_summary()}
+            # `keyword_search` is additive too (F-HYBRID-HEALTH): the keyword arm fails per query
+            # into a dense-only answer, so without this an operator never learns it is gone.
+            # It never flips `status` -- dense retrieval still serves.
+            return {
+                "status": "UP",
+                "build": build_summary(),
+                "keyword_search": await keyword_search_health(),
+            }
         logger.error("Health check failed")
         return JSONResponse(status_code=503, content={"status": "DOWN"})
     except Exception as e:
@@ -927,10 +934,28 @@ async def delete_documents(
     # the upload then wrote batches 2..7, and BOTH calls answered success -- leaving a
     # partial document (6 of 7 chunks) that neither caller knew about. Waiting for the
     # upload makes the delete apply to the whole file it finished writing.
+    #
+    # F-BULK-DELETE-LOCK: with NO file_ids this is a bulk purge of the entity, and the lock
+    # set used to be that empty list -- so the purge locked nothing and reopened the exact
+    # race F02B closed (reproduced: purge mid-upload, both 200, the file survived without
+    # its first batch). Resolve the purge to the entity's file_ids first, lock THOSE, and
+    # delete exactly the locked set, never the open entity filter. A file whose first batch
+    # had not landed when the purge resolved is left whole, ordered after the purge. Only
+    # the pgvector store is resolved here: the other store's lookup is not entity-scoped
+    # (F-MONGO-DELETE-SCOPE) and its path is left as it was.
+    origin_type_value = document_origin_type.value if document_origin_type else None
+    bulk_purge = not document_ids
+    if bulk_purge and isinstance(vector_store, AsyncPgVector):
+        document_ids = sorted(set(await vector_store.get_filtered_ids(
+            [],
+            user_id=user_id,
+            document_origin_type=origin_type_value,
+            subscription_id=subscription_id,
+            executor=request.app.state.thread_pool,
+        )))
     file_locks = await _hold_file_locks(document_ids, caller_still_waiting(request))
 
     try:
-        origin_type_value = document_origin_type.value if document_origin_type else None
         logger.info(
             "[delete_documents] request [user_id=%s][file_ids=%s][document_origin_type=%s][subscription_id=%s]",
             user_id, document_ids, origin_type_value, subscription_id,
@@ -943,14 +968,18 @@ async def delete_documents(
                 subscription_id=subscription_id,
                 executor=request.app.state.thread_pool,
             )
-            await vector_store.delete(
-                ids=document_ids,
-                user_id=user_id,
-                document_origin_type=origin_type_value,
-                subscription_id=subscription_id,
-                text_source=text_source,
-                executor=request.app.state.thread_pool,
-            )
+            # A resolved purge that found nothing must not fall through to ids=[] -- that
+            # is the open entity filter, which could halve a file that started writing
+            # after the resolve.
+            if document_ids:
+                await vector_store.delete(
+                    ids=document_ids,
+                    user_id=user_id,
+                    document_origin_type=origin_type_value,
+                    subscription_id=subscription_id,
+                    text_source=text_source,
+                    executor=request.app.state.thread_pool,
+                )
         else:
             existing_ids = vector_store.get_filtered_ids(document_ids)
             if text_source is not None:
@@ -968,7 +997,7 @@ async def delete_documents(
                 )
             vector_store.delete(ids=document_ids)
 
-        if document_ids:
+        if not bulk_purge:
             if not all(id in existing_ids for id in document_ids):
                 raise HTTPException(status_code=404, detail="One or more IDs not found")
         else:
@@ -1185,6 +1214,21 @@ async def _retrieve_documents(
     return await rerank(query, candidates, top_n=top_n)
 
 
+def _authorized_only(documents, entity_ids):
+    """Defensive entitlement post-filter shared by every query route (D-KSPT-1).
+
+    Keeps only (Document, score) pairs whose owning entity (`user_id`) is within the
+    token entitlement. The retrieval arms already filter by user_id; this is defence in
+    depth, so a filter dropped from any arm (dense, keyword, fused, reranked) can never
+    put another entity's row on the wire. On correct data it is the identity.
+    """
+    return [
+        (doc, score)
+        for (doc, score) in documents
+        if doc.metadata.get("user_id") in entity_ids
+    ]
+
+
 @router.post("/query", response_model=List[QueryHit])
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
@@ -1217,11 +1261,7 @@ async def query_embeddings_by_file_id(
         if not documents:
             return authorized_documents
 
-        authorized_documents = [
-            (doc, score)
-            for (doc, score) in documents
-            if doc.metadata.get("user_id") in ent["entity_ids"]
-        ]
+        authorized_documents = _authorized_only(documents, ent["entity_ids"])
         if len(authorized_documents) != len(documents):
             logger.warning(
                 "[query] filtered %d unauthorized document(s) out of %d for file_id=%s",
@@ -1267,8 +1307,9 @@ async def query_embeddings_by_entity_id(
     request: Request,
 ):
     # Entitlement (D-KSPT-1): the path entity_id is a filter; it must be within the
-    # token entitlement and read must be granted.
-    _require_entity(request, "read", entity_id)
+    # token entitlement and read must be granted. Results are defensively re-filtered to
+    # the entitlement exactly as /query and /query_multiple do (F-ENTITLEMENT-FUSED).
+    ent = _require_entity(request, "read", entity_id)
     logger.info(
         "[query_embeddings_by_entity_id] request [entity_id=%s][query=%r][k=%d][args=%s]",
         entity_id, body.query, body.k, body.args
@@ -1293,7 +1334,16 @@ async def query_embeddings_by_entity_id(
         if not documents:
             return []
 
-        return documents
+        authorized_documents = _authorized_only(documents, ent["entity_ids"])
+        if len(authorized_documents) != len(documents):
+            logger.warning(
+                "[query_embeddings_by_entity_id] filtered %d unauthorized document(s) out of %d for entity_id=%s",
+                len(documents) - len(authorized_documents),
+                len(documents),
+                entity_id,
+            )
+
+        return authorized_documents
 
     except HTTPException as http_exc:
         logger.error(
@@ -3188,11 +3238,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             filters,
         )
 
-        documents = [
-            (doc, score)
-            for (doc, score) in documents
-            if doc.metadata.get("user_id") in ent["entity_ids"]
-        ]
+        documents = _authorized_only(documents, ent["entity_ids"])
 
         # Empty result aligned to [] (200), matching /query and /query/{entity_id}.
         # Was 404 {"detail":"No documents found for the given query"}; that divergence
