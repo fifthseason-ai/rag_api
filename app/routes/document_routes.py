@@ -93,7 +93,7 @@ from app.utils.extraction_budget import (
     ExtractionBudget,
 )
 from app.utils.ocr import ENGINE_NAME as OCR_ENGINE_NAME, OcrBudget, OcrCancelled
-from app.utils.health import is_health_ok
+from app.utils.health import is_health_ok, keyword_search_health
 
 router = APIRouter()
 
@@ -802,7 +802,14 @@ async def health_check():
             # caller that only reads `status` is unaffected. It is here because this is the route
             # that actually answers in the deployed app, and a health check that cannot say WHICH
             # build is healthy leaves the only question a deployment receipt needs unanswerable.
-            return {"status": "UP", "build": build_summary()}
+            # `keyword_search` is additive too (F-HYBRID-HEALTH): the keyword arm fails per query
+            # into a dense-only answer, so without this an operator never learns it is gone.
+            # It never flips `status` -- dense retrieval still serves.
+            return {
+                "status": "UP",
+                "build": build_summary(),
+                "keyword_search": await keyword_search_health(),
+            }
         logger.error("Health check failed")
         return JSONResponse(status_code=503, content={"status": "DOWN"})
     except Exception as e:
@@ -948,10 +955,28 @@ async def delete_documents(
     # the upload then wrote batches 2..7, and BOTH calls answered success -- leaving a
     # partial document (6 of 7 chunks) that neither caller knew about. Waiting for the
     # upload makes the delete apply to the whole file it finished writing.
+    #
+    # F-BULK-DELETE-LOCK: with NO file_ids this is a bulk purge of the entity, and the lock
+    # set used to be that empty list -- so the purge locked nothing and reopened the exact
+    # race F02B closed (reproduced: purge mid-upload, both 200, the file survived without
+    # its first batch). Resolve the purge to the entity's file_ids first, lock THOSE, and
+    # delete exactly the locked set, never the open entity filter. A file whose first batch
+    # had not landed when the purge resolved is left whole, ordered after the purge. Only
+    # the pgvector store is resolved here: the other store's lookup is not entity-scoped
+    # (F-MONGO-DELETE-SCOPE) and its path is left as it was.
+    origin_type_value = document_origin_type.value if document_origin_type else None
+    bulk_purge = not document_ids
+    if bulk_purge and isinstance(vector_store, AsyncPgVector):
+        document_ids = sorted(set(await vector_store.get_filtered_ids(
+            [],
+            user_id=user_id,
+            document_origin_type=origin_type_value,
+            subscription_id=subscription_id,
+            executor=request.app.state.thread_pool,
+        )))
     file_locks = await _hold_file_locks(document_ids, caller_still_waiting(request))
 
     try:
-        origin_type_value = document_origin_type.value if document_origin_type else None
         logger.info(
             "[delete_documents] request [user_id=%s][file_ids=%s][document_origin_type=%s][subscription_id=%s]",
             user_id, document_ids, origin_type_value, subscription_id,
@@ -964,14 +989,18 @@ async def delete_documents(
                 subscription_id=subscription_id,
                 executor=request.app.state.thread_pool,
             )
-            await vector_store.delete(
-                ids=document_ids,
-                user_id=user_id,
-                document_origin_type=origin_type_value,
-                subscription_id=subscription_id,
-                text_source=text_source,
-                executor=request.app.state.thread_pool,
-            )
+            # A resolved purge that found nothing must not fall through to ids=[] -- that
+            # is the open entity filter, which could halve a file that started writing
+            # after the resolve.
+            if document_ids:
+                await vector_store.delete(
+                    ids=document_ids,
+                    user_id=user_id,
+                    document_origin_type=origin_type_value,
+                    subscription_id=subscription_id,
+                    text_source=text_source,
+                    executor=request.app.state.thread_pool,
+                )
         else:
             existing_ids = vector_store.get_filtered_ids(document_ids)
             if text_source is not None:
@@ -989,7 +1018,7 @@ async def delete_documents(
                 )
             vector_store.delete(ids=document_ids)
 
-        if document_ids:
+        if not bulk_purge:
             if not all(id in existing_ids for id in document_ids):
                 raise HTTPException(status_code=404, detail="One or more IDs not found")
         else:
@@ -1200,6 +1229,21 @@ async def _retrieve_documents(
     return await rerank(query, candidates, top_n=top_n)
 
 
+def _authorized_only(documents, entity_ids):
+    """Defensive entitlement post-filter shared by every query route (D-KSPT-1).
+
+    Keeps only (Document, score) pairs whose owning entity (`user_id`) is within the
+    token entitlement. The retrieval arms already filter by user_id; this is defence in
+    depth, so a filter dropped from any arm (dense, keyword, fused, reranked) can never
+    put another entity's row on the wire. On correct data it is the identity.
+    """
+    return [
+        (doc, score)
+        for (doc, score) in documents
+        if doc.metadata.get("user_id") in entity_ids
+    ]
+
+
 @router.post("/query", response_model=List[QueryHit])
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
@@ -1232,11 +1276,7 @@ async def query_embeddings_by_file_id(
         if not documents:
             return authorized_documents
 
-        authorized_documents = [
-            (doc, score)
-            for (doc, score) in documents
-            if doc.metadata.get("user_id") in ent["entity_ids"]
-        ]
+        authorized_documents = _authorized_only(documents, ent["entity_ids"])
         if len(authorized_documents) != len(documents):
             logger.warning(
                 "[query] filtered %d unauthorized document(s) out of %d for file_id=%s",
@@ -1275,8 +1315,9 @@ async def query_embeddings_by_entity_id(
     request: Request,
 ):
     # Entitlement (D-KSPT-1): the path entity_id is a filter; it must be within the
-    # token entitlement and read must be granted.
-    _require_entity(request, "read", entity_id)
+    # token entitlement and read must be granted. Results are defensively re-filtered to
+    # the entitlement exactly as /query and /query_multiple do (F-ENTITLEMENT-FUSED).
+    ent = _require_entity(request, "read", entity_id)
     logger.info(
         "[query_embeddings_by_entity_id] request [entity_id=%s][query=%r][k=%d][args=%s]",
         entity_id, body.query, body.k, body.args
@@ -1301,7 +1342,16 @@ async def query_embeddings_by_entity_id(
         if not documents:
             return []
 
-        return documents
+        authorized_documents = _authorized_only(documents, ent["entity_ids"])
+        if len(authorized_documents) != len(documents):
+            logger.warning(
+                "[query_embeddings_by_entity_id] filtered %d unauthorized document(s) out of %d for entity_id=%s",
+                len(documents) - len(authorized_documents),
+                len(documents),
+                entity_id,
+            )
+
+        return authorized_documents
 
     except HTTPException as http_exc:
         logger.error(
@@ -2336,6 +2386,51 @@ def _assert_extractable_content(
     return receipt
 
 
+async def _index_receipt(file_id: str, ingest_id: str, prepared: int, executor) -> dict:
+    """The INDEX state of one write, read back from the store (KC-FILES-1).
+
+    PARSE != INDEX. `extraction` reports what the loader read; nothing reported what the
+    table then held, so a consumer could only take HTTP 200 as "indexed". This counts the
+    rows carrying this write's `ingest_id` after the insert returned:
+
+      indexed     every prepared chunk is in the table (and there was at least one)
+      partial     the table holds a different number of this write's chunks than were
+                  prepared -- a short (or over-counted) write is never `indexed`
+      unverified  the store cannot be read back, or the read failed. UNKNOWN, reported
+                  as such: never promoted to `indexed` because the insert did not raise.
+
+    A read failure must not fail an upload whose insert succeeded, so it degrades to
+    `unverified` rather than raising.
+    """
+    confirmed = None
+    counter = getattr(vector_store, "count_rows_for_ingest", None)
+    if counter is not None:
+        try:
+            if isinstance(vector_store, AsyncPgVector):
+                confirmed = await counter(file_id, ingest_id, executor=executor)
+            else:
+                confirmed = counter(file_id, ingest_id)
+            confirmed = int(confirmed)
+        except Exception as read_error:  # noqa: BLE001 - see docstring: degrade to unknown
+            logger.warning(
+                "Could not read back rows of %s after insert (%s); index state unverified",
+                file_id, type(read_error).__name__,
+            )
+            confirmed = None
+    if confirmed is None:
+        state = "unverified"
+    elif prepared > 0 and confirmed == prepared:
+        state = "indexed"
+    else:
+        state = "partial"
+    return {
+        "status": state,
+        "ingest_id": ingest_id,
+        "chunks_prepared": prepared,
+        "chunks_confirmed": confirmed,
+    }
+
+
 async def _undo_abandoned_insert(
     file_id: str, rows_before_insert: Optional[List[str]], executor
 ) -> Optional[int]:
@@ -2550,6 +2645,10 @@ async def _store_data_in_vector_db_unlocked(
         # what it takes to stop a 200 meaning "the old version is gone" when it is not.
         out_of_scope_rows = max(0, len(all_rows_before) - len(superseded_rows))
 
+    # Named (it was generated inline) so the index receipt can read back exactly the rows
+    # of THIS write -- see `_index_receipt`.
+    ingest_id = str(uuid.uuid4())
+
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     docs = await loop.run_in_executor(
@@ -2568,7 +2667,7 @@ async def _store_data_in_vector_db_unlocked(
         # a failed or abandoned one is rolled back (and a replacement deletes the version
         # it supersedes only after its own insert succeeded), so a reader always sees the
         # id that belongs to the content in front of them.
-        str(uuid.uuid4()),
+        ingest_id,
     )
 
     # F04: the rows this file ALREADY had, captured before anything is inserted, so an
@@ -2631,6 +2730,7 @@ async def _store_data_in_vector_db_unlocked(
         await _stop_if_caller_gone(still_wanted, "after insert")
 
         result = {"message": "Documents added successfully", "ids": ids, "docs": docs}
+        result["index"] = await _index_receipt(file_id, ingest_id, len(docs), executor)
 
         if superseded_rows is not None:
             # Only now -- the new rows exist, so removing the old ones cannot empty the
@@ -2777,6 +2877,7 @@ async def embed_local_file(
                 "filename": document.filename,
                 "known_type": known_type,
                 "extraction": extraction_receipt,
+                "index": result.get("index"),
             }
         else:
             # Defensive only: `store_data_in_vector_db` now raises rather than returning a falsy
@@ -2895,6 +2996,7 @@ async def embed_file(
     known_type = None
     extraction_receipt = None
     replacement_receipt = None
+    index_receipt = None
 
     user_id = get_user_id(request, entity_id)
     logger.info(
@@ -2954,6 +3056,7 @@ async def embed_file(
             )
 
         replacement_receipt = result.get("replacement")
+        index_receipt = result.get("index")
 
         logger.info(
             "[embed_file] stored [file_id=%s][chunks=%d][replace=%s][superseded=%s]",
@@ -3016,6 +3119,8 @@ async def embed_file(
         "filename": file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        # KC-FILES-1: the INDEX state, read back from the store; `extraction` is the parse.
+        "index": index_receipt,
         # PRESENT ONLY when the caller asked to replace, so every existing response keeps
         # its exact shape. Absent means "nothing was superseded", never "we did not check".
         **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
@@ -3094,6 +3199,7 @@ async def embed_file_upload(
     tenant_id = ent["tenant_id"]
     extraction_receipt = None
     replacement_receipt = None
+    index_receipt = None
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
@@ -3129,6 +3235,7 @@ async def embed_file_upload(
             )
 
         replacement_receipt = result.get("replacement")
+        index_receipt = result.get("index")
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in embed_file_upload | Status: %d | Detail: %s",
@@ -3151,6 +3258,7 @@ async def embed_file_upload(
         "filename": uploaded_file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        "index": index_receipt,
         **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
     }
 
@@ -3185,11 +3293,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             filters,
         )
 
-        documents = [
-            (doc, score)
-            for (doc, score) in documents
-            if doc.metadata.get("user_id") in ent["entity_ids"]
-        ]
+        documents = _authorized_only(documents, ent["entity_ids"])
 
         # Empty result aligned to [] (200), matching /query and /query/{entity_id}.
         # Was 404 {"detail":"No documents found for the given query"}; that divergence

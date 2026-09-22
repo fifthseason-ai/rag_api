@@ -1292,15 +1292,102 @@ class SheetExcelLoader:
                 ]
         return documents
 
+    # -- year-only date cells -----------------------------------------------
+
+    @staticmethod
+    def _is_year_only_format(number_format) -> bool:
+        """True when a cell's number format displays nothing but the year.
+
+        Excel shows a date cell formatted ``yyyy`` as ``2016``; the value it
+        stores is the full date (2016-01-01). Locale/colour prefixes (``[$-409]``)
+        and a trailing text section (``;@``) do not change what is displayed.
+        """
+        if not isinstance(number_format, str):
+            return False
+        fmt = number_format.split(";", 1)[0]
+        while fmt.startswith("[") and "]" in fmt:
+            fmt = fmt[fmt.index("]") + 1 :]
+        return fmt.strip().lower() in ("yy", "yyy", "yyyy")
+
+    def _year_only_copy(self, workdir: str) -> Optional[str]:
+        """Return a copy of the workbook with year-only date cells as the year.
+
+        The parser renders every date cell as a full timestamp, so a cell the
+        author sees as ``2016`` was extracted as ``2016-01-01 00:00:00`` — a day
+        and month the source never shows. When (and only when) the workbook has
+        such cells, write a copy whose year-only date cells hold the integer
+        year, and parse that. The copy is written from the cached values
+        (``data_only``), which is what the parser reads anyway. Every other
+        workbook is parsed from the original file, untouched. Bounded like the
+        formula scan; past a bound (or on any failure) the original is parsed.
+        """
+        if not self._head(4).startswith(self._ZIP_MAGIC):
+            return None
+        try:
+            if os.path.getsize(self.filepath) > self._MAX_SCAN_BYTES:
+                return None
+            from openpyxl import load_workbook
+
+            found = False
+            cells_seen = 0
+            scan = load_workbook(self.filepath, data_only=True, read_only=True)
+            try:
+                for ws in scan.worksheets:
+                    for row in ws.iter_rows():
+                        cells_seen += len(row)
+                        if cells_seen > self._MAX_SCAN_CELLS:
+                            return None
+                        for cell in row:
+                            if getattr(cell, "is_date", False) and self._is_year_only_format(
+                                cell.number_format
+                            ):
+                                found = True
+                                break
+                        if found:
+                            break
+                    if found:
+                        break
+            finally:
+                scan.close()
+            if not found:
+                return None
+            wb = load_workbook(self.filepath, data_only=True)
+            for ws in wb.worksheets:
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if (
+                            cell.is_date
+                            and hasattr(cell.value, "year")
+                            and self._is_year_only_format(cell.number_format)
+                        ):
+                            cell.value = cell.value.year
+                            cell.number_format = "0"
+            copy_path = os.path.join(workdir, os.path.basename(self.filepath))
+            wb.save(copy_path)
+            stat = os.stat(self.filepath)
+            os.utime(copy_path, (stat.st_atime, stat.st_mtime))
+            return copy_path
+        except Exception as e:  # noqa: BLE001 - never fatal; parse the original
+            logger.warning("Year-only date pass failed for %s: %s", self.filepath, e)
+            return None
+
     # -- loader interface ---------------------------------------------------
 
     def load(self) -> List[Document]:
         self._precheck_container()
-        inner = UnstructuredExcelLoader(self.filepath, mode="elements")
-        try:
-            documents = inner.load()
-        except Exception as e:
-            raise self._translate(e) from e
+        with tempfile.TemporaryDirectory() as workdir:
+            parse_path = self._year_only_copy(workdir) or self.filepath
+            inner = UnstructuredExcelLoader(parse_path, mode="elements")
+            try:
+                documents = inner.load()
+            except Exception as e:
+                raise self._translate(e) from e
+        if parse_path != self.filepath:
+            # Provenance names the uploaded file, never the working copy.
+            for doc in documents:
+                doc.metadata["source"] = self.filepath
+                if "file_directory" in doc.metadata:
+                    doc.metadata["file_directory"] = os.path.dirname(self.filepath)
         return self._annotate(documents)
 
     def lazy_load(self) -> Iterator[Document]:
@@ -1442,7 +1529,19 @@ class SlidePowerPointLoader:
         for idx, slide in enumerate(prs.slides, start=1):
             title = self._slide_title(slide)
 
-            texts = self._collect_shape_texts(slide.shapes)
+            # KC-FILES-EXTRACT-REPAIR: the TITLE LEADS the slide text. The shape tree is
+            # z-order, not reading order, so a title placeholder brought to the front (or
+            # re-inserted after the body) sat AFTER the body and the chunk read
+            # "body ... title" -- the out-of-order defect recorded in the 2026-09-13
+            # extraction QA ("slide emits body before its title"). The title is taken
+            # out of the walk and put first; every other shape keeps its existing order.
+            title_shape = slide.shapes.title
+            title_id = getattr(title_shape, "shape_id", None) if title_shape is not None else None
+            texts = [title] if title else []
+            texts += self._collect_shape_texts(
+                s for s in slide.shapes
+                if title_id is None or getattr(s, "shape_id", None) != title_id
+            )
 
             if (
                 slide.has_notes_slide

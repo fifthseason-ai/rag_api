@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict
 from typing import Optional, Any, Dict, List, Union
 from sqlalchemy import event
-from sqlalchemy import delete
+from sqlalchemy import delete, func
 from sqlalchemy.orm import Session
 from sqlalchemy.engine import Engine
 from langchain_core.documents import Document
@@ -166,6 +166,23 @@ class ExtendedPgVector(PGVector):
                     self.EmbeddingStore.cmetadata["tenant_id"].astext == tenant_id
                 )
             return [str(r[0]) for r in query.all() if r[0] is not None]
+
+    def count_rows_for_ingest(self, file_id: str, ingest_id: str) -> int:
+        """How many rows of `file_id` carry THIS write's `ingest_id`, read back now (KC-FILES-1).
+
+        This is the index half of the receipt: the parse half (`extraction`) says what
+        the loader read; this says what the table actually holds from the write. It is
+        keyed on `ingest_id` -- a new UUID per write -- so earlier versions kept by the
+        additive default, and a concurrent writer's rows, can never be counted as ours.
+        """
+        with Session(self._bind) as session:
+            return int(
+                session.query(func.count(self.EmbeddingStore.uuid))
+                .filter(self.EmbeddingStore.custom_id == file_id)
+                .filter(self.EmbeddingStore.cmetadata["ingest_id"].astext == ingest_id)
+                .scalar()
+                or 0
+            )
 
     def delete_rows_by_uuid(self, row_uuids: list[str]) -> int:
         """Delete exactly these rows by primary key; returns how many were removed.

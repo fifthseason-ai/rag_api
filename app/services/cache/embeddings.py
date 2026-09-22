@@ -37,9 +37,18 @@ class CachingEmbeddings(Embeddings):
     def _key(self, text: str) -> str:
         return f"{self._namespace}\x00{text}"
 
+    def _cached(self, key: str):
+        """A cached vector, or None. Anything that is not a non-empty list (e.g. a
+        stored ``[]``) is a miss: the provider recomputes rather than an empty
+        vector reaching the store or a similarity search."""
+        cached = self._cache.get(key)
+        if isinstance(cached, list) and cached:
+            return cached
+        return None
+
     def embed_query(self, text: str) -> List[float]:
         key = self._key(text)
-        cached = self._cache.get(key)
+        cached = self._cached(key)
         if cached is not None:
             return cached
         embedding = self._embeddings.embed_query(text)
@@ -52,7 +61,7 @@ class CachingEmbeddings(Embeddings):
         missing_texts: List[str] = []
 
         for i, text in enumerate(texts):
-            cached = self._cache.get(self._key(text))
+            cached = self._cached(self._key(text))
             if cached is not None:
                 results[i] = cached
             else:
