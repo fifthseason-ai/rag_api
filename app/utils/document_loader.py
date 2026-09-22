@@ -1442,7 +1442,19 @@ class SlidePowerPointLoader:
         for idx, slide in enumerate(prs.slides, start=1):
             title = self._slide_title(slide)
 
-            texts = self._collect_shape_texts(slide.shapes)
+            # KC-FILES-EXTRACT-REPAIR: the TITLE LEADS the slide text. The shape tree is
+            # z-order, not reading order, so a title placeholder brought to the front (or
+            # re-inserted after the body) sat AFTER the body and the chunk read
+            # "body ... title" -- the out-of-order defect recorded in the 2026-09-13
+            # extraction QA ("slide emits body before its title"). The title is taken
+            # out of the walk and put first; every other shape keeps its existing order.
+            title_shape = slide.shapes.title
+            title_id = getattr(title_shape, "shape_id", None) if title_shape is not None else None
+            texts = [title] if title else []
+            texts += self._collect_shape_texts(
+                s for s in slide.shapes
+                if title_id is None or getattr(s, "shape_id", None) != title_id
+            )
 
             if (
                 slide.has_notes_slide
