@@ -36,7 +36,7 @@ The `index` block (indexed|partial|unverified, ingest_id, chunks_prepared/confir
 asserted on the success cases and MUST BE ABSENT on the refused ones.
 
 EVERYTHING HERE IS SYNTHETIC. The sources are built in-process (txt, multi-sheet xlsx,
-zip, png, encrypted xlsx); there is no real Knowledge original on this host (blocked on
+zip, png, encrypted PDF); there is no real Knowledge original on this host (blocked on
 A3 Box / A4 Graph credentials). SYNTHETIC proof of the ingestion PATH is NOT proof of
 real-source ingestion.
 
