@@ -14,8 +14,13 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download standard NLTK data, to prevent unstructured from downloading packages at runtime
-RUN python -m nltk.downloader -d /app/nltk_data punkt_tab averaged_perceptron_tagger
+# Download the EXACT NLTK data unstructured==0.18.32 looks for, so it never fetches from nltk.org
+# at runtime. nltk 3.9.x RENAMED the POS tagger: unstructured/nlp/tokenize.py checks for
+# `averaged_perceptron_tagger_eng`, NOT the old `averaged_perceptron_tagger`. Baking the old name
+# was INERT -- MEASURED (F-CI-NLTK receipt, control A): with the old name and no network, markdown
+# ingestion raised LookupError('averaged_perceptron_tagger_eng') and /embed returned 400. With the
+# _eng name baked, the same offline test PASSES (control C).
+RUN python -m nltk.downloader -d /app/nltk_data punkt_tab averaged_perceptron_tagger_eng
 ENV NLTK_DATA=/app/nltk_data
 
 # Disable Unstructured analytics
