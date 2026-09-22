@@ -116,6 +116,12 @@ class FakeStore(AsyncPgVector):
             and (tenant_id is None or r.metadata.get("tenant_id") == tenant_id)
         ]
 
+    async def count_rows_for_ingest(self, file_id, ingest_id, executor=None):
+        # Read-back for the index receipt (KC-FILES-1). Not recorded in `calls`: it is a
+        # read after the write and the ordering assertions are about writes.
+        return sum(1 for r in self.rows
+                   if r.custom_id == file_id and r.metadata.get("ingest_id") == ingest_id)
+
     async def delete_rows_by_uuid(self, row_uuids, executor=None):
         self.calls.append("delete")
         self.deleted_arg = list(row_uuids)
