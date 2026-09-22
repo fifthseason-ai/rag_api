@@ -3,6 +3,7 @@
 import os
 import codecs
 import csv
+import re
 import tempfile
 import zipfile
 
@@ -491,7 +492,11 @@ def get_loader(
     ]:
         # A legacy binary .doc can never be read by docx2txt (see refuse_legacy_word_binary).
         refuse_legacy_word_binary(filepath, filename)
-        loader = Docx2txtLoader(filepath)
+        # SafeDocxLoader delegates to Docx2txtLoader but reads an mc:AlternateContent
+        # text box only ONCE (docx2txt otherwise emits both the Choice and the
+        # Fallback -- P06-3-EXTRACTION-QUALITY). A DOCX without AlternateContent is
+        # parsed from the original file, byte-untouched.
+        loader = SafeDocxLoader(filepath)
     elif file_ext in ["xls", "xlsx"] or file_content_type in [
         "application/vnd.ms-excel",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1087,6 +1092,121 @@ class SafePyPDFLoader:
     def load(self) -> List[Document]:
         """Load PDF documents with automatic fallback on image extraction errors."""
         return list(self.lazy_load())
+
+
+class SafeDocxLoader:
+    """`Docx2txtLoader`, but a markup-compatibility text box is read only ONCE.
+
+    Word and PowerPoint write a text box as an ``<mc:AlternateContent>`` element
+    carrying the SAME runs in two branches: a modern ``<mc:Choice>`` (DrawingML
+    ``wps:txbx``) and a legacy ``<mc:Fallback>`` (VML ``v:textbox``). A conformant
+    reader renders exactly one branch, chosen by the ``Requires`` attribute. But
+    ``docx2txt`` (0.9) flattens ``word/document.xml`` with ``ElementTree.iter()``,
+    which visits every descendant regardless of those rules, so BOTH branches'
+    ``<w:t>`` are emitted and the text box's content is stored TWICE -- retrieval
+    then double-counts it and a citation shows it twice (P06-3-EXTRACTION-QUALITY,
+    reproduced on 5816e133).
+
+    The fix keeps exactly one text-bearing branch per ``AlternateContent`` before
+    ``docx2txt`` sees the file, in a temp copy -- the same parse-a-copy pattern
+    `SheetExcelLoader._year_only_copy` uses. A DOCX with no ``AlternateContent`` is
+    parsed from the ORIGINAL file, byte-untouched, so ordinary documents behave
+    exactly as before. Provenance always names the uploaded file, never the copy.
+    """
+
+    _MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+    _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    #: The parts docx2txt actually reads: document body plus every header/footer.
+    _PART_RE = re.compile(r"^word/(document|header\d*|footer\d*)\.xml$")
+
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self._temp_filepath = None  # For compatibility with cleanup function
+
+    @classmethod
+    def _has_text(cls, element) -> bool:
+        return any(
+            (t.text or "").strip()
+            for t in element.iter("{%s}t" % cls._W_NS)
+        )
+
+    @classmethod
+    def _dedupe_alternate_content(cls, xml_bytes: bytes) -> Optional[bytes]:
+        """Return rewritten XML keeping one branch per AlternateContent, or None
+        if there was nothing to change (so the caller can skip the copy)."""
+        import xml.etree.ElementTree as ET
+
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return None  # not our problem to diagnose here; let docx2txt read it
+        parents = {child: parent for parent in root.iter() for child in parent}
+        ac_tag = "{%s}AlternateContent" % cls._MC_NS
+        choice_tag = "{%s}Choice" % cls._MC_NS
+        fallback_tag = "{%s}Fallback" % cls._MC_NS
+        changed = False
+        for ac in list(root.iter(ac_tag)):
+            branches = [c for c in list(ac) if c.tag in (choice_tag, fallback_tag)]
+            if len(branches) < 2:
+                continue
+            # Prefer the first branch that actually carries text; a Choice over a
+            # Fallback when both do (the Choice is the richer, modern content).
+            keep = next((b for b in branches if b.tag == choice_tag and cls._has_text(b)), None)
+            if keep is None:
+                keep = next((b for b in branches if cls._has_text(b)), None)
+            if keep is None:
+                keep = branches[0]  # nothing text-bearing; keep one, drop the rest
+            for b in branches:
+                if b is not keep:
+                    ac.remove(b)
+                    changed = True
+        if not changed:
+            return None
+        return ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+    def _deduped_copy(self, workdir: str) -> Optional[str]:
+        """Write a copy of the .docx with AlternateContent branches deduped, or
+        None when the file has none (parse the original) or cannot be opened as a
+        zip (let docx2txt raise the honest error)."""
+        try:
+            with zipfile.ZipFile(self.filepath) as zin:
+                names = zin.namelist()
+                targets = [n for n in names if self._PART_RE.match(n)]
+                rewritten = {}
+                for n in targets:
+                    data = zin.read(n)
+                    if b"AlternateContent" not in data:
+                        continue
+                    new = self._dedupe_alternate_content(data)
+                    if new is not None:
+                        rewritten[n] = new
+                if not rewritten:
+                    return None
+                copy_path = os.path.join(workdir, os.path.basename(self.filepath))
+                with zipfile.ZipFile(copy_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                    for item in zin.infolist():
+                        zout.writestr(item, rewritten.get(item.filename, zin.read(item.filename)))
+            stat = os.stat(self.filepath)
+            os.utime(copy_path, (stat.st_atime, stat.st_mtime))
+            return copy_path
+        except zipfile.BadZipFile:
+            return None  # docx2txt on the original raises the real verdict
+        except Exception as e:  # noqa: BLE001 - never fatal; parse the original
+            logger.warning("DOCX AlternateContent dedupe failed for %s: %s", self.filepath, e)
+            return None
+
+    def load(self) -> List[Document]:
+        with tempfile.TemporaryDirectory() as workdir:
+            parse_path = self._deduped_copy(workdir) or self.filepath
+            documents = Docx2txtLoader(parse_path).load()
+            if parse_path != self.filepath:
+                # Provenance names the uploaded file, never the working copy.
+                for doc in documents:
+                    doc.metadata["source"] = self.filepath
+        return documents
+
+    def lazy_load(self) -> Iterator[Document]:
+        yield from self.load()
 
 
 class SheetExcelLoader:
