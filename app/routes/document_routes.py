@@ -927,10 +927,28 @@ async def delete_documents(
     # the upload then wrote batches 2..7, and BOTH calls answered success -- leaving a
     # partial document (6 of 7 chunks) that neither caller knew about. Waiting for the
     # upload makes the delete apply to the whole file it finished writing.
+    #
+    # F-BULK-DELETE-LOCK: with NO file_ids this is a bulk purge of the entity, and the lock
+    # set used to be that empty list -- so the purge locked nothing and reopened the exact
+    # race F02B closed (reproduced: purge mid-upload, both 200, the file survived without
+    # its first batch). Resolve the purge to the entity's file_ids first, lock THOSE, and
+    # delete exactly the locked set, never the open entity filter. A file whose first batch
+    # had not landed when the purge resolved is left whole, ordered after the purge. Only
+    # the pgvector store is resolved here: the other store's lookup is not entity-scoped
+    # (F-MONGO-DELETE-SCOPE) and its path is left as it was.
+    origin_type_value = document_origin_type.value if document_origin_type else None
+    bulk_purge = not document_ids
+    if bulk_purge and isinstance(vector_store, AsyncPgVector):
+        document_ids = sorted(set(await vector_store.get_filtered_ids(
+            [],
+            user_id=user_id,
+            document_origin_type=origin_type_value,
+            subscription_id=subscription_id,
+            executor=request.app.state.thread_pool,
+        )))
     file_locks = await _hold_file_locks(document_ids, caller_still_waiting(request))
 
     try:
-        origin_type_value = document_origin_type.value if document_origin_type else None
         logger.info(
             "[delete_documents] request [user_id=%s][file_ids=%s][document_origin_type=%s][subscription_id=%s]",
             user_id, document_ids, origin_type_value, subscription_id,
@@ -943,14 +961,18 @@ async def delete_documents(
                 subscription_id=subscription_id,
                 executor=request.app.state.thread_pool,
             )
-            await vector_store.delete(
-                ids=document_ids,
-                user_id=user_id,
-                document_origin_type=origin_type_value,
-                subscription_id=subscription_id,
-                text_source=text_source,
-                executor=request.app.state.thread_pool,
-            )
+            # A resolved purge that found nothing must not fall through to ids=[] -- that
+            # is the open entity filter, which could halve a file that started writing
+            # after the resolve.
+            if document_ids:
+                await vector_store.delete(
+                    ids=document_ids,
+                    user_id=user_id,
+                    document_origin_type=origin_type_value,
+                    subscription_id=subscription_id,
+                    text_source=text_source,
+                    executor=request.app.state.thread_pool,
+                )
         else:
             existing_ids = vector_store.get_filtered_ids(document_ids)
             if text_source is not None:
@@ -968,7 +990,7 @@ async def delete_documents(
                 )
             vector_store.delete(ids=document_ids)
 
-        if document_ids:
+        if not bulk_purge:
             if not all(id in existing_ids for id in document_ids):
                 raise HTTPException(status_code=404, detail="One or more IDs not found")
         else:
