@@ -2385,6 +2385,51 @@ def _assert_extractable_content(
     return receipt
 
 
+async def _index_receipt(file_id: str, ingest_id: str, prepared: int, executor) -> dict:
+    """The INDEX state of one write, read back from the store (KC-FILES-1).
+
+    PARSE != INDEX. `extraction` reports what the loader read; nothing reported what the
+    table then held, so a consumer could only take HTTP 200 as "indexed". This counts the
+    rows carrying this write's `ingest_id` after the insert returned:
+
+      indexed     every prepared chunk is in the table (and there was at least one)
+      partial     the table holds a different number of this write's chunks than were
+                  prepared -- a short (or over-counted) write is never `indexed`
+      unverified  the store cannot be read back, or the read failed. UNKNOWN, reported
+                  as such: never promoted to `indexed` because the insert did not raise.
+
+    A read failure must not fail an upload whose insert succeeded, so it degrades to
+    `unverified` rather than raising.
+    """
+    confirmed = None
+    counter = getattr(vector_store, "count_rows_for_ingest", None)
+    if counter is not None:
+        try:
+            if isinstance(vector_store, AsyncPgVector):
+                confirmed = await counter(file_id, ingest_id, executor=executor)
+            else:
+                confirmed = counter(file_id, ingest_id)
+            confirmed = int(confirmed)
+        except Exception as read_error:  # noqa: BLE001 - see docstring: degrade to unknown
+            logger.warning(
+                "Could not read back rows of %s after insert (%s); index state unverified",
+                file_id, type(read_error).__name__,
+            )
+            confirmed = None
+    if confirmed is None:
+        state = "unverified"
+    elif prepared > 0 and confirmed == prepared:
+        state = "indexed"
+    else:
+        state = "partial"
+    return {
+        "status": state,
+        "ingest_id": ingest_id,
+        "chunks_prepared": prepared,
+        "chunks_confirmed": confirmed,
+    }
+
+
 async def _undo_abandoned_insert(
     file_id: str, rows_before_insert: Optional[List[str]], executor
 ) -> Optional[int]:
@@ -2599,6 +2644,10 @@ async def _store_data_in_vector_db_unlocked(
         # what it takes to stop a 200 meaning "the old version is gone" when it is not.
         out_of_scope_rows = max(0, len(all_rows_before) - len(superseded_rows))
 
+    # Named (it was generated inline) so the index receipt can read back exactly the rows
+    # of THIS write -- see `_index_receipt`.
+    ingest_id = str(uuid.uuid4())
+
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     docs = await loop.run_in_executor(
@@ -2617,7 +2666,7 @@ async def _store_data_in_vector_db_unlocked(
         # a failed or abandoned one is rolled back (and a replacement deletes the version
         # it supersedes only after its own insert succeeded), so a reader always sees the
         # id that belongs to the content in front of them.
-        str(uuid.uuid4()),
+        ingest_id,
     )
 
     # F04: the rows this file ALREADY had, captured before anything is inserted, so an
@@ -2680,6 +2729,7 @@ async def _store_data_in_vector_db_unlocked(
         await _stop_if_caller_gone(still_wanted, "after insert")
 
         result = {"message": "Documents added successfully", "ids": ids, "docs": docs}
+        result["index"] = await _index_receipt(file_id, ingest_id, len(docs), executor)
 
         if superseded_rows is not None:
             # Only now -- the new rows exist, so removing the old ones cannot empty the
@@ -2826,6 +2876,7 @@ async def embed_local_file(
                 "filename": document.filename,
                 "known_type": known_type,
                 "extraction": extraction_receipt,
+                "index": result.get("index"),
             }
         else:
             # Defensive only: `store_data_in_vector_db` now raises rather than returning a falsy
@@ -2944,6 +2995,7 @@ async def embed_file(
     known_type = None
     extraction_receipt = None
     replacement_receipt = None
+    index_receipt = None
 
     user_id = get_user_id(request, entity_id)
     logger.info(
@@ -3003,6 +3055,7 @@ async def embed_file(
             )
 
         replacement_receipt = result.get("replacement")
+        index_receipt = result.get("index")
 
         logger.info(
             "[embed_file] stored [file_id=%s][chunks=%d][replace=%s][superseded=%s]",
@@ -3065,6 +3118,8 @@ async def embed_file(
         "filename": file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        # KC-FILES-1: the INDEX state, read back from the store; `extraction` is the parse.
+        "index": index_receipt,
         # PRESENT ONLY when the caller asked to replace, so every existing response keeps
         # its exact shape. Absent means "nothing was superseded", never "we did not check".
         **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
@@ -3147,6 +3202,7 @@ async def embed_file_upload(
     tenant_id = ent["tenant_id"]
     extraction_receipt = None
     replacement_receipt = None
+    index_receipt = None
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
@@ -3182,6 +3238,7 @@ async def embed_file_upload(
             )
 
         replacement_receipt = result.get("replacement")
+        index_receipt = result.get("index")
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in embed_file_upload | Status: %d | Detail: %s",
@@ -3204,6 +3261,7 @@ async def embed_file_upload(
         "filename": uploaded_file.filename,
         "known_type": known_type,
         "extraction": extraction_receipt,
+        "index": index_receipt,
         **({"replacement": replacement_receipt} if replacement_receipt is not None else {}),
     }
 

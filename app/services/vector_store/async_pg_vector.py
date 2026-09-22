@@ -60,6 +60,14 @@ class AsyncPgVector(ExtendedPgVector):
             executor, super().get_row_uuids, file_id, user_id, tenant_id
         )
 
+    async def count_rows_for_ingest(
+        self, file_id: str, ingest_id: str, executor=None
+    ) -> int:
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor, super().count_rows_for_ingest, file_id, ingest_id
+        )
+
     async def delete_rows_by_uuid(self, row_uuids: list[str], executor=None) -> int:
         executor = executor or self._get_thread_pool()
         return await self._run_in_executor(
