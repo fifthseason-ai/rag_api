@@ -321,6 +321,46 @@ def test_SYNTHETIC_merged_category_label_reaches_every_row(tmp_path):
     assert detail.count("Hardware") >= 3, detail
 
 
+def make_SYNTHETIC_vertical_merge_no_year_workbook(path):
+    """A vertical merge and NOTHING else that would trigger the year-cell copy -- so
+    this isolates the merge-fill effect from the _year_only_copy path."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws["A1"] = "Category"
+    ws["B1"] = "Item"
+    ws["A2"] = "Hardware"
+    ws.merge_cells("A2:A4")
+    ws["B2"] = "Widget"
+    ws["B3"] = "Gadget"
+    ws["B4"] = "Gizmo"
+    wb.save(str(path))
+
+
+def test_SYNTHETIC_merged_label_reaches_every_row_no_year(tmp_path):
+    """THE OBSERVABLE DIFFERENCE that keeps _resolve_merged_cells (card #91 review).
+
+    MEASURED: UnstructuredExcelLoader does NOT propagate a merged value across its
+    span. On this fixture raw extraction yields the category "Hardware" ONCE and
+    splits the continuation rows (Gadget, Gizmo) into separate chunks that have lost
+    it entirely; the merge fill puts it on every spanned row. This holds WITHOUT any
+    year cell, so it is the fill -- not the _year_only_copy re-save -- that matters.
+
+    RED-FIRST CONTROL: replace the anchor fill in _resolve_merged_cells with `pass`
+    (or delete the method + call site) and this reddens with count 1, naming the exact
+    difference the transformation exists to produce. Nothing else in the suite depends
+    on the fill, so this is its sole permanent guard."""
+    path = tmp_path / "vmerge.xlsx"
+    make_SYNTHETIC_vertical_merge_no_year_workbook(str(path))
+
+    docs = load_documents(path)
+    content = " ".join(d.page_content for d in docs)
+    assert content.count("Hardware") >= 3, (
+        "the merged category was not propagated to every spanned row: %r" % content)
+
+
 # ===========================================================================
 # 6. THE DELIBERATE NON-PROMOTION (condition 4) + units/empty_locators unchanged
 #    (condition 6) -- DETERMINISTIC via _extraction_receipt on synthetic chunks.

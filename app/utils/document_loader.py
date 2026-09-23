@@ -1431,14 +1431,21 @@ class SheetExcelLoader:
         """Return a copy of ``src_path`` with every merged range unmerged and its
         anchor value FILLED across the range, or ``None`` to parse ``src_path`` as is.
 
-        A merged cell stores its value only in the top-left cell; every other cell
-        of the range reads back empty. When the parser flattens the sheet those
-        cells render as PHANTOM EMPTY cells, and for a value merged down a column
-        (a category label spanning several rows) the label is effectively LOST for
-        every continuation row -- the row no longer says which category it belongs
-        to. Unmerging and writing the anchor value into every cell of the range
-        keeps the anchor value AND removes the phantom empties: each row carries its
-        own copy of the merged value.
+        A merged cell stores its value only in the top-left cell; every other cell of
+        the range reads back empty. MEASURED against the pinned UnstructuredExcelLoader
+        (mode="elements"): it does NOT propagate a merged value across its span -- it
+        emits the value once on the anchor row and renders the continuation rows as
+        SEPARATE elements with the merged cell empty. So a value merged down a column
+        (a category label spanning several rows) is LOST for every continuation row,
+        and because those rows become their own chunks, the STORED chunk that cites a
+        continuation row has no idea which category it belongs to. Concretely, a
+        vertical "Hardware" merged over three rows extracts as
+        ``'... Hardware Widget | Gadget | Gizmo'`` (once) at base, and as
+        ``'... Hardware Widget Hardware Gadget Hardware Gizmo'`` (per row) after this
+        fill. Unmerging and writing the anchor value into every cell of the range puts
+        the value on every spanned row so each row -- and each resulting chunk -- keeps
+        it. This is the observable difference pinned by
+        test_xlsx_cell_locator.py::test_SYNTHETIC_merged_label_reaches_every_row_no_year.
 
         ``None`` is returned (parse the source untouched) when there is nothing to
         do (no merged ranges) or the workbook cannot be opened by openpyxl -- never
