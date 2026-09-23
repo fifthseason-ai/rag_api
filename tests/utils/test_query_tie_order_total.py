@@ -24,7 +24,28 @@ Controls:
   * drop `asc(EmbeddingStore.uuid)` from the dense override      -> the dense test reds
   * restore `ORDER BY score DESC` (no uuid) in hybrid_search     -> the keyword test reds
   * remove the explicit sort in reranker.rerank                  -> the rerank tie test reds
-  * let a langchain upgrade replace our `_query_collection`      -> the override-identity test reds
+  * DELETE or RENAME our `_query_collection`                     -> the override-identity test reds
+
+KNOWN LIMIT 1 -- what the override-identity pin does NOT do (RV-122 F1, measured by the
+reviewer). An earlier version of this docstring said the pin makes "a langchain upgrade"
+fail loudly. It does not: it catches DELETION or RENAME only. The reviewer simulated two
+realistic upgrades -- upstream changing `_query_collection`'s body, and upstream routing
+the public search through a DIFFERENT internal method -- and all five tests here stayed
+GREEN. In the second case our override would simply stop being called and the order would
+revert to upstream's partial one, silently. The real fix (follow-on): drive the dense test
+through the PUBLIC `similarity_search_with_score_by_vector` and pin the upstream version or
+a source hash. Until then the identity pin is a tripwire for the easy case, not upgrade
+safety.
+
+KNOWN LIMIT 2 -- the provider decides a tie we never see (RV-122 F2). `reranker._rerank_sync`
+asks Bedrock for `numberOfResults: top_n` (reranker.py:59), so when relevance ties at the
+k-boundary the PROVIDER chooses which candidates come back before our sort runs. The sort
+below makes the returned set totally ordered; it cannot make the SET deterministic. This is
+the same k-boundary argument this file makes about SQL `LIMIT`, applied one layer out, and
+it is a real hole in the guarantee. Closing it means scoring the whole candidate pool and
+cutting locally, whose cost effect is UNMEASURED -- and cannot be measured here, because
+that measurement is itself a paid Bedrock call under the standing no-paid-calls hold. Stated
+as a limit rather than guessed at.
 """
 import pytest
 from langchain_core.documents import Document
@@ -113,8 +134,12 @@ def test_dense_leg_orders_by_distance_then_row_uuid(monkeypatch):
 
 
 def test_the_dense_override_is_ours_not_langchains():
-    """If a langchain upgrade replaces the method we copied, the total order silently
-    reverts to upstream's partial one. Pin the override's identity so that fails loudly."""
+    """Catches DELETION or RENAME of our override -- and only that.
+
+    It does NOT make a langchain upgrade fail loudly; see KNOWN LIMIT 1 in the module
+    docstring. RV-122 measured two realistic upgrades that leave this green, including
+    upstream routing the public search through a different internal method, which would
+    strand our override uncalled and silently restore the partial order."""
     from langchain_community.vectorstores.pgvector import PGVector
 
     assert ExtendedPgVector._query_collection is not PGVector._query_collection
