@@ -1398,8 +1398,12 @@ class SheetExcelLoader:
             for ws in wb.worksheets:
                 for row in ws.iter_rows():
                     for cell in row:
+                        # getattr, not `cell.is_date`: a MergedCell (a merged range's
+                        # non-anchor cell) has no `is_date`, so a workbook that is both
+                        # merged AND holds a year-only cell would otherwise crash this
+                        # pass and silently lose the year conversion.
                         if (
-                            cell.is_date
+                            getattr(cell, "is_date", False)
                             and hasattr(cell.value, "year")
                             and self._is_year_only_format(cell.number_format)
                         ):
@@ -1510,19 +1514,27 @@ class SheetExcelLoader:
 
             out: dict = {}
             cells_seen = 0
-            wb = load_workbook(self.filepath, data_only=True, read_only=True)
+            # Not read_only: read_only mode yields `EmptyCell`/`MergedCell` proxies for
+            # blank and merged-continuation cells that lack `.row`/`.column`, so a
+            # merged workbook (or any row whose first column is blank) would crash the
+            # scan. A normal load gives every cell a coordinate; bounded by size above
+            # and by the cell budget below, exactly like the year/merge passes.
+            wb = load_workbook(self.filepath, data_only=True)
             try:
                 for ws in wb.worksheets:
                     min_r = min_c = None
                     max_r = max_c = 0
                     header_buf = []
                     for row in ws.iter_rows():
+                        if not row:
+                            continue
                         cells_seen += len(row)
                         if cells_seen > self._MAX_SCAN_CELLS:
                             return {}
+                        r_idx = row[0].row  # real coordinate (non read_only)
                         values = [c.value for c in row]
-                        if row and row[0].row <= self._HEADER_SEARCH_ROWS:
-                            header_buf.append((row[0].row, values))
+                        if r_idx <= self._HEADER_SEARCH_ROWS:
+                            header_buf.append((r_idx, values))
                         for cell in row:
                             if cell.value is None or str(cell.value).strip() == "":
                                 continue
