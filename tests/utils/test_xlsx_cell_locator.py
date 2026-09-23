@@ -362,6 +362,112 @@ def test_SYNTHETIC_merged_label_reaches_every_row_no_year(tmp_path):
 
 
 # ===========================================================================
+# 5b. THE DISTRIBUTION CONTRACT MADE EXECUTABLE (card #91 ruling (a)).
+#
+# The fill distributes EVERY merged value UNIFORMLY across its span, regardless of
+# type. That is the disclosed distortion, chosen deliberately: flattening a 2-D merge
+# into a linear chunk stream changes counts for every value type, and a downstream
+# occurrence-counter cannot tell a faithful label repeat from a figure repeat -- so
+# repeated spreadsheet-derived values MUST NOT be counted as independent occurrences
+# (a figure appearing three times may be ONE figure merged across three rows).
+#
+# The TYPE RULE ("fill text, skip numeric") was PROPOSED AND DEFEATED: text-stored
+# numbers (leading-zero codes, accounting/CSV exports, @-formatted cells) read as
+# `data_type='s'`, so it would have FILLED them and the figure double-count would have
+# survived for exactly the dirtiest ledger shapes -- protecting the clean case and
+# failing the dirty one. A rule right most of the time and wrong unpredictably is
+# harder to work with than one wrong consistently; a consistent distortion can be
+# corrected downstream, an inconsistent one becomes invisible. Hence ruling (a).
+#
+# These five pins assert the DISCLOSED behaviour for every value type measured. They
+# are the contract, not desired outcomes: if anyone later adds a type discriminator,
+# all five go red at once and force a return to this trade rather than a silent re-fix.
+# ===========================================================================
+
+
+def _merged_down_workbook(path, anchor_setter, cached=None):
+    """A single vertical merge A2:A4 (the value under test) beside a per-phase column."""
+    import shutil
+    import zipfile
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws["A1"] = "Fee"
+    ws["B1"] = "Phase"
+    anchor_setter(ws)              # sets A2 (+ optional number_format)
+    ws.merge_cells("A2:A4")
+    ws["B2"] = "Discovery"
+    ws["B3"] = "Build"
+    ws["B4"] = "Handover"
+    wb.save(str(path))
+    if cached:
+        tmp = str(path) + ".t"
+        with zipfile.ZipFile(str(path)) as zin, zipfile.ZipFile(tmp, "w") as zout:
+            for it in zin.infolist():
+                pay = zin.read(it.filename)
+                if it.filename == "xl/worksheets/sheet1.xml":
+                    pay = pay.replace(cached[0], cached[0] + cached[1])
+                zout.writestr(it, pay)
+        shutil.move(tmp, str(path))
+
+
+def _distributed_count(tmp_path, name, anchor_setter, token, cached=None):
+    path = tmp_path / name
+    _merged_down_workbook(str(path), anchor_setter, cached=cached)
+    docs = load_documents(path)
+    content = " ".join(d.page_content for d in docs)
+    return content.count(token), content
+
+
+def test_CONTRACT_merged_plain_numeric_is_distributed_SYNTHETIC(tmp_path):
+    """DISCLOSED DISTORTION, not a desired outcome: a numeric figure stated once in a
+    merged cell is distributed to every spanned row. Fails loudly if a discriminator
+    ever stops filling numerics -> back to the contract, not a silent 'fix'."""
+    n, content = _distributed_count(
+        tmp_path, "n.xlsx", lambda ws: ws.__setitem__("A2", 15000), "15000")
+    assert n >= 3, content
+
+
+def test_CONTRACT_merged_text_stored_number_is_distributed_SYNTHETIC(tmp_path):
+    """A number typed as TEXT ("15000") -- the shape that defeated the type rule --
+    is distributed like any text. Pinned so the defeated rule cannot quietly return."""
+    n, content = _distributed_count(
+        tmp_path, "tsn.xlsx", lambda ws: ws.__setitem__("A2", "15000"), "15000")
+    assert n >= 3, content
+
+
+def test_CONTRACT_merged_single_fact_text_is_distributed_SYNTHETIC(tmp_path):
+    """A stated-once text value (a status) is distributed like a label -- type cannot
+    tell them apart, which is precisely why the distribution is uniform and disclosed."""
+    n, content = _distributed_count(
+        tmp_path, "sft.xlsx", lambda ws: ws.__setitem__("A2", "APPROVED"), "APPROVED")
+    assert n >= 3, content
+
+
+def test_CONTRACT_merged_date_is_distributed_SYNTHETIC(tmp_path):
+    """A merged date is distributed to every spanned row."""
+    import datetime
+
+    def setter(ws):
+        ws["A2"] = datetime.datetime(2016, 3, 4)
+        ws["A2"].number_format = "yyyy-mm-dd"
+
+    n, content = _distributed_count(tmp_path, "d.xlsx", setter, "2016")
+    assert n >= 3, content
+
+
+def test_CONTRACT_merged_cached_formula_result_is_distributed_SYNTHETIC(tmp_path):
+    """A cached formula RESULT is distributed. The pass loads data_only=True, so the
+    cached numeric result is what gets distributed (a dependency of the behaviour)."""
+    n, content = _distributed_count(
+        tmp_path, "cf.xlsx", lambda ws: ws.__setitem__("A2", "=SUM(1,2,3)"), "15000",
+        cached=(b"<f>SUM(1,2,3)</f>", b"<v>15000</v>"))
+    assert n >= 3, content
+
+
+# ===========================================================================
 # 6. THE DELIBERATE NON-PROMOTION (condition 4) + units/empty_locators unchanged
 #    (condition 6) -- DETERMINISTIC via _extraction_receipt on synthetic chunks.
 #    This is the most important pin: it records executably that we chose NOT to
