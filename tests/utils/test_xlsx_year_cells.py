@@ -27,22 +27,36 @@ precision, so a genuine 30 June 2016 displayed as `2016` enters the index as `20
 A fiscal year end becomes unanswerable and a mid-year reporter is indistinguishable
 from a calendar-year one.
 
-RULED: keep the behaviour, disclose it. In the common case the author typed only a
-year and this pass removes a January-the-first timestamp the source never showed --
-usually right, occasionally wrong, which is the inverse of a heuristic worth removing.
-What was missing is that it was the only content-changing step in this loader that
-left no trace on success.
+RULED (Richard, 2026-09-23): PRESERVE the full underlying date; DISPLAY only the year
+when that is how the cell is formatted; do not destroy month and day at ingestion.
 
-The disclosure names WHAT WAS LOST rather than merely that something happened:
-`extraction.dates.reduced` lists the cells whose month and day were discarded, and is
-ABSENT when nothing was. A flag on every rewritten year cell would be true on
-thousands where nothing was lost, and an alarm that fires on the normal case is one
-readers learn to ignore -- which would put the rare destructive case back where it
-started.
+An earlier remedy -- keep the reduction and DISCLOSE it -- was superseded, and the
+reason is worth carrying because it generalises. Year-only is a PRESENTATION concern
+and it was being resolved at INGESTION, which is exactly where the data dies. A
+disclosure tells a reader that month and day were destroyed; it cannot give them back,
+and it converts a fixable data defect into a permanent caveat. Disclosure is not
+safety, one level deeper than where that rule is usually applied.
+
+So both halves hold at once:
+  * the TEXT shows `2016`, because that is what the author sees and an invented
+    `2016-01-01` claims a day the source never shows;
+  * `date_values` carries the FULL date of every rendered cell, keyed by
+    sheet-qualified reference, so nothing is lost and no reprocessing is needed.
+
+`date_display_reduced` survives with a CHANGED MEANING: it names cells whose month and
+day are now only in `date_values` -- a pointer for a reader who needs the real date,
+not a record of a loss. It stays absent when every rendered cell was a bare
+January-the-first, because an alarm that fires on the normal case is one readers learn
+to ignore.
 
 Stated as a fact about the VALUE, never about intent: rag_api cannot know what the
 author typed, only whether anything other than the January-the-first default was
 present.
+
+STILL OWED, not in this change: marking historical losses in already-ingested records
+and reprocessing the originals where authorization exists. Those rows were ingested by
+the old path and their month and day are genuinely gone; recovering them needs the
+source files, which is governed (A3/A4).
 
 Fixtures are SYNTHETIC, built at test time. No client content.
 """
@@ -407,3 +421,56 @@ def test_a_workbook_with_no_year_cells_has_no_dates_block_at_all(client, tmp_pat
     r = _embed(client, "plain.xlsx", path.read_bytes(), file_id="f-plain")
     assert r.status_code == 200, r.text
     assert "dates" not in r.json()["extraction"], r.json()["extraction"]
+
+
+# ===========================================================================
+# RE-SCOPED 2026-09-23 (Richard): PRESERVE the date, RENDER the year
+# ===========================================================================
+
+
+def test_the_full_date_is_preserved_even_though_the_text_shows_only_the_year(tmp_path):
+    """THE RULING. Year-only is a PRESENTATION choice; resolving it at INGESTION is
+    where the data died.
+
+    Both halves must hold at once:
+      * the extracted TEXT shows `2016`, because that is what the author sees and an
+        invented `2016-01-01` claims a day the source never shows;
+      * the FULL date is still on the record, so nothing is destroyed and no
+        reprocessing is needed to get it back.
+
+    A disclosure could only ever say month and day were discarded. It could not
+    return them, and it turned a fixable ingestion defect into a permanent caveat.
+    """
+    path = tmp_path / "fiscal.xlsx"
+    make_year_workbook(str(path), year_cell_value=datetime.datetime(2016, 6, 30))
+
+    doc = sheet_text(path)
+
+    assert "date_yyyy 2016" in doc.page_content, doc.page_content
+    assert "2016-06-30" not in doc.page_content, (
+        "the text shows the underlying date; it must show what the cell DISPLAYS")
+
+    values = doc.metadata.get("date_values")
+    assert values, (
+        "the full date was not preserved anywhere -- this is the destruction the "
+        "ruling forbids. metadata=%r" % (sorted(doc.metadata),))
+    assert values["Years!B7"].startswith("2016-06-30"), values
+
+
+def test_preservation_covers_lossless_cells_too(tmp_path):
+    """Every rendered cell is preserved, not only the ones that would have lost data.
+
+    Preserving selectively would make `date_values` a record of past defects rather
+    than a faithful copy of what the workbook holds, and a consumer could not tell
+    whether a missing entry meant "January the first" or "we did not keep it".
+    """
+    path = tmp_path / "calendar.xlsx"
+    make_year_workbook(str(path))  # 2016-01-01
+
+    doc = sheet_text(path)
+
+    values = doc.metadata.get("date_values")
+    assert values and values["Years!B7"].startswith("2016-01-01"), values
+    assert not doc.metadata.get("date_display_reduced"), (
+        "a 2016-01-01 cell is not a reduction: its full date is identical to what the "
+        "text conveys. metadata=%r" % (doc.metadata,))

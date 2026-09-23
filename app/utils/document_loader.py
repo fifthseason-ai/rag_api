@@ -1347,6 +1347,7 @@ class SheetExcelLoader:
         # quietest possible way.
         self._year_normalised = 0
         self._year_reduced = []
+        self._year_preserved = {}
         if not self._head(4).startswith(self._ZIP_MAGIC):
             return None
         try:
@@ -1386,16 +1387,25 @@ class SheetExcelLoader:
                             and hasattr(cell.value, "year")
                             and self._is_year_only_format(cell.number_format)
                         ):
+                            # PRESERVE FIRST, THEN RENDER (Richard, 2026-09-23). The
+                            # extracted TEXT shows what the author sees -- `2016`,
+                            # never an invented `2016-01-01` -- while the full
+                            # underlying date is kept on the record.
+                            #
+                            # The earlier remedy was to keep the reduction and
+                            # DISCLOSE it. That was wrong: year-only is a
+                            # PRESENTATION choice and it was being resolved at
+                            # INGESTION, which is where the data dies. A disclosure
+                            # can tell a reader that month and day were destroyed; it
+                            # cannot give them back, and it converts a fixable defect
+                            # into a permanent caveat.
+                            ref = "%s!%s" % (ws.title, cell.coordinate)
+                            self._year_preserved[ref] = cell.value.isoformat()
                             if self._reduction_discards_a_date(cell.value):
-                                # Record WHAT WAS LOST, not merely that something
-                                # happened. A flag on every rewritten cell would be
-                                # true on thousands where nothing was discarded, and
-                                # an alarm that fires on the normal case is one that
-                                # readers learn to ignore -- which puts the rare
-                                # destructive case back where it started.
-                                self._year_reduced.append(
-                                    "%s!%s" % (ws.title, cell.coordinate)
-                                )
+                                # Still recorded, but its meaning has changed: this
+                                # cell's full date now lives ONLY in metadata, not in
+                                # the text. It is a pointer, no longer an epitaph.
+                                self._year_reduced.append(ref)
                             self._year_normalised += 1
                             cell.value = cell.value.year
                             cell.number_format = "0"
@@ -1425,19 +1435,27 @@ class SheetExcelLoader:
                 doc.metadata["source"] = self.filepath
                 if "file_directory" in doc.metadata:
                     doc.metadata["file_directory"] = os.path.dirname(self.filepath)
-            # DISCLOSURE (F-XLSX-YEAR-FORMAT-DESTROYS-DATE). The year pass is the only
-            # content-changing step in this loader that left no trace on success, so a
-            # rewritten year was indistinguishable from a year that was always a year.
-            # Stamped only when the pass actually ran.
+            # PRESERVATION + DISCLOSURE (F-XLSX-YEAR-FORMAT-DESTROYS-DATE).
             #
-            # `date_display_reduced` is the one that matters: it names the cells whose
-            # month and day were discarded. ABSENT, never empty, when nothing was lost
-            # -- an empty list reads as a measurement that found nothing, which is a
-            # different claim from "every rewrite was lossless".
+            # `date_values` is the load-bearing one: the FULL underlying date of every
+            # cell the year pass rendered down, keyed by sheet-qualified reference. The
+            # text shows `2016` because that is what the author sees; the date itself
+            # is still here. Nothing is destroyed at ingestion.
+            #
+            # `date_display_reduced` names the cells whose month and day are now ONLY
+            # in `date_values` — a pointer for a reader who needs the real date, not a
+            # record of a loss. ABSENT, never empty, when every rendered cell was a
+            # bare January-the-first: an empty list reads as a measurement that found
+            # nothing, which is a different claim.
+            #
+            # Stamped only when the pass actually ran.
             normalised = getattr(self, "_year_normalised", 0)
             reduced = getattr(self, "_year_reduced", [])
+            preserved = getattr(self, "_year_preserved", {})
             for doc in documents:
                 doc.metadata["date_display_normalised"] = normalised
+                if preserved:
+                    doc.metadata["date_values"] = dict(preserved)
                 if reduced:
                     doc.metadata["date_display_reduced"] = list(reduced)
         return self._annotate(documents)
