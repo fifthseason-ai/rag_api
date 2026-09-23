@@ -203,7 +203,12 @@ def test_query_returns_current_version_and_superseded_does_not_leak(monkeypatch)
         assert len(post_ids) == 1, ("more than one version's ingest_id present", post_ids)
         assert post_ids.isdisjoint(v1_ids), ("still carrying v1's ingest_id", post_ids, v1_ids)
 
-        # the table physically holds only v2's rows
+        # the table physically holds only v2's rows.
+        # Not pinned to an exact count: V2_TEXT's chunk count depends on the app's text
+        # splitter config (chunk size + overlap), which this test neither imports nor sets,
+        # so no unambiguous exact number is available statically -- guessing one would be a
+        # fabricated constant. The load-bearing supersession guards are the single-ingest_id
+        # and V1-absence assertions above; this only confirms v2 rows physically remain.
         assert len(_real_rows(store)) >= 1
     finally:
         _teardown(store)
@@ -216,6 +221,18 @@ def test_keyword_leg_no_longer_matches_a_v1_only_term_after_replace(monkeypatch)
     store = _real_store(monkeypatch, "vers_source_kw")
     try:
         client = _client(monkeypatch, store)
+        # Stub the DENSE arm to contribute nothing, so the keyword (FTS) arm is the SOLE
+        # possible contributor to both queries below. This is what makes the keyword-specific
+        # claim real: without it, with only this file's rows in the table and k=10, dense
+        # returns the same rows regardless -- so the `before` match would not prove the
+        # keyword arm ever matched V1_TERM, and the `after` emptiness would be guaranteed by
+        # the replace deletion whichever arm ran (i.e. dense alone would satisfy both halves).
+        # Function-scoped monkeypatch (the test param) so it cannot leak to sibling tests.
+        # Pattern copied from test_both_legs_expected_passage_and_version.py (~:217-219).
+        async def _no_dense(*a, **k):
+            return []
+        monkeypatch.setattr(document_routes.vector_store,
+                            "asimilarity_search_with_score_by_vector", _no_dense)
         assert _embed(client, V1_TEXT, FILENAME).status_code == 200
         before = client.post("/query", json={"query": V1_TERM, "file_id": FID, "k": 10,
                                              "entity_id": ENT}, headers=_hdr())

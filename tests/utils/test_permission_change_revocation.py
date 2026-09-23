@@ -267,13 +267,19 @@ def test_grant_then_revoke_refused(env, route):
 
 @needs_pg
 @pytest.mark.parametrize("route", sorted(_ROUTES))
-def test_revocation_equality_indistinguishable_from_never_entitled(env, route):
-    """Revocation-equality: a revoked caller (who queried nothing before) is byte-for-byte
-    indistinguishable from a caller who never had uX -- same status, same body, same
-    content-length. No existence oracle, no residue-based divergence."""
+def test_never_entitled_denial_is_deterministic_and_leaks_no_existence_oracle(env, route):
+    """NEVER-ENTITLED existence-oracle guard (NOT a grant->revoke transition: both compared
+    calls carry ENT_OTHER, which never included uX, so no transition is built here). Two
+    never-entitled denials are byte-for-byte identical -- same status, same body, same
+    content-length -- and identical to a query that matches nothing at all, so a denied
+    caller learns nothing about whether uX's row exists. The transition property is proven
+    by test_grant_then_revoke_refused and test_revoked_after_owner_warmed_the_cache."""
     revoked = _ROUTES[route](env.client, TERM, [ENT_OTHER])
     never = _ROUTES[route](env.client, TERM, [ENT_OTHER])
     assert (revoked.status_code, revoked.content) == (never.status_code, never.content)
+    # This header check degrades to None == None when content-length is absent; the
+    # load-bearing guard is the .content byte-equality on the line above, which cannot pass
+    # vacuously. Kept as a cheap corroborating signal, not as the primary assertion.
     assert revoked.headers.get("content-length") == never.headers.get("content-length")
 
     # And identical to a query that matches nothing at all (no count / existence leak).
@@ -305,9 +311,12 @@ def test_revoked_after_owner_warmed_the_cache(env, route):
 
 @needs_pg
 @pytest.mark.parametrize("route", sorted(_ROUTES))
-def test_cross_tenant_caller_gets_neither_content_nor_metadata(env, route):
-    """A cross-tenant caller (different tid AND its own, different entity set) gets nothing
-    on every route and no restricted value leaks.
+def test_caller_with_a_foreign_entity_set_is_excluded_on_every_route(env, route):
+    """A caller whose token carries a DIFFERENT entity set (here also a different tid, but the
+    tid is NOT what excludes the row) gets nothing on every route and no restricted value
+    leaks. This is the same entity-exclusion as test_grant_then_revoke_refused, exercised
+    under a foreign entity id -- it is NOT a tenant-isolation test, because (per the nuance
+    below) rag_api has no tenant retrieval filter to exercise.
 
     MEASURED NUANCE (P06-5 §2a): rag_api has no tenant retrieval filter -- `tenant_id` is
     stored on cmetadata but retrieval scopes on `user_id` (entity). Cross-tenant isolation

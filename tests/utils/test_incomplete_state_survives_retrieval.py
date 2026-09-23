@@ -16,13 +16,27 @@ provable, contract-accurate parts, and one flagged gap:
   1. On the /embed receipt, partial/unverified surface AS SUCH and are never promoted to
      indexed -- ALREADY PROVEN by tests/utils/test_parse_is_not_index.py (pinned here,
      not re-proven).
-  2. The RETRIEVAL path must not FABRICATE a completeness claim: a chunk from a
-     partial/unverified write must not come back from /query carrying any
-     status/index/complete/indexed field the store never held. THIS FILE proves that.
+  2. The PRODUCER must not STAMP a completeness claim onto a chunk, and the /query
+     RESPONSE MODEL must not ADD one when echoing it back: a chunk from a
+     partial/unverified write, once stored, carries no status/index/complete/indexed field
+     the store never held, and QueryHit returns it without inventing one. THIS FILE proves
+     that -- at the producer and at the response model, NOT inside the real retrieval path
+     (which is stubbed here; see the LIMITATION note below).
   3. GAP (reported, not silently satisfied): if the outcome requires the incomplete
      state to reach a retrieval-only consumer, that is a PRODUCER change (attach an
      index-state / partial flag to cmetadata) and is OUT OF SCOPE for P06-4 -- it is
      carded, not manufactured here.
+
+LIMITATION -- WHAT THIS FILE DOES NOT EXERCISE
+--------------------------------------------------------------------------------
+The `_client` fixture monkeypatches document_routes._retrieve_documents with a stub that
+echoes the FakeStore rows, so the REAL retrieval path does NOT run in tests 1-2. A
+completeness field fabricated INSIDE the real retrieval path would therefore be invisible
+to them; what they actually prove is that the PRODUCER (/embed + _prepare_documents_sync)
+never stamps such a field onto stored chunks and that the QueryHit RESPONSE MODEL never
+adds one. The direct producer-side guard is
+test_the_chunk_never_carries_an_index_status_field_by_construction. A pg-backed variant
+that hits the REAL retrieval path is NOT present in this file.
 
 The honest per-chunk provenance that DOES survive retrieval (text_source, ocr_confidence,
 ingest_id, locators) is proven by tests/utils/test_query_response_model.py
@@ -100,10 +114,13 @@ def _stored(store):
     return [r for r in store.rows if r.custom_id == FID]
 
 
-def test_a_partial_write_is_partial_on_the_receipt_and_uninflated_at_retrieval(monkeypatch):
-    """A short write reports index.status=partial on the /embed receipt (pin), and the
-    SAME chunks retrieved via /query carry NO completeness/index field -- the query path
-    neither promotes them to indexed nor fabricates a status the store never held."""
+def test_a_partial_write_is_partial_on_the_receipt_and_the_producer_stamps_no_completeness(monkeypatch):
+    """A short write reports index.status=partial on the /embed receipt (pin), and the SAME
+    chunks -- as stamped by the producer and echoed by the /query RESPONSE MODEL -- carry NO
+    completeness/index field. This proves the producer never stamped one and the response
+    model never added one. It does NOT exercise the real retrieval path, which the fixture
+    stubs (see the file LIMITATION note); an index-state fabricated inside that path would be
+    invisible here."""
     store = ShortStore()
     client = _client(monkeypatch, store)
 
@@ -129,10 +146,12 @@ def test_a_partial_write_is_partial_on_the_receipt_and_uninflated_at_retrieval(m
         assert meta.get("ingest_id"), ("ingest_id provenance lost at retrieval", meta)
 
 
-def test_an_unverified_write_is_never_promoted_to_indexed_or_complete_at_retrieval(monkeypatch):
-    """A store that cannot be read back reports index.status=unverified on the receipt.
-    Its chunks retrieved via /query must not come back asserting indexed/complete either
-    -- unverified must never be silently upgraded, at write time OR at retrieval."""
+def test_an_unverified_write_is_never_stamped_indexed_or_complete_by_producer_or_response_model(monkeypatch):
+    """A store that cannot be read back reports index.status=unverified on the receipt. Its
+    stored chunks -- as stamped by the producer and echoed by the /query RESPONSE MODEL --
+    must not assert indexed/complete either: unverified must never be silently upgraded by
+    the producer or the response model. The real retrieval path is stubbed here (see the file
+    LIMITATION note), so this does not prove anything about a fabrication inside that path."""
     store = BlindStore()
     client = _client(monkeypatch, store)
 
