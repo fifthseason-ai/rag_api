@@ -90,8 +90,9 @@ def _pages_text(docs):
 
 
 def test_running_header_footer_removed_when_repeated_SYNTHETIC(tmp_path):
+    # >= _PDF_DEDUP_MIN_PAGES pages, header/footer on EVERY page (fraction 1.0).
     path = tmp_path / "hf.pdf"
-    make_running_hf_pdf_SYNTHETIC(str(path), pages=3)
+    make_running_hf_pdf_SYNTHETIC(str(path), pages=6)
     for p, text in _pages_text(_load(path)).items():
         assert _HEADER not in text, "running header not removed on page %d: %r" % (p, text)
         assert _FOOTER not in text, "running footer not removed on page %d: %r" % (p, text)
@@ -99,16 +100,17 @@ def test_running_header_footer_removed_when_repeated_SYNTHETIC(tmp_path):
 
 
 def test_a_non_repeated_band_line_is_kept_SYNTHETIC(tmp_path):
-    """A top-band line that DIFFERS per page is not a running header and must be kept."""
+    """A top-band line that DIFFERS per page is not a running header and must be kept,
+    even across enough pages for dedup to run."""
     writer = PdfWriter()
-    for p in (0, 1):
+    for p in range(6):
         _page(writer, [(72, 760, "UNIQUE_TITLE_%d" % p), (72, 700, "P%d_body" % p)])
     path = tmp_path / "unique.pdf"
     with open(str(path), "wb") as fh:
         writer.write(fh)
     by_page = _pages_text(_load(path))
-    assert "UNIQUE_TITLE_0" in by_page[0], by_page[0]
-    assert "UNIQUE_TITLE_1" in by_page[1], by_page[1]
+    for p in range(6):
+        assert "UNIQUE_TITLE_%d" % p in by_page[p], by_page[p]
 
 
 def test_a_single_page_document_is_untouched_SYNTHETIC(tmp_path):
@@ -133,10 +135,11 @@ def test_a_single_page_document_is_untouched_SYNTHETIC(tmp_path):
 def make_header_phrase_also_mid_body_same_page_SYNTHETIC(path):
     writer = PdfWriter()
     shared = "SHARED_PHRASE_alpha"
-    # page 0: SHARED as running header (top band, y=760) AND as mid-body text (y=560)
+    # SHARED is a running header (top band, y=760) on EVERY page (fraction 1.0), and on
+    # page 0 it ALSO appears as standalone mid-body text (y=560).
     _page(writer, [(72, 760, shared), (72, 700, "P0_body_a"), (72, 560, shared), (72, 400, "P0_body_b")])
-    # page 1: SHARED only as running header
-    _page(writer, [(72, 760, shared), (72, 700, "P1_body_a")])
+    for p in range(1, 6):
+        _page(writer, [(72, 760, shared), (72, 700, "P%d_body_a" % p)])
     with open(path, "wb") as fh:
         writer.write(fh)
     return shared
@@ -151,8 +154,9 @@ def test_same_page_mid_body_line_matching_running_header_survives_SYNTHETIC(tmp_
         "F2: expected exactly one surviving (mid-body) occurrence on page 0: %r" % by_page[0]
     )
     assert "P0_body_a" in by_page[0] and "P0_body_b" in by_page[0], by_page[0]
-    # page 1: header-only occurrence removed.
-    assert shared not in by_page[1], "running header not removed on page 1: %r" % by_page[1]
+    # every other page: header-only occurrence removed.
+    for p in range(1, 6):
+        assert shared not in by_page[p], "running header not removed on page %d: %r" % (p, by_page[p])
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +171,8 @@ def make_ascii_table_pdf_SYNTHETIC(path, header=_HEADER):
     writer = PdfWriter()
     rows = [("Name", "Value", "Notes"), ("Alice", "100", "ok"),
             ("Bob", "200", "low"), ("Carol", "300", "high")]
-    for p in (0, 1):
-        runs = [(72, 760, header)]  # running header (repeats -> dropped)
+    for p in range(6):
+        runs = [(72, 760, header)]  # running header on every page (fraction 1.0 -> dropped)
         y = 700
         for name, val, note in rows:
             runs.append((72, y, name)); runs.append((240, y, val)); runs.append((400, y, note))
@@ -220,7 +224,7 @@ def test_a_scanned_page_reaches_the_pass_empty_SYNTHETIC(tmp_path):
     from langchain_core.documents import Document
 
     path = tmp_path / "hf.pdf"
-    make_running_hf_pdf_SYNTHETIC(str(path), pages=2)
+    make_running_hf_pdf_SYNTHETIC(str(path), pages=6)
     loader = SafePyPDFLoader(str(path))
     scanned = Document(page_content="", metadata={"page": 0})
     out = list(loader._dedup_running_hf(iter([scanned])))
@@ -273,9 +277,18 @@ def test_ocr_output_is_structurally_unreachable_from_the_pass_SYNTHETIC(tmp_path
 def test_dedup_pass_is_skipped_above_the_page_cap_SYNTHETIC(tmp_path, monkeypatch):
     monkeypatch.setattr(dl, "_PDF_DEDUP_MAX_PAGES", 1)
     path = tmp_path / "hf.pdf"
-    make_running_hf_pdf_SYNTHETIC(str(path), pages=2)  # 2 pages > cap 1
+    make_running_hf_pdf_SYNTHETIC(str(path), pages=6)  # >= min pages, but > cap 1
     text = _pages_text(_load(path))[0]
     assert _HEADER in text, "header removed despite exceeding the page cap: %r" % text
+
+
+def test_dedup_pass_is_skipped_below_the_minimum_page_count_SYNTHETIC(tmp_path):
+    """Below `_PDF_DEDUP_MIN_PAGES`, a repeated band line cannot be distinguished from a
+    short continuation table, so NO dedup runs and the header is kept."""
+    path = tmp_path / "hf.pdf"
+    make_running_hf_pdf_SYNTHETIC(str(path), pages=dl._PDF_DEDUP_MIN_PAGES - 1)
+    text = _pages_text(_load(path))[0]
+    assert _HEADER in text, "header removed on a too-short document: %r" % text
 
 
 # ---------------------------------------------------------------------------
@@ -286,16 +299,92 @@ def test_dedup_pass_is_skipped_above_the_page_cap_SYNTHETIC(tmp_path, monkeypatc
 def test_drop_running_hf_line_drops_only_first_last_in_band():
     loader = SafePyPDFLoader("unused.pdf")
     key = loader._run_key("HEAD")
-    # first line is a running-h/f key AND in this page's band -> dropped.
-    out = loader._drop_running_hf_line("HEAD\nbody one\nbody two", {key}, {key})
-    assert out == "body one\nbody two", out
+    # first line is a running-h/f key AND in this page's band -> dropped, count 1.
+    out, dropped = loader._drop_running_hf_line("HEAD\nbody one\nbody two", {key}, {key})
+    assert out == "body one\nbody two" and dropped == 1, (out, dropped)
+    # both first and last -> count 2.
+    out2, dropped2 = loader._drop_running_hf_line("HEAD\nbody\nHEAD", {key}, {key})
+    assert out2 == "body" and dropped2 == 2, (out2, dropped2)
     # a MID-body match is never dropped (only first/last considered).
-    mid = loader._drop_running_hf_line("top\nHEAD\nbottom", {key}, {key})
-    assert mid is None, mid  # HEAD is neither first nor last -> nothing changes
+    assert loader._drop_running_hf_line("top\nHEAD\nbottom", {key}, {key}) == (None, 0)
     # not in this page's band -> nothing dropped.
-    assert loader._drop_running_hf_line("HEAD\nbody", {key}, set()) is None
+    assert loader._drop_running_hf_line("HEAD\nbody", {key}, set()) == (None, 0)
 
 
 def test_run_key_normalises_whitespace():
     loader = SafePyPDFLoader("unused.pdf")
     assert loader._run_key("  A   B \n") == "A B"
+
+
+# ---------------------------------------------------------------------------
+# F-A NEGATIVE CASES: legitimately-repeated band content must SURVIVE. A phrase
+# that repeats in the band on only a FEW of many pages is a subtotal / continuation
+# heading / data row, NOT a running header, and deleting it silently corrupts a
+# finance corpus. Built from the reviewer's probes.
+# ---------------------------------------------------------------------------
+
+
+def _doc_with_repeated_line_on(path, npages, phrase, y, on_pages):
+    """`npages` pages, each with a UNIQUE top line and a mid body line (so nothing
+    else repeats in the band), plus `phrase` placed at `y` on exactly `on_pages`."""
+    writer = PdfWriter()
+    for p in range(npages):
+        runs = [(72, 758, "UNIQUE_TOP_%d" % p), (72, 400, "P%d_body_mid" % p)]
+        if p in on_pages:
+            runs.append((72, y, phrase))
+        _page(writer, runs)
+    with open(path, "wb") as fh:
+        writer.write(fh)
+
+
+def test_repeated_subtotal_survives_SYNTHETIC(tmp_path):
+    """A per-section subtotal repeated in the bottom band on 2 of 6 pages must NOT be
+    deleted (it is a value, not boilerplate)."""
+    path = tmp_path / "subtotal.pdf"
+    _doc_with_repeated_line_on(str(path), 6, "Subtotal 100.00", y=60, on_pages={2, 5})
+    by_page = _pages_text(_load(path))
+    assert "Subtotal 100.00" in by_page[2], by_page[2]
+    assert "Subtotal 100.00" in by_page[5], by_page[5]
+
+
+def test_continuation_heading_survives_SYNTHETIC(tmp_path):
+    """A continuation heading in the top band spanning the 2 pages of one table
+    within a 6-page document must NOT be deleted."""
+    path = tmp_path / "cont.pdf"
+    _doc_with_repeated_line_on(str(path), 6, "Balance Sheet (continued)", y=760, on_pages={3, 4})
+    by_page = _pages_text(_load(path))
+    assert "Balance Sheet (continued)" in by_page[3], by_page[3]
+    assert "Balance Sheet (continued)" in by_page[4], by_page[4]
+
+
+def test_repeated_in_band_data_row_survives_SYNTHETIC(tmp_path):
+    """A data row just inside the band (y=71) repeated on 2 of 6 pages must survive."""
+    path = tmp_path / "datarow.pdf"
+    _doc_with_repeated_line_on(str(path), 6, "Line item 42 amount 5.00", y=71, on_pages={1, 4})
+    by_page = _pages_text(_load(path))
+    assert "Line item 42 amount 5.00" in by_page[1], by_page[1]
+    assert "Line item 42 amount 5.00" in by_page[4], by_page[4]
+
+
+# ---------------------------------------------------------------------------
+# DISCLOSURE (PROPOSED, PENDING the consuming lane): a shortened page carries a
+# count of the running-h/f lines removed, so the removal is auditable, not silent.
+# ---------------------------------------------------------------------------
+
+
+def test_dropped_lines_are_disclosed_on_the_chunk_metadata_SYNTHETIC(tmp_path):
+    path = tmp_path / "hf.pdf"
+    make_running_hf_pdf_SYNTHETIC(str(path), pages=6)  # header + footer on every page
+    docs = _load(path)
+    # every page had its header AND footer dropped -> count 2, disclosed.
+    for d in docs:
+        assert d.metadata.get(dl._PDF_HF_DROPPED_KEY) == 2, d.metadata
+    # a document with nothing removed carries no such key (no false disclosure).
+    clean = tmp_path / "clean.pdf"
+    writer = PdfWriter()
+    for p in range(6):
+        _page(writer, [(72, 400, "P%d_only_body_no_running_line" % p)])
+    with open(str(clean), "wb") as fh:
+        writer.write(fh)
+    for d in _load(clean):
+        assert dl._PDF_HF_DROPPED_KEY not in d.metadata, d.metadata

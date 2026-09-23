@@ -603,7 +603,21 @@ def process_documents(documents: List[Document]) -> str:
 #: this finance/engagement corpus is not reliably possible and the failure is silent.)
 _PDF_DEDUP_MAX_PAGES = 200           # above this many pages, skip the pass (bounded cost)
 _PDF_HEADER_FOOTER_BAND_PT = 72.0    # top/bottom band (pt, from the page edge) for running h/f
-_PDF_HEADER_FOOTER_MIN_REPEAT = 2    # a band line repeated on >= this many pages is a running h/f
+#: A running header/footer appears in the band on ESSENTIALLY EVERY page; a per-section
+#: subtotal, a continuation heading, or a repeated data row appears on only a FEW of
+#: many pages. So dedup fires only on a HIGH FRACTION of scanned pages, never an absolute
+#: count -- and only when there are enough pages for that fraction to be meaningful. On
+#: fewer than `_PDF_DEDUP_MIN_PAGES` pages a repeated band line cannot be distinguished
+#: from a short continuation table or a coincidence, so NO dedup runs. Missing a genuine
+#: running header on a short document is the accepted cost; deleting a subtotal is not.
+_PDF_DEDUP_MIN_PAGES = 5             # dedup runs only for documents with >= this many pages
+_PDF_HEADER_FOOTER_MIN_FRACTION = 0.75  # drop only a band line present on >= this fraction of pages
+#: PROPOSED, PENDING the consuming lane (criterion (d), same gate as E4's heading_path):
+#: when the pass shortens a page, stamp how many running-h/f lines it removed, so the
+#: removal is auditable like text_source / image_ocr_coverage instead of silent. This is
+#: a NEW cmetadata key on a shared contract surface -- NOT agreed. One-line removal diff
+#: in the PR body. Set to None to disable emission entirely.
+_PDF_HF_DROPPED_KEY = "running_hf_lines_dropped"
 
 
 class SafePyPDFLoader:
@@ -876,12 +890,19 @@ class SafePyPDFLoader:
     # `_PDF_DEDUP_MAX_PAGES`, or on a document too short to have a repeat, or when
     # nothing repeats, pages stream through byte-unchanged.
     #
+    # TRADEOFF, stated honestly. Dedup cannot perfectly tell running boilerplate from
+    # legitimately-repeated content (a subtotal, a continuation heading, an in-band data
+    # row). It fires CONSERVATIVELY -- only on a high fraction of enough pages (see the
+    # constants) -- so a false positive is implausible, not merely unlikely; and because
+    # it cannot be perfect, a shortened page is STAMPED (`_PDF_HF_DROPPED_KEY`) so the
+    # removal is auditable rather than silent. It is biased to UNDER-remove: a missed
+    # running header costs a little index noise, a deleted subtotal corrupts meaning.
+    #
     # NOTE. Column REORDERING was investigated and DROPPED (see the PR body).
     # `extraction_mode="layout"` genuinely separates interleaved columns, but on this
     # finance/engagement corpus a single-column DATA TABLE (which needs row order) is
     # not reliably distinguishable from ARTICLE COLUMNS (which need column order), and
-    # a wrong reorder loses no token so the corruption is silent. Dedup keeps only what
-    # is safe and unambiguous.
+    # a wrong reorder loses no token so the corruption is silent.
 
     @staticmethod
     def _run_key(text: str) -> str:
@@ -914,9 +935,11 @@ class SafePyPDFLoader:
 
     def _running_hf_keys(self, reader, npages):
         """Scan `npages` pages for running headers/footers. Returns
-        (drop_keys, per_page_band_keys): a key is a running h/f when it sits in the
-        geometric band on >= `_PDF_HEADER_FOOTER_MIN_REPEAT` pages. `per_page_band_keys`
-        is cached so the per-page pass does not re-run the visitor."""
+        (drop_keys, per_page_band_keys): a key is a running h/f only when it sits in the
+        geometric band on a HIGH FRACTION (`_PDF_HEADER_FOOTER_MIN_FRACTION`) of the
+        scanned pages -- NOT an absolute count, so a subtotal / continuation heading /
+        data row on a few of many pages is never a drop key. `per_page_band_keys` is
+        cached so the per-page pass does not re-run the visitor."""
         from collections import Counter
 
         per_page = []
@@ -930,25 +953,31 @@ class SafePyPDFLoader:
             for key in band:
                 if key:
                     counts[key] += 1
-        drop = {key for key, n in counts.items() if n >= _PDF_HEADER_FOOTER_MIN_REPEAT}
+        threshold = _PDF_HEADER_FOOTER_MIN_FRACTION * npages
+        drop = {key for key, n in counts.items() if n >= threshold}
         return drop, per_page
 
     def _drop_running_hf_line(self, default_text, drop_keys, band_keys):
         """Drop a running header/footer: the FIRST and/or LAST line of the page's text
         when it is a running-h/f key AND in this page's band -- NEVER every matching
         line, so a standalone mid-body line equal to a running-header phrase survives.
-        The body is byte-identical (pypdf's own text). Returns None when nothing
-        changes."""
+        The body is byte-identical (pypdf's own text). Returns (new_text, dropped_count),
+        or (None, 0) when nothing changes."""
         active = drop_keys & band_keys
         if not active:
-            return None
+            return None, 0
         out = default_text.split("\n")
+        dropped = 0
         if out and self._run_key(out[0]) in active:
             out = out[1:]
+            dropped += 1
         if out and self._run_key(out[-1]) in active:
             out = out[:-1]
+            dropped += 1
         new = "\n".join(out)
-        return new if new != default_text else None
+        if new == default_text:
+            return None, 0
+        return new, dropped
 
     def _dedup_running_hf(self, pages: Iterator[Document]) -> Iterator[Document]:
         """STREAMING native running-header/footer dedup. Detects running h/f from a
@@ -964,9 +993,9 @@ class SafePyPDFLoader:
             logger.info("PDF dedup pass could not open %s: %s", self.filepath, error)
             yield from pages
             return
-        # Too big, or too short to possibly carry a REPEATED running line -> no work,
-        # no up-front scan cost.
-        if not (_PDF_HEADER_FOOTER_MIN_REPEAT <= total <= _PDF_DEDUP_MAX_PAGES):
+        # Too big, or too few pages for "on a high fraction of pages" to distinguish a
+        # running header from a coincidence / short continuation -> no work, no scan.
+        if not (_PDF_DEDUP_MIN_PAGES <= total <= _PDF_DEDUP_MAX_PAGES):
             yield from pages
             return
 
@@ -974,9 +1003,13 @@ class SafePyPDFLoader:
         budget = self.extraction_budget
         if budget is not None and getattr(budget, "max_pages", None):
             scan_n = min(scan_n, budget.max_pages)
+        if scan_n < _PDF_DEDUP_MIN_PAGES:
+            # A page budget can shrink the scan below the meaningful minimum.
+            yield from pages
+            return
         drop_keys, per_page_band = self._running_hf_keys(reader, scan_n)
         if not drop_keys:
-            # Nothing repeats in any band: no dedup to do, stream untouched.
+            # Nothing appears on a high fraction of pages: no dedup to do.
             yield from pages
             return
 
@@ -986,9 +1019,15 @@ class SafePyPDFLoader:
             page_index = meta.get("page")
             if default_text.strip() and isinstance(page_index, int) and 0 <= page_index < len(per_page_band):
                 band = per_page_band[page_index]
-                new = self._drop_running_hf_line(default_text, drop_keys, band)
+                new, dropped = self._drop_running_hf_line(default_text, drop_keys, band)
                 if new is not None and new.strip():
                     doc.page_content = new
+                    # DISCLOSURE (PROPOSED, PENDING the consuming lane): record how many
+                    # running-h/f lines were removed so the shortening is auditable, not
+                    # silent. Remove this one block if the ASK is declined.
+                    if _PDF_HF_DROPPED_KEY is not None and dropped:
+                        meta[_PDF_HF_DROPPED_KEY] = dropped
+                        doc.metadata = meta
             yield doc
 
     # -- local-first OCR (FILES-01, FS-CONTINUE-R3) ---------------------------------
