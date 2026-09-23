@@ -1,40 +1,40 @@
-"""XLSX finer-than-sheet locators + merged-cell resolution + header row (card E3).
+"""XLSX finer-than-sheet precision (cell-range) + merged-cell resolution + header row.
 
-MEASURED base: origin/main 5816e133. Today SheetExcelLoader emits one Document per
-sheet carrying `page_name` (sheet) as its only per-unit locator. Card E3 adds:
+Card E3, OPTION 3 (FILES-lead ruling PACKET-1-E3-XLSX-PLACEMENT-RULING-20260923T042623Z):
+`cell_range`, `header` and `header_row` ship as ADDITIVE, OPTIONAL cmetadata fields and
+are DELIBERATELY NOT registered in `_UNIT_LOCATOR_KEYS`. XLSX `locator_kind` stays
+`"sheet"` -- a stable TYPE TAG; precision lives in the VALUE (`cell_range`), which Core
+reads directly. This suite pins that non-promotion executably.
 
-  * a finer-than-sheet locator -- a sheet-qualified CELL-RANGE (e.g. "Revenue!A1:C5")
-    naming the occupied extent -- carried ON TOP of `page_name` on every sheet chunk,
-  * MERGED-CELL resolution: a merged range's anchor value is filled across the range,
-    so the value is not lost and no phantom empty cells are produced,
-  * the HEADER ROW detected and carried as a unit field (`header`, `header_row`).
-
-WHY CELL-RANGE, NOT ROW-LEVEL: the loader wraps UnstructuredExcelLoader(mode="elements"),
-which emits ONE element per sheet (pinned by test_xlsx_year_cells.sheet_text's
-`len(docs) == 1`). Emitting one Document per ROW would change XLSX chunk granularity
-corpus-wide -- a far larger consumer-visible change than the locator itself -- and lose
-the per-sheet `text_as_html` the year-cell suite asserts. A sheet-qualified cell-range is
-additive metadata on the existing per-sheet chunk: finer than the unbounded sheet
-reference, one range per chunk.
-
-PENDING PLACEMENT: the `_UNIT_LOCATOR_KEYS` registration is NOT in this branch (it is the
-FILES-lead's placement ruling; see the E3 ASK). Until it lands, an XLSX chunk carries BOTH
-`page_name` and `cell_range` but the receipt still advertises locator_kind `sheet`
-(Option 1 semantics). These tests read the EXPECTED locator_kind from the module so that
-when the placement lands, only that value changes -- the tests do not hardcode "sheet".
+MEASURED base: origin/main 5816e133. SheetExcelLoader emits one Document per sheet
+(pinned by test_xlsx_year_cells.sheet_text `len(docs)==1`); row-per-Document splitting is
+therefore impossible without reddening existing tests, so the finer locator is additive
+per-sheet metadata: a SHEET-QUALIFIED cell-range naming the occupied extent, one range
+per sheet chunk.
 
 Fixtures are SYNTHETIC, built at test time with openpyxl. No client content.
 
-RED-FIRST: the deterministic unit tests below fail if the E3 loader code is reverted --
-see the mutation table in the PR body / return record for the exact one-line control per
-guard and the sha256 before/after.
+RED-FIRST controls (mutations restored byte-identical; sha256 in the return record):
+  * cell_range stamp        -> delete the `_annotate` stamp or the `_sheet_locators`
+                               range build  -> the cell_range asserts redden.
+  * header rule             -> weaken `_detect_header_row` to "first non-empty row"
+                               -> the merged-title-skip asserts redden.
+  * merged-cell fill        -> replace `ws.cell(...).value = anchor` with `pass`
+                               -> `found` never True, `_resolve_merged_cells` returns
+                               None, the fill/no-phantom asserts redden.
+  * NON-PROMOTION (cond 4)  -> insert `("cell_range","cell_range")` before
+                               `("sheet","page_name")` in `_UNIT_LOCATOR_KEYS`
+                               -> `test_locator_kind_stays_sheet_*` redden (locator_kind
+                               becomes "cell_range").
+  * NO-FABRICATED-EXTENT    -> give an empty sheet a degenerate range in
+    (cond 5)                  `_sheet_locators` -> the empty-sheet asserts redden.
 """
 
-import io
-import zipfile
-import shutil
+import os
 
 import pytest
+
+from langchain_core.documents import Document
 
 from app.utils.document_loader import (
     SheetExcelLoader,
@@ -43,9 +43,9 @@ from app.utils.document_loader import (
     XLSX_HEADER_KEY,
     XLSX_HEADER_ROW_KEY,
 )
-from app.routes.document_routes import _UNIT_LOCATOR_KEYS
+from app.routes.document_routes import _UNIT_LOCATOR_KEYS, _extraction_receipt
 
-# Reuse the proven route driver + loader helpers from the capability suite.
+# Reuse the proven in-process route driver + loader helpers from the capability suite.
 from tests.utils.test_xlsx_capability import (  # noqa: F401 - pytest fixture `client`
     client,
     _embed,
@@ -56,16 +56,17 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 # ===========================================================================
-# SYNTHETIC fixture: two sheets, a merged title row, a vertical merged category,
-# a header row, a cached formula, and a year cell.
+# SYNTHETIC fixtures
 # ===========================================================================
 
 
 def make_SYNTHETIC_merged_workbook(path):
-    """Revenue: merged title A1:C1, header row 2, data rows 3-4, cached SUM in B5.
-    Detail:  header row 1, category "Hardware" vertically merged A2:A4, a yyyy year
-    cell at C2. Ground truth is asserted directly by the tests below."""
+    """Two sheets. Revenue: merged title A1:C1, header row 2, data rows 3-4, cached
+    SUM in B5. Detail: header row 1, category "Hardware" vertically merged A2:A4, a
+    yyyy year cell at C2. Ground truth is asserted directly by the tests below."""
     import datetime
+    import shutil
+    import zipfile
     from openpyxl import Workbook
 
     wb = Workbook()
@@ -119,10 +120,20 @@ def make_SYNTHETIC_merged_workbook(path):
     shutil.move(tmp, str(path))
 
 
+def make_SYNTHETIC_populated_plus_empty_workbook(path):
+    """One populated sheet and one genuinely empty sheet (no occupied extent)."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    wb.active.title = "Data"
+    wb.active["A1"] = "x"
+    wb.active["B1"] = "y"
+    wb.create_sheet("Blank")  # left empty on purpose
+    wb.save(str(path))
+
+
 # ===========================================================================
 # 1. Finer-than-sheet cell-range locator -- DETERMINISTIC (no parser dependency).
-#    Control: delete the `doc.metadata[CELL_RANGE_LOCATOR_KEY] = ...` stamp in
-#    _annotate, OR the cell_range computation in _sheet_locators -> this reddens.
 # ===========================================================================
 
 
@@ -139,29 +150,8 @@ def test_SYNTHETIC_sheet_locators_expose_the_cell_range_extent(tmp_path):
     assert len(ranges) == 2
 
 
-def test_SYNTHETIC_empty_sheet_has_no_cell_range(tmp_path):
-    """A sheet with no content has no data extent to cite, so it is omitted rather
-    than given a phantom range."""
-    from openpyxl import Workbook
-
-    path = tmp_path / "with-blank.xlsx"
-    wb = Workbook()
-    wb.active.title = "Data"
-    wb.active["A1"] = "x"
-    wb.active["B1"] = "y"
-    wb.create_sheet("Blank")  # left empty
-    wb.save(str(path))
-
-    locators = SheetExcelLoader(str(path))._sheet_locators()
-    assert "Blank" not in locators
-    assert locators["Data"][CELL_RANGE_LOCATOR_KEY] == "Data!A1:B1"
-
-
 # ===========================================================================
 # 2. Header-row detection -- DETERMINISTIC.
-#    Control: revert _detect_header_row's ">= 2 non-empty AND not all identical"
-#    rule (e.g. accept the first non-empty row) -> the merged title is mis-picked
-#    and header_row/header redden.
 # ===========================================================================
 
 
@@ -194,9 +184,6 @@ def test_detect_header_row_rule_is_first_multi_distinct_row():
 
 # ===========================================================================
 # 3. Merged-cell resolution -- DETERMINISTIC via openpyxl on the produced copy.
-#    Control: replace the anchor-fill `ws.cell(...).value = anchor` with `pass`
-#    -> `found` never becomes True, _resolve_merged_cells returns None, and the
-#    `copy_path is not None` assertion below reddens (phantom empties restored).
 # ===========================================================================
 
 
@@ -233,13 +220,8 @@ def test_SYNTHETIC_merged_cells_are_unmerged_and_filled_no_phantom_empties(tmp_p
 def test_resolve_merged_cells_is_a_noop_without_merges(tmp_path):
     """No merges -> parse the source untouched (None), the same contract the year
     pass uses; this is what keeps a plain workbook off the copy path."""
-    from openpyxl import Workbook
-
     path = tmp_path / "plain.xlsx"
-    wb = Workbook()
-    wb.active["A1"] = "a"
-    wb.active["B1"] = "b"
-    wb.save(str(path))
+    make_SYNTHETIC_populated_plus_empty_workbook(str(path))
 
     assert SheetExcelLoader(str(path))._resolve_merged_cells(
         str(path), str(tmp_path)) is None
@@ -255,10 +237,39 @@ def test_resolve_merged_cells_is_never_fatal_on_a_bad_workbook(tmp_path):
 
 
 # ===========================================================================
-# 4. The stamp reaches the LOADER Document, and the merged label reaches content.
+# 4. NEVER FABRICATE AN EXTENT (condition 5): a sheet with no occupied extent
+#    carries NO cell_range -- not a degenerate range, not a neighbouring one.
+# ===========================================================================
+
+
+def test_SYNTHETIC_empty_sheet_has_no_cell_range_at_the_locator_level(tmp_path):
+    path = tmp_path / "with-blank.xlsx"
+    make_SYNTHETIC_populated_plus_empty_workbook(str(path))
+
+    locators = SheetExcelLoader(str(path))._sheet_locators()
+
+    assert "Blank" not in locators, "an empty sheet must not be given a fabricated extent"
+    assert locators["Data"][CELL_RANGE_LOCATOR_KEY] == "Data!A1:B1"
+
+
+def test_SYNTHETIC_no_emitted_document_carries_a_fabricated_extent(tmp_path):
+    """At the loader-document level: every emitted chunk's cell_range (if any) is a
+    real, well-formed, sheet-qualified extent of a POPULATED sheet -- never a
+    degenerate range and never one belonging to the empty sheet."""
+    path = tmp_path / "with-blank.xlsx"
+    make_SYNTHETIC_populated_plus_empty_workbook(str(path))
+
+    docs = load_documents(path)
+    for d in docs:
+        cr = d.metadata.get(CELL_RANGE_LOCATOR_KEY)
+        if cr is not None:
+            assert cr.startswith("Data!"), cr          # never the empty "Blank" sheet
+            assert "!" in cr and ":" in cr             # sheet-qualified, real range
+
+
+# ===========================================================================
+# 5. The stamp reaches the LOADER Document, and the merged label reaches content.
 #    (Parser-dependent: exercises UnstructuredExcelLoader. CODE-TESTED via image.)
-#    Control: _resolve_merged_cells -> None makes "Hardware" appear once, reddening
-#    the >= 3 assertion; deleting the _annotate stamp reddens the cell_range asserts.
 # ===========================================================================
 
 
@@ -276,7 +287,6 @@ def test_SYNTHETIC_every_sheet_document_carries_cell_range_and_header(tmp_path):
                 CELL_RANGE_LOCATOR_KEY)))
         seen.add(sheet)
     assert seen == {"Revenue", "Detail"}
-    # Header carried on the sheet's chunks.
     rev_headers = {
         tuple(d.metadata.get(XLSX_HEADER_KEY))
         for d in docs
@@ -299,25 +309,66 @@ def test_SYNTHETIC_merged_category_label_reaches_every_row(tmp_path):
 
 
 # ===========================================================================
-# 5. Receipt <-> chunk agreement for the new family, robust to placement.
-#    Reads the EXPECTED kind from _UNIT_LOCATOR_KEYS so that when the FILES-ruled
-#    placement lands, ONLY the asserted locator_kind value changes.
-#    (Parser+route dependent. CODE-TESTED via image.)
+# 6. THE DELIBERATE NON-PROMOTION (condition 4) + units/empty_locators unchanged
+#    (condition 6) -- DETERMINISTIC via _extraction_receipt on synthetic chunks.
+#    This is the most important pin: it records executably that we chose NOT to
+#    promote cell_range, so locator_kind stays the sheet TYPE TAG while the chunks
+#    carry the cell_range precision, and the receipt still groups/names by page_name.
 # ===========================================================================
 
 
-def _expected_kind_from_registry(stored_meta):
-    for kind, key in _UNIT_LOCATOR_KEYS:
-        if any((m or {}).get(key) is not None for m in stored_meta):
-            return kind
-    return "none"
+def _xlsx_chunks_like_the_store():
+    """Two sheets as the store would hold them: a populated sheet carrying page_name
+    AND the additive cell_range, and an empty sheet carrying page_name with NO
+    cell_range (condition 5 -- no occupied extent, no fabricated position)."""
+    return [
+        Document(
+            page_content="Region Q1 Q2 EMEA 100 110 AMER 200 210",
+            metadata={
+                "page_name": "Revenue",
+                "page_number": 0,
+                CELL_RANGE_LOCATOR_KEY: "Revenue!A1:C5",
+                XLSX_HEADER_ROW_KEY: 2,
+                XLSX_HEADER_KEY: ["Region", "Q1", "Q2"],
+            },
+        ),
+        Document(
+            page_content="",  # empty sheet: no content
+            metadata={"page_name": "Empty", "page_number": 1},
+        ),
+    ]
 
 
-def test_SYNTHETIC_cell_range_reaches_the_stored_chunk_and_receipt_agrees(
-    client, tmp_path
-):
-    """The FILES-lead caution: prove the stamp reaches the STORED chunk, not only
-    the loader Document; and the receipt names the family the store carries."""
+def test_locator_kind_stays_sheet_while_chunks_carry_cell_range():
+    """CONDITION 4 -- the deliberate non-promotion, pinned. cell_range is present on
+    the chunk yet locator_kind is the stable `sheet` type tag, NOT `cell_range`.
+    RED if anyone registers cell_range before sheet in _UNIT_LOCATOR_KEYS."""
+    receipt = _extraction_receipt(_xlsx_chunks_like_the_store())
+    assert receipt["locator_kind"] == "sheet"
+    # Guard the guard: the chunk really does carry the precision the tag ignores.
+    chunks = _xlsx_chunks_like_the_store()
+    assert any(c.metadata.get(CELL_RANGE_LOCATOR_KEY) for c in chunks)
+    # And cell_range is not (accidentally) a registered family.
+    assert (CELL_RANGE_LOCATOR_KIND, CELL_RANGE_LOCATOR_KEY) not in _UNIT_LOCATOR_KEYS
+    assert CELL_RANGE_LOCATOR_KEY not in {k for _kind, k in _UNIT_LOCATOR_KEYS}
+
+
+def test_units_and_empty_locators_stay_keyed_by_page_name():
+    """CONDITION 6 -- units stay one-per-sheet and empty_locators names sheets by
+    page_name (a sheet name), never by cell_range, despite cell_range being present."""
+    receipt = _extraction_receipt(_xlsx_chunks_like_the_store())
+    assert receipt["units_total"] == 2
+    assert receipt["units_extracted"] == 1
+    # The empty sheet is named by its page_name, not by any cell_range value.
+    assert receipt["empty_locators"] == ["Empty"]
+    assert all("!" not in str(loc) for loc in receipt["empty_locators"]), (
+        "empty_locators must name sheets by page_name, not by a cell_range")
+
+
+def test_SYNTHETIC_route_keeps_sheet_locator_kind_and_units_two(client, tmp_path):
+    """CONDITION 4 + 6 end-to-end through /embed (in-process store double): the
+    stored chunks carry cell_range yet the receipt advertises locator_kind `sheet`
+    with two units. Parser+route dependent (CODE-TESTED via image)."""
     path = tmp_path / "merged.xlsx"
     make_SYNTHETIC_merged_workbook(str(path))
 
@@ -330,18 +381,66 @@ def test_SYNTHETIC_cell_range_reaches_the_stored_chunk_and_receipt_agrees(
         for d in batch
     ]
     assert stored, "the workbook must store chunks"
-    # Every stored chunk carries BOTH the sheet locator and the finer cell_range.
     assert all(m.get("page_name") for m in stored)
     assert all(m.get(CELL_RANGE_LOCATOR_KEY) for m in stored)
 
     receipt = r.json()["extraction"]
-    assert receipt["locator_kind"] == _expected_kind_from_registry(stored)
-
-    # CURRENT-STATE PIN: while cell_range is unregistered, XLSX still advertises
-    # `sheet` (Option 1). When the placement lands this guard's branch retires and
-    # the registry-driven assertion above carries the new value on its own.
-    if (CELL_RANGE_LOCATOR_KIND, CELL_RANGE_LOCATOR_KEY) not in _UNIT_LOCATOR_KEYS:
-        assert receipt["locator_kind"] == "sheet"
-    # units_extracted stays one-per-sheet under either placement (cell_range is
-    # sheet-qualified, so grouping by it yields the same count as by sheet).
+    assert receipt["locator_kind"] == "sheet"      # deliberate non-promotion
     assert receipt["units_extracted"] == 2
+
+
+# ===========================================================================
+# 7. CONDITION 3 -- the stamp reaches the STORED chunk via a real pgvector
+#    round-trip on cmetadata (not loader output). DSN-gated: skips cleanly without
+#    RAG_TEST_PG_DSN. Modelled on E1's test_parse_is_not_index real-pg tests.
+# ===========================================================================
+
+try:
+    from tests.utils.test_parse_is_not_index import (
+        needs_pg,
+        PG_DSN,
+        _real_store,
+        _client as _real_client,
+        _post as _real_post,
+        FID,
+    )
+    _HAVE_REAL_PG_HARNESS = True
+except Exception:  # pragma: no cover - the E1 harness is present on this tree
+    _HAVE_REAL_PG_HARNESS = False
+    PG_DSN = os.environ.get("RAG_TEST_PG_DSN")
+    needs_pg = pytest.mark.skipif(True, reason="E1 real-pg harness unavailable")
+
+
+@needs_pg
+@pytest.mark.skipif(not _HAVE_REAL_PG_HARNESS, reason="E1 real-pg harness unavailable")
+def test_real_pgvector_stored_cmetadata_carries_cell_range(monkeypatch, tmp_path):
+    """Prove cell_range survives to the stored `cmetadata` jsonb, read back with SQL
+    from the real table -- not asserted on the loader's in-memory Document."""
+    import psycopg2
+
+    path = tmp_path / "merged.xlsx"
+    make_SYNTHETIC_merged_workbook(str(path))
+
+    store = _real_store(monkeypatch, "kc_files_e3_cellrange")
+    real_client = _real_client(monkeypatch, store)
+    r = _real_post(real_client, "/embed", "merged.xlsx", path.read_bytes(), XLSX_MIME)
+    assert r.status_code == 200, r.text
+
+    raw = PG_DSN.replace("postgresql+psycopg2://", "postgresql://")
+    with psycopg2.connect(raw) as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT cmetadata FROM langchain_pg_embedding "
+            "WHERE cmetadata->>'file_id' = %s",
+            (FID,),
+        )
+        rows = [row[0] for row in cur.fetchall()]
+
+    assert rows, "no stored chunks for this file_id"
+    with_range = [m for m in rows if m.get(CELL_RANGE_LOCATOR_KEY)]
+    assert with_range, "no stored chunk carried cell_range in cmetadata"
+    # Every stored chunk that names a sheet carries the sheet-qualified extent; and
+    # locator_kind is NOT stamped on the chunk (it is a receipt field, not cmetadata).
+    for m in with_range:
+        assert m.get("page_name")
+        assert m[CELL_RANGE_LOCATOR_KEY].startswith(m["page_name"] + "!")
+        assert "locator_kind" not in m

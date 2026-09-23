@@ -1858,14 +1858,6 @@ _UNIT_LOCATOR_KEYS = (
     ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
     ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
     ("row", "row"),             # CSV: 0-indexed data row (RowCSVLoader / langchain CSVLoader)
-    # TODO(E3, PENDING FILES-lead placement ruling): register the XLSX finer-than-sheet
-    # family (SheetExcelLoader.CELL_RANGE_LOCATOR_KEY == "cell_range"). XLSX chunks now
-    # carry BOTH `page_name` (above) and `cell_range`, so this tuple is ORDERED and
-    # placement is precedence: appended here -> shadowed by `sheet` (Option 1, locator_kind
-    # stays "sheet"); placed BEFORE `sheet` -> XLSX locator_kind becomes "cell_range"
-    # (Option 2, consumer-visible). Do NOT add the line until the E3 placement ASK is
-    # answered; the same commit must also add "cell_range" to _LOADER_NATIVE_LOCATOR_KEYS
-    # in tests/utils/test_receipt_locator_agrees_with_chunks.py or Test 2 reddens.
 )
 
 

@@ -1089,29 +1089,32 @@ class SafePyPDFLoader:
         return list(self.lazy_load())
 
 
-# --- XLSX finer-than-sheet locator family (card E3) ------------------------------
+# --- XLSX finer-than-sheet precision fields (card E3, OPTION 3) -------------------
 #
-# PROVISIONAL, single-source. These name the finer-than-sheet locator XLSX gained in
-# card E3, defined ONCE here so the loader stamp, the tests, and the pending
-# `_UNIT_LOCATOR_KEYS` registration (document_routes.py:1856) never drift apart.
+# Single-source. These name the finer-than-sheet precision XLSX gained in card E3,
+# defined ONCE here so the loader stamp and the tests never drift apart.
 #
-# `CELL_RANGE_LOCATOR_KEY`  = the cmetadata key each sheet chunk carries.
-# `CELL_RANGE_LOCATOR_KIND` = the `locator_kind` vocabulary value it would resolve to
-#                             once registered (a UNIT name -- a range of cells -- NOT
-#                             the format).
+# `CELL_RANGE_LOCATOR_KEY` = the cmetadata key each sheet chunk carries; its value is
+#     the sheet-qualified occupied extent (e.g. "Revenue!A1:C5") -- a UNIT-named
+#     precision (a range of cells), never the format.
+# `CELL_RANGE_LOCATOR_KIND` = the value a `locator_kind` would take IF this were ever
+#     promoted to a `_UNIT_LOCATOR_KEYS` family. It is defined only so a future
+#     promotion has one source of truth; it is NOT used today.
 #
-# The registration line is DELIBERATELY NOT ADDED yet: the tuple is ORDERED and its
-# order is precedence (document_routes.py:2017), and an XLSX chunk now carries BOTH
-# `page_name` (sheet, registered at position 3) AND `cell_range`. Whether `cell_range`
-# is appended (shadowed by `sheet`) or placed before `sheet` (inverting XLSX's
-# advertised locator_kind) is a consumer-visible decision reserved for the FILES lead
-# (see the E3 placement ASK). Until it lands, XLSX still advertises locator_kind
-# `sheet` and `cell_range` rides along un-advertised (Option 1 semantics).
+# OPTION 3 RULING (FILES lead, 2026-09-23, PACKET-1-E3-XLSX-PLACEMENT-RULING): these
+# ship as ADDITIVE, OPTIONAL cmetadata fields and are DELIBERATELY NOT registered in
+# `_UNIT_LOCATOR_KEYS`. XLSX `locator_kind` stays `sheet` -- a stable TYPE TAG naming
+# which family the citable position belongs to; precision lives in the VALUE
+# (`cell_range`), which Core reads directly, never in the tag. Registering `cell_range`
+# is a deliberate future act that must trip CONTROL A in
+# test_receipt_locator_agrees_with_chunks.py; the non-promotion is pinned executably by
+# test_xlsx_cell_locator.py. ABSENCE of `cell_range` means UNKNOWN extent, never
+# "no cells" (see the CONTRACT DELTA in the return record for P06-5 §2).
 CELL_RANGE_LOCATOR_KEY = "cell_range"
 CELL_RANGE_LOCATOR_KIND = "cell_range"
 
-# Additive structural fields carried alongside the family (declared as contract
-# additions in the PR body, per packet §4 rule). Not locator families themselves.
+# Additive optional structural fields carried alongside cell_range (declared in the
+# CONTRACT DELTA for P06-5 §2). Not locator families. Absence means UNKNOWN.
 XLSX_HEADER_KEY = "header"          # the detected header row's cell values (list[str])
 XLSX_HEADER_ROW_KEY = "header_row"  # 1-indexed worksheet row number of the header
 
