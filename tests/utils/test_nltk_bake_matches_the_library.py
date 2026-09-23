@@ -48,6 +48,12 @@ REPO = Path(__file__).resolve().parents[2]
 DOCKERFILES = ("Dockerfile", "Dockerfile.lite")
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 
+#: How many nltk resources unstructured==0.18.32 requests. A DELIBERATE INDEPENDENT anchor,
+#: not derived from the parse it checks -- deriving it from the same parse would make it
+#: agree with itself and catch nothing. Bump it only after deciding what to do about the
+#: new resource, which is the decision this number exists to force.
+EXPECTED_RESOURCE_COUNT = 2
+
 
 def _pinned_unstructured() -> str:
     """The pin, read from requirements.txt -- never hardcoded in this file."""
@@ -99,11 +105,29 @@ def resources():
     )
 
     found = _requested_resources()
-    assert found, (
-        "parsed NO resource names out of unstructured/nlp/tokenize.py. The module's shape "
-        "changed, so this guard is reading nothing and would pass vacuously. Re-derive it "
-        "before trusting any green in this file."
+    assert len(found) == EXPECTED_RESOURCE_COUNT, (
+        "parsed %d resource name(s) out of unstructured/nlp/tokenize.py, expected exactly "
+        "%d: %r.\n"
+        "Non-empty is NOT sufficient here. If the module's shape changes so the parse picks "
+        "up ONE of two names, every comparison below still passes -- on a half-read set. "
+        "This count is a deliberate independent anchor: if upstream starts requesting a "
+        "different NUMBER of resources, somebody decides whether to bake the new one, "
+        "rather than this guard quietly checking only what it happened to find."
+        % (len(found), EXPECTED_RESOURCE_COUNT, sorted(found))
     )
+
+    # POSITIVE EVIDENCE THAT THIS RAN. Every compared set is printed on every run, so a
+    # passing run is distinguishable from one that never executed. That is this lane's own
+    # rule -- any control that can be satisfied by its own absence must emit evidence it
+    # ran -- and the first version of this file did not follow it.
+    #
+    # print(), not warnings.warn(): a warning would show under `-q` on a passing run, which
+    # is strictly better for visibility, but it would also move the suite's warning count,
+    # and several open cards reconcile their acceptance against that number. Trading a
+    # shared signal for a local one is the wrong trade. `pytest -s` shows these, and pytest
+    # shows them automatically on any failure.
+    print("\n[nltk-guard] pinned/installed unstructured : %s" % actual)
+    print("[nltk-guard] requested by the library      : %s" % sorted(found))
     return found
 
 
