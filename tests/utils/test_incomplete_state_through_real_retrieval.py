@@ -15,12 +15,24 @@ back through the real `/query` route, the real hybrid/dense search and the real 
 
 WHAT IS UNDER TEST, AND WHAT IS NOT
 -----------------------------------
-NOT re-proven here (already covered, and duplicating it would blur what this file is for):
+NOT re-proven here -- REACHABLE FROM THIS TREE, so a reader can check it:
   * the /embed receipt reports partial/unverified as such and never promotes to indexed
-    -- tests/utils/test_parse_is_not_index.py;
-  * the PRODUCER never stamps a completeness field onto a stored chunk
-    -- test_incomplete_state_survives_retrieval.test_the_chunk_never_carries_an_index_status_
-       field_by_construction.
+    -- tests/utils/test_parse_is_not_index.py, present on the base.
+
+PROVEN HERE RATHER THAN CITED. The producer-side half -- that `_prepare_documents_sync`
+never stamps a completeness field onto a stored chunk -- was originally cited to
+`test_incomplete_state_survives_retrieval`, which lives ONLY on the unmerged
+search-perms branch and is absent from this change and from the base. **A citation is a
+claim about the tree the reader has, not about any tree anywhere**, so it read as
+corroboration to anyone who did not go looking, with nothing behind it for them. It is
+asserted directly below instead (`test_the_producer_stamps_no_completeness_field`), which
+removes the dependency rather than annotating it.
+
+For the record, since the distinction cost a review round: that sibling file is NOT
+unrun. Its commit TITLE says "(slot-free prep, UNRUN)" and the title is stale -- the file
+was executed in the P06-4 slot run at 2026-09-23T02:15Z, 3 passed. A commit title is a
+claim true when written; it does not update itself when the state it describes changes.
+The citation was still wrong, for the reachability reason above and not for that one.
 
 UNDER TEST HERE: everything between the store and the caller. `index.status` is a WRITE-TIME
 receipt property returned on the /embed body (P06-5 §3a); it is NOT written onto per-chunk
@@ -287,3 +299,46 @@ def test_a_partial_source_is_not_described_at_all_rather_than_described_as_compl
     assert md == STORED_METADATA, (
         "the stored metadata and the retrieved metadata differ: stored %r, retrieved %r"
         % (STORED_METADATA, md))
+
+
+# ---------------------------------------------------------------------------
+# THE PRODUCER HALF — asserted here so this file does not depend on an unmerged branch
+# ---------------------------------------------------------------------------
+
+
+def test_the_producer_stamps_no_completeness_field():
+    """`_prepare_documents_sync` is where chunk metadata is built. It must not invent an
+    index-state key, because `index.status` is a WRITE-TIME receipt property (P06-5 §3a)
+    and a per-chunk copy would make a partial source look complete to every consumer that
+    never read the receipt.
+
+    No database and no route: this is the producer called directly, which is the only
+    place the stamping decision is made. Set equality against the caller-supplied keys
+    would be wrong here -- the producer legitimately ADDS file_id, digest and friends --
+    so this asserts the forbidden set specifically, and the retrieval-side test above
+    carries the stronger any-invention guard.
+    """
+    from app.routes.document_routes import _prepare_documents_sync
+
+    prepared = _prepare_documents_sync(
+        [Document(page_content=TEXT, metadata={"page": 3})],
+        file_id=FILE_ID,
+        user_id=ENTITY,
+        clean_content=False,
+        filename="quarterly.pdf",
+        tenant_id="tenant-incs",
+        ingest_id="ing-0001",
+    )
+
+    assert prepared, "the producer returned no chunks, so this asserts nothing"
+    for chunk in prepared:
+        present = FORBIDDEN & set(chunk.metadata)
+        assert not present, (
+            "the producer stamped a completeness claim onto a stored chunk: %r. "
+            "metadata=%r" % (sorted(present), sorted(chunk.metadata)))
+
+    # POSITIVE CONTROL: the producer really did stamp, so "no forbidden key" is not
+    # satisfied by a chunk carrying no metadata at all.
+    assert prepared[0].metadata.get("file_id") == FILE_ID, prepared[0].metadata
+    assert prepared[0].metadata.get("page") == 3, (
+        "the loader's own key did not survive the producer: %r" % prepared[0].metadata)
