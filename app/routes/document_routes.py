@@ -2041,6 +2041,13 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     # receipt must say so rather than let a "Total" row arrive silently blank.
     formula_scan: Optional[str] = None
     uncached_cells: dict = {}
+    #: Spreadsheet-only, additive (F-XLSX-YEAR-FORMAT-DESTROYS-DATE). The year-display
+    #: pass rewrites a date cell formatted to show only its year down to that year. It
+    #: is the only content-changing step in the loader that used to leave no trace on
+    #: success, so a rewritten year was indistinguishable from a year that was always a
+    #: year. `None` means the pass did not run at all.
+    date_normalised: Optional[int] = None
+    date_reduced: list = []
     #: Set when a configured read bound stopped the extraction early (FILES-01). Absent means the
     #: whole document was read -- never "we did not check".
     extraction_stop: Optional[dict] = None
@@ -2088,6 +2095,15 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             }
         if meta.get("formula_scan") is not None:
             formula_scan = meta["formula_scan"]
+        if meta.get("date_display_normalised") is not None:
+            # Scanned across ALL documents rather than read off one, exactly as the
+            # stop marker is: the loader stamps the same workbook-level totals onto
+            # every sheet, and a receipt that depended on which sheet it read would go
+            # quietly wrong the day that changed.
+            date_normalised = meta["date_display_normalised"]
+            for ref in meta.get("date_display_reduced") or ():
+                if ref not in date_reduced:
+                    date_reduced.append(ref)
         cells = meta.get("formula_uncached_cells")
         if cells:
             # Same unit reported twice (elements mode emits several Documents per
@@ -2294,6 +2310,15 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
 
     # Present ONLY for formats that report a formula scan (spreadsheets today), so
     # every existing receipt keeps its exact shape.
+    # Present ONLY when the year-display pass actually ran, so every existing receipt
+    # keeps its exact shape. `reduced` is omitted, never empty, when nothing was lost:
+    # an empty list reads as "we measured and found none", which is a different claim
+    # from "every rewrite was lossless" and would put the alarm on the normal case.
+    if date_normalised is not None:
+        receipt["dates"] = {"display_normalised": date_normalised}
+        if date_reduced:
+            receipt["dates"]["reduced"] = sorted(date_reduced)
+
     if formula_scan is not None:
         receipt["formulas"] = {
             "scan": formula_scan,
