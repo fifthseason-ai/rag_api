@@ -42,6 +42,7 @@ from langchain_core.documents import Document
 from main import app
 from app.routes.document_routes import _extraction_receipt
 from app.services.vector_store.async_pg_vector import AsyncPgVector
+from app.utils.document_loader import SafeDocxLoader
 
 # Reuse the synthetic generators / skip marks already proven in WP-C.
 from tests.utils.test_parser_fitness import (
@@ -346,10 +347,26 @@ def test_embed_all_image_pptx_is_empty_receipt_on_422_no_rows(rec_client, tmp_pa
     assert rec_client.inserted_batches == []  # zero vector writes, unchanged
 
 
-def test_embed_docx_reports_complete_locator_none_and_writes(rec_client, tmp_path):
-    """DOCX has no page/slide/sheet locator today -> locator_kind 'none',
-    units_total 1, status 'complete'; rows are written and the receipt is present
-    on the 200 body (consumer-shape lock)."""
+def test_embed_docx_reports_block_locator_family_units_and_writes(rec_client, tmp_path):
+    """FLIPPED for E1 (was ..._reports_complete_locator_none_and_writes): DOCX now
+    carries the per-unit block locator family, so `/embed` reports
+    locator_kind == the family, one unit per authored block, status 'complete';
+    rows are written and the receipt is present on the 200 body (consumer-shape lock).
+
+    make_docx builds a heading + a body paragraph + a 2x2 table + a header + a footer.
+    SafeDocxLoader emits one BODY unit per direct body `w:p` and one per table cell
+    (row-major), each with a distinct 0-based block_index (2 paragraphs + 4 table
+    cells = 6 body blocks), and it emits the header/footer text as unit(s) carrying
+    NO block_index (ruling 2026-09-23: header/footer have no body position). In the
+    receipt's detection loop the header/footer chunks fold into the single unnamed
+    (None) unit, so units_total = 6 distinct block_index values + 1 = 7.
+
+    NO hardcoded literal is asserted: units_total is checked against the DISTINCT
+    locator groups the STORED chunks actually form (each block_index, plus the None
+    group for the keyless header/footer chunks), so a loader that dropped a block,
+    merged two, or re-stamped a header would move this number. locator_kind is read
+    from the loader's own RULED constant; the receipt derives its kind from the
+    _UNIT_LOCATOR_KEYS registry, so this also proves registry<->loader agreement."""
     path = tmp_path / "report.docx"
     make_docx(str(path))
     r = _embed(
@@ -363,15 +380,42 @@ def test_embed_docx_reports_complete_locator_none_and_writes(rec_client, tmp_pat
     assert "extraction" in body  # receipt present on the success body
     rec = body["extraction"]
     assert rec["status"] == "complete"
-    assert rec["locator_kind"] == "none"
-    assert rec["units_total"] == 1
-    assert rec["units_extracted"] == 1
+    assert rec["locator_kind"] == SafeDocxLoader._DOCX_LOCATOR_KIND
+
+    # units_total equals the number of DISTINCT locator groups across the stored
+    # chunks -- each block_index value, PLUS the None group holding the keyless
+    # header/footer chunks (dict.get returns None for a missing key, exactly as the
+    # receipt's own grouping does). No integer literal is hardcoded.
+    key = SafeDocxLoader._DOCX_LOCATOR_KEY
+    stored = _stored_docs(rec_client)
+    locs = {(d.metadata or {}).get(key) for d in stored}  # includes None for header/footer
+    assert rec["units_total"] == len(locs)
+    assert rec["units_total"] > 1  # DOCX no longer folds to a single unit
+
+    body_idx = sorted(v for v in locs if v is not None)
+    assert body_idx == list(range(len(body_idx)))  # 0-based contiguous body blocks
+    assert None in locs  # the unnamed header/footer unit is present
+
+    # ABSOLUTE anchor (reviewer Finding 2): make_docx has 6 body blocks -- 1 heading
+    # + 1 body paragraph + 4 table cells (2x2). Pinned as a literal at ONE site, the
+    # way the card fixture is anchored to 9 named tokens. This is what the derived
+    # `units_total == len(locs)` agreement above cannot catch on its own: a
+    # regression collapsing all body indices to a single value moves BOTH sides of
+    # that equality together and still passes, but would break this count.
+    # (units_total itself is NOT asserted as a literal -- ruling (c): the test must
+    # not name that number; it is pinned via the derived agreement + this body count
+    # + the None group, i.e. 6 body blocks + 1 unnamed header/footer unit.)
+    assert len(body_idx) == 6, f"expected 6 body blocks for make_docx, got {body_idx}"
+
+    assert rec["units_extracted"] == rec["units_total"]  # every unit text-bearing
     assert rec["empty_locators"] == []
     assert len(rec_client.inserted_batches) >= 1  # rows written
 
 
 def test_embed_markdown_reports_complete(rec_client, tmp_path):
-    """A markdown file extracts to text -> complete, locator none."""
+    """A markdown file extracts to text -> complete. (Since PACKET-1 E4 markdown carries a
+    per-section `section` locator; this test asserts only the complete-status/units contract,
+    not the locator family -- see tests/utils/test_md_heading_locator.py for the locator.)"""
     path = tmp_path / "note.md"
     make_markdown(str(path))
     r = _embed(rec_client, "note.md", path.read_bytes(), "text/markdown")

@@ -439,6 +439,33 @@ def is_service_fault(error: BaseException) -> bool:
     return False
 
 
+def client_safe_error(exc: BaseException, context: str, status_code: int = 500) -> HTTPException:
+    """Log an unexpected error under a reference and return a caller-safe HTTPException.
+
+    The read/delete routes (`/documents`, `/documents/{id}/context`, `/query`,
+    `/query/{entity_id}`, `/query_multiple`) used to `raise HTTPException(detail=str(e))`,
+    handing the caller the raw exception text. The intake surfaces and the auth middleware
+    already stopped doing that (#26/#34/#35): the operator gets the exception, its traceback
+    and the route context in the LOG under a reference; the caller gets a generic sentence
+    and that reference. This extends the same rule to the routes that still leaked.
+
+    Why it matters even though these routes are authenticated: this is a multi-tenant
+    service, and an exception string can carry store internals or another tenant's data
+    (a DB error quoting a row, a path built from a filename). One authenticated tenant must
+    not receive another's internals. `status_code` is left to the caller so a route keeps
+    the status it already returned -- this changes only what text crosses the wire.
+    """
+    reference = uuid.uuid4().hex[:12]
+    logger.error("%s [reference=%s]: %s\n%s", context, reference, exc, traceback.format_exc())
+    return HTTPException(
+        status_code=status_code,
+        detail=(
+            "An internal error occurred processing this request. "
+            f"Quote reference {reference} to an operator."
+        ),
+    )
+
+
 def describe_failure(error: BaseException, filename: str) -> tuple:
     """Turn a non-verdict failure into `(status_code, caller_message)` and log the real detail.
 
@@ -836,13 +863,7 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error getting documents by IDs | IDs: %s | Error: %s | Traceback: %s",
-            ids,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Error getting documents by IDs | IDs: {ids}")
 
 
 #: The producers a delete may be narrowed to. These are the exact values the PDF loader
@@ -1047,13 +1068,7 @@ async def delete_documents(
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Failed to delete documents | IDs: %s | Error: %s | Traceback: %s",
-            document_ids,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Failed to delete documents | IDs: {document_ids}")
     finally:
         await file_locks.aclose()
 
@@ -1280,14 +1295,7 @@ async def query_embeddings_by_file_id(
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error in query embeddings | File ID: %s | Query: %s | Error: %s | Traceback: %s",
-            body.file_id,
-            body.query,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Error in query embeddings | File ID: {body.file_id}")
 
 
 # response_model as on `/query` (#45, F-QC1): SIBLING ROUTE, MEASURED byte-identical.
@@ -1353,14 +1361,7 @@ async def query_embeddings_by_entity_id(
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error in query by entity | Entity ID: %s | Query: %s | Error: %s | Traceback: %s",
-            entity_id,
-            body.query,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Error in query by entity | Entity ID: {entity_id}")
 
 
 #: HTTP 499 ("client closed request"). Nobody reads this response -- the caller has gone --
@@ -1851,13 +1852,25 @@ def _prepare_documents_sync(
 # Per-unit locator metadata keys, in detection precedence. Each loader emits at
 # most ONE of these families (PDF -> `page`, PPTX -> `slide_number`, XLSX
 # elements -> `page_name`), so the precedence only guards a defensive
-# mixed-metadata edge; a format with no per-unit locator (DOCX/MD/TXT/CSV) folds
-# into a single `none` unit.
+# mixed-metadata edge; a format with no per-unit locator (DOCX/TXT) folds
+# into a single `none` unit. ORDER IS PRECEDENCE (the detection loop breaks on
+# the first family present), so new families append AFTER the existing four so no
+# current format's answer changes.
 _UNIT_LOCATOR_KEYS = (
     ("page", "page"),           # PDF: 0-indexed page (SafePyPDFLoader / pypdf)
     ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
     ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
     ("row", "row"),             # CSV: 0-indexed data row (RowCSVLoader / langchain CSVLoader)
+    ("section", "section_index"),  # Markdown: 0-indexed heading section in doc order (HeadingMarkdownLoader)
+    # DOCX (E1): 0-indexed per-block unit (SafeDocxLoader), RULED by the FILES lead
+    # (PACKET-1-LOCATOR-TUPLE-AGREEMENT-ADDENDUM 2026-09-23). APPENDED AT THE END on
+    # purpose -- the detection loop below breaks on the FIRST family present, and a
+    # DOCX body chunk carries exactly this one family, so appending never shadows or
+    # inverts another format's answer. Header/footer chunks carry NO block_index and
+    # fall to this loop's `none` group. The value + key MUST equal
+    # SafeDocxLoader._DOCX_LOCATOR_KIND / ._DOCX_LOCATOR_KEY (pinned equal by
+    # tests/utils/test_docx_locator_fidelity.py::test_registry_entry_mirrors_loader_constants).
+    ("block", "block_index"),   # RULED 2026-09-23 (FILES lead)
 )
 
 
@@ -2028,6 +2041,13 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     # receipt must say so rather than let a "Total" row arrive silently blank.
     formula_scan: Optional[str] = None
     uncached_cells: dict = {}
+    #: Spreadsheet-only, additive (F-XLSX-YEAR-FORMAT-DESTROYS-DATE). The year-display
+    #: pass rewrites a date cell formatted to show only its year down to that year. It
+    #: is the only content-changing step in the loader that used to leave no trace on
+    #: success, so a rewritten year was indistinguishable from a year that was always a
+    #: year. `None` means the pass did not run at all.
+    date_normalised: Optional[int] = None
+    date_reduced: list = []
     #: Set when a configured read bound stopped the extraction early (FILES-01). Absent means the
     #: whole document was read -- never "we did not check".
     extraction_stop: Optional[dict] = None
@@ -2075,6 +2095,15 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             }
         if meta.get("formula_scan") is not None:
             formula_scan = meta["formula_scan"]
+        if meta.get("date_display_normalised") is not None:
+            # Scanned across ALL documents rather than read off one, exactly as the
+            # stop marker is: the loader stamps the same workbook-level totals onto
+            # every sheet, and a receipt that depended on which sheet it read would go
+            # quietly wrong the day that changed.
+            date_normalised = meta["date_display_normalised"]
+            for ref in meta.get("date_display_reduced") or ():
+                if ref not in date_reduced:
+                    date_reduced.append(ref)
         cells = meta.get("formula_uncached_cells")
         if cells:
             # Same unit reported twice (elements mode emits several Documents per
@@ -2281,6 +2310,15 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
 
     # Present ONLY for formats that report a formula scan (spreadsheets today), so
     # every existing receipt keeps its exact shape.
+    # Present ONLY when the year-display pass actually ran, so every existing receipt
+    # keeps its exact shape. `reduced` is omitted, never empty, when nothing was lost:
+    # an empty list reads as "we measured and found none", which is a different claim
+    # from "every rewrite was lossless" and would put the alarm on the normal case.
+    if date_normalised is not None:
+        receipt["dates"] = {"display_normalised": date_normalised}
+        if date_reduced:
+            receipt["dates"]["reduced"] = sorted(date_reduced)
+
     if formula_scan is not None:
         receipt["formulas"] = {
             "scan": formula_scan,
@@ -3163,15 +3201,11 @@ async def load_document_context(request: Request, id: str):
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error loading document context | Document ID: %s | Error: %s | Traceback: %s",
-            id,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(
+        # Kept at 400 (the status this route already returned) -- this change removes the
+        # raw exception text, not the status contract.
+        raise client_safe_error(
+            e, f"Error loading document context | Document ID: {id}",
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
 
@@ -3319,14 +3353,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
         )
         raise http_exc
     except Exception as e:
-        logger.error(
-            "Error in query multiple embeddings | File IDs: %s | Query: %s | Error: %s | Traceback: %s",
-            body.file_ids,
-            body.query,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise client_safe_error(e, f"Error in query multiple embeddings | File IDs: {body.file_ids}")
 
 
 @router.post("/text")
