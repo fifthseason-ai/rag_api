@@ -1089,6 +1089,33 @@ class SafePyPDFLoader:
         return list(self.lazy_load())
 
 
+# --- XLSX finer-than-sheet locator family (card E3) ------------------------------
+#
+# PROVISIONAL, single-source. These name the finer-than-sheet locator XLSX gained in
+# card E3, defined ONCE here so the loader stamp, the tests, and the pending
+# `_UNIT_LOCATOR_KEYS` registration (document_routes.py:1856) never drift apart.
+#
+# `CELL_RANGE_LOCATOR_KEY`  = the cmetadata key each sheet chunk carries.
+# `CELL_RANGE_LOCATOR_KIND` = the `locator_kind` vocabulary value it would resolve to
+#                             once registered (a UNIT name -- a range of cells -- NOT
+#                             the format).
+#
+# The registration line is DELIBERATELY NOT ADDED yet: the tuple is ORDERED and its
+# order is precedence (document_routes.py:2017), and an XLSX chunk now carries BOTH
+# `page_name` (sheet, registered at position 3) AND `cell_range`. Whether `cell_range`
+# is appended (shadowed by `sheet`) or placed before `sheet` (inverting XLSX's
+# advertised locator_kind) is a consumer-visible decision reserved for the FILES lead
+# (see the E3 placement ASK). Until it lands, XLSX still advertises locator_kind
+# `sheet` and `cell_range` rides along un-advertised (Option 1 semantics).
+CELL_RANGE_LOCATOR_KEY = "cell_range"
+CELL_RANGE_LOCATOR_KIND = "cell_range"
+
+# Additive structural fields carried alongside the family (declared as contract
+# additions in the PR body, per packet §4 rule). Not locator families themselves.
+XLSX_HEADER_KEY = "header"          # the detected header row's cell values (list[str])
+XLSX_HEADER_ROW_KEY = "header_row"  # 1-indexed worksheet row number of the header
+
+
 class SheetExcelLoader:
     """Load a workbook as sheet-cited Documents, with honest terminal verdicts.
 
@@ -1282,14 +1309,27 @@ class SheetExcelLoader:
 
     def _annotate(self, documents: List[Document]) -> List[Document]:
         per_sheet, scan_status = self._uncached_formulas()
+        sheet_locators = self._sheet_locators()
         for doc in documents:
             doc.metadata["formula_scan"] = scan_status
-            cells = per_sheet.get(doc.metadata.get("page_name"), [])
+            page_name = doc.metadata.get("page_name")
+            cells = per_sheet.get(page_name, [])
             if cells:
                 doc.metadata["formula_uncached"] = len(cells)
                 doc.metadata["formula_uncached_cells"] = cells[
                     : self._MAX_REPORTED_CELLS
                 ]
+            # Finer-than-sheet locator + header, keyed by the same sheet name the
+            # element already carries. Every element of a sheet gets the same
+            # cell_range (the sheet's occupied extent), so grouping by cell_range
+            # yields one unit per sheet -- the same count as grouping by sheet.
+            loc = sheet_locators.get(page_name)
+            if loc:
+                if loc.get(CELL_RANGE_LOCATOR_KEY) is not None:
+                    doc.metadata[CELL_RANGE_LOCATOR_KEY] = loc[CELL_RANGE_LOCATOR_KEY]
+                if loc.get(XLSX_HEADER_ROW_KEY) is not None:
+                    doc.metadata[XLSX_HEADER_ROW_KEY] = loc[XLSX_HEADER_ROW_KEY]
+                    doc.metadata[XLSX_HEADER_KEY] = loc[XLSX_HEADER_KEY]
         return documents
 
     # -- year-only date cells -----------------------------------------------
@@ -1371,12 +1411,155 @@ class SheetExcelLoader:
             logger.warning("Year-only date pass failed for %s: %s", self.filepath, e)
             return None
 
+    # -- merged cells -------------------------------------------------------
+
+    def _resolve_merged_cells(self, src_path: str, workdir: str) -> Optional[str]:
+        """Return a copy of ``src_path`` with every merged range unmerged and its
+        anchor value FILLED across the range, or ``None`` to parse ``src_path`` as is.
+
+        A merged cell stores its value only in the top-left cell; every other cell
+        of the range reads back empty. When the parser flattens the sheet those
+        cells render as PHANTOM EMPTY cells, and for a value merged down a column
+        (a category label spanning several rows) the label is effectively LOST for
+        every continuation row -- the row no longer says which category it belongs
+        to. Unmerging and writing the anchor value into every cell of the range
+        keeps the anchor value AND removes the phantom empties: each row carries its
+        own copy of the merged value.
+
+        ``None`` is returned (parse the source untouched) when there is nothing to
+        do (no merged ranges) or the workbook cannot be opened by openpyxl -- never
+        fatal, exactly like the year-only pass. Bounded the same way as the other
+        diagnostic passes so a hostile upload cannot make this expensive.
+        """
+        if not self._head(4).startswith(self._ZIP_MAGIC):
+            return None
+        try:
+            if os.path.getsize(src_path) > self._MAX_SCAN_BYTES:
+                return None
+            from openpyxl import load_workbook
+
+            wb = load_workbook(src_path, data_only=True)
+            try:
+                found = False
+                for ws in wb.worksheets:
+                    # `ws.merged_cells.ranges` mutates as we unmerge, so snapshot it.
+                    for rng in list(ws.merged_cells.ranges):
+                        anchor = ws.cell(row=rng.min_row, column=rng.min_col).value
+                        ws.unmerge_cells(str(rng))
+                        if anchor is None:
+                            continue
+                        found = True
+                        for row in range(rng.min_row, rng.max_row + 1):
+                            for col in range(rng.min_col, rng.max_col + 1):
+                                ws.cell(row=row, column=col).value = anchor
+                if not found:
+                    return None
+                copy_path = os.path.join(workdir, os.path.basename(src_path))
+                wb.save(copy_path)
+            finally:
+                wb.close()
+            stat = os.stat(src_path)
+            os.utime(copy_path, (stat.st_atime, stat.st_mtime))
+            return copy_path
+        except Exception as e:  # noqa: BLE001 - never fatal; parse the source as is
+            logger.warning("Merged-cell resolution failed for %s: %s", src_path, e)
+            return None
+
+    # -- finer-than-sheet locators + header row -----------------------------
+
+    #: How far down a sheet the header search looks. A column header lives at the
+    #: top; scanning the whole sheet for it would be both pointless and unbounded.
+    _HEADER_SEARCH_ROWS = 20
+
+    @staticmethod
+    def _detect_header_row(rows):
+        """Return ``(row_1indexed, [str values])`` for the header, or ``(None, None)``.
+
+        ``rows`` is a list of ``(row_number, [cell values])`` pairs. The header is
+        the first row carrying at least two non-empty cells whose non-empty values
+        are NOT all identical. That rule skips a merged title row on purpose: read
+        from the ORIGINAL workbook a merged title's value sits only in the anchor
+        cell (one non-empty cell), and after merged-cell resolution every cell holds
+        the same value (all identical) -- either way it is not mistaken for a header.
+        """
+        for row_number, values in rows:
+            non_empty = [v for v in values if v is not None and str(v).strip() != ""]
+            if len(non_empty) >= 2 and len(set(map(str, non_empty))) >= 2:
+                return row_number, ["" if v is None else str(v) for v in values]
+        return None, None
+
+    def _sheet_locators(self) -> dict:
+        """Per-sheet ``{sheet_name: {cell_range, header_row, header}}`` for the
+        finer-than-sheet locator family, from a bounded read of the ORIGINAL file.
+
+        ``cell_range`` is the sheet-qualified occupied extent (``'Revenue!A1:B4'``):
+        finer than the unbounded sheet reference because it names exactly the cells
+        that hold content, and sheet-qualified so it is unique per unit even when two
+        sheets share the same A1-notation range. Sheets with no content are omitted.
+        """
+        if not self._head(4).startswith(self._ZIP_MAGIC):
+            return {}
+        try:
+            if os.path.getsize(self.filepath) > self._MAX_SCAN_BYTES:
+                return {}
+            from openpyxl import load_workbook
+            from openpyxl.utils import get_column_letter
+
+            out: dict = {}
+            cells_seen = 0
+            wb = load_workbook(self.filepath, data_only=True, read_only=True)
+            try:
+                for ws in wb.worksheets:
+                    min_r = min_c = None
+                    max_r = max_c = 0
+                    header_buf = []
+                    for row in ws.iter_rows():
+                        cells_seen += len(row)
+                        if cells_seen > self._MAX_SCAN_CELLS:
+                            return {}
+                        values = [c.value for c in row]
+                        if row and row[0].row <= self._HEADER_SEARCH_ROWS:
+                            header_buf.append((row[0].row, values))
+                        for cell in row:
+                            if cell.value is None or str(cell.value).strip() == "":
+                                continue
+                            r, c = cell.row, cell.column
+                            min_r = r if min_r is None else min(min_r, r)
+                            min_c = c if min_c is None else min(min_c, c)
+                            max_r = max(max_r, r)
+                            max_c = max(max_c, c)
+                    if min_r is None:
+                        continue  # empty sheet: no data extent to cite
+                    cell_range = "%s!%s%d:%s%d" % (
+                        ws.title,
+                        get_column_letter(min_c), min_r,
+                        get_column_letter(max_c), max_r,
+                    )
+                    header_row, header = self._detect_header_row(header_buf)
+                    out[ws.title] = {
+                        CELL_RANGE_LOCATOR_KEY: cell_range,
+                        XLSX_HEADER_ROW_KEY: header_row,
+                        XLSX_HEADER_KEY: header,
+                    }
+            finally:
+                wb.close()
+            return out
+        except Exception as e:  # noqa: BLE001 - diagnostic; never fatal
+            logger.warning("Sheet-locator scan failed for %s: %s", self.filepath, e)
+            return {}
+
     # -- loader interface ---------------------------------------------------
 
     def load(self) -> List[Document]:
         self._precheck_container()
         with tempfile.TemporaryDirectory() as workdir:
-            parse_path = self._year_only_copy(workdir) or self.filepath
+            # Two optional working-copy passes, chained. Each copy keeps the
+            # ORIGINAL basename (so the parser reports the uploaded filename), so
+            # when both fire the merged copy is written over the year copy in the
+            # same workdir -- intended: the merged pass reads the year-converted
+            # values and re-saves them alongside the unmerged/filled cells.
+            base_path = self._year_only_copy(workdir) or self.filepath
+            parse_path = self._resolve_merged_cells(base_path, workdir) or base_path
             inner = UnstructuredExcelLoader(parse_path, mode="elements")
             try:
                 documents = inner.load()
