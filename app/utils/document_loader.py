@@ -1094,9 +1094,49 @@ class SafePyPDFLoader:
         return list(self.lazy_load())
 
 
-class SafeDocxLoader:
-    """`Docx2txtLoader`, but a markup-compatibility text box is read only ONCE.
+class _UnrepresentableBody(Exception):
+    """Private sentinel: the structured DOCX walk found a body (or w:sdtContent)
+    child carrying non-whitespace ``w:t`` text that it cannot faithfully place as
+    a unit. ``_structured_units`` catches this and returns None, so ``load()``
+    degrades to the flat ``Docx2txtLoader`` path -- a single ``locator_kind=none``
+    Document that loses NO text -- rather than returning a partial, lossy unit
+    list that would falsely report ``status: complete``. This is the load-bearing
+    fail-safe invariant: the structured walk never silently drops authored text.
+    """
 
+
+class SafeDocxLoader:
+    """A block-indexed DOCX loader whose text box is read only ONCE.
+
+    Emits one ``Document`` per authored unit. BODY units -- heading / paragraph /
+    table cell (row-major), and blocks descended from a block-level ``w:sdt`` --
+    come in ``word/document.xml`` body order, each carrying the per-unit DOCX
+    locator (``_DOCX_LOCATOR_KEY``, a 0-based index CONTIGUOUS over the body blocks
+    actually emitted) so a citation can open the block it came from. HEADER/FOOTER
+    units carry NO locator key (absent, not None): that text has no position in the
+    body reading sequence and must never inherit a body block's index (ruling
+    2026-09-23), so it surfaces as unnamed unit(s) under the receipt's ``None``
+    unit. This is the source-location fidelity ``Docx2txtLoader`` cannot give: it
+    flattens the whole file to ONE ``locator_kind="none"`` Document (E1, on top of
+    the #85 dedupe below). The locator family's value/key are RULED
+    (``block`` / ``block_index``); see ``_DOCX_LOCATOR_KIND`` / ``_DOCX_LOCATOR_KEY``.
+
+    The structured walk reads only ``w:t`` text after AlternateContent dedupe, so a
+    text box is counted once, and it reads the same header/footer parts docx2txt
+    reads, so nothing is dropped. A block-level ``w:sdt`` content control (a Word
+    template/form field wrapping paragraphs or a table in ``w:sdtContent``) is
+    descended into and its blocks are read as body units, in document order,
+    contiguous with the surrounding blocks -- content controls are common in real
+    templates, so their text is NOT skipped. The fail-safe invariant is stronger
+    than any single tag: if a direct body child the walk cannot faithfully place as
+    a unit still carries authored text, the WHOLE structured walk abandons to the
+    flat path (rather than emitting a partial list), so the walk never silently
+    drops authored text. A document whose structure the walk cannot read (a
+    zip/parse problem, no text-bearing block found, or such an unrepresentable
+    text-bearing child) degrades to the flat ``Docx2txtLoader`` path below -- text
+    still extracted, honestly ``locator_kind=none``, never a lossy partial.
+
+    #85 dedupe, preserved on both paths:
     Word and PowerPoint write a text box as an ``<mc:AlternateContent>`` element
     carrying the SAME runs in two branches: a modern ``<mc:Choice>`` (DrawingML
     ``wps:txbx``) and a legacy ``<mc:Fallback>`` (VML ``v:textbox``). A conformant
@@ -1199,7 +1239,286 @@ class SafeDocxLoader:
             logger.warning("DOCX AlternateContent dedupe failed for %s: %s", self.filepath, e)
             return None
 
-    def load(self) -> List[Document]:
+    #: docx2txt reads these body parts; the structured walk reads the same set so
+    #: headers/footers are not dropped (test_parser_fitness header/footer rule).
+    _DOC_PART = "word/document.xml"
+    _HEADER_RE = re.compile(r"^word/header\d*\.xml$")
+    _FOOTER_RE = re.compile(r"^word/footer\d*\.xml$")
+
+    #: The DOCX per-unit locator family (E1), RULED by the FILES lead
+    #: (PACKET-1-LOCATOR-TUPLE-AGREEMENT-ADDENDUM 2026-09-23). The vocabulary names
+    #: a UNIT (page / slide / sheet / row), never the format, so the value is
+    #: `block`, not `docx`. `block_index` is an ADDRESS -- a 0-indexed, contiguous
+    #: position over the BODY-LEVEL blocks (each `w:p`, and each table cell) in
+    #: document order -- NOT a human-readable display label; no heading path or
+    #: title is carried (out of scope by ruling). Header/footer text has no position
+    #: in the body reading sequence, so it carries NO `block_index` key at all.
+    #: These two constants are the SINGLE SOURCE OF TRUTH: the loader stamps
+    #: `_DOCX_LOCATOR_KEY`, the `_UNIT_LOCATOR_KEYS` tuple line in document_routes.py
+    #: mirrors this exact pair (a test pins them equal), and every test reads these
+    #: constants.
+    _DOCX_LOCATOR_KIND = "block"        # RULED 2026-09-23 (FILES lead)
+    _DOCX_LOCATOR_KEY = "block_index"   # RULED 2026-09-23 (FILES lead)
+
+    @classmethod
+    def _text_of(cls, element) -> str:
+        """Concatenate the run text under `element` in document order.
+
+        `iter()` visits descendants in document order, so runs come out in the
+        order they were authored; `w:tab`/`w:br`/`w:cr` become whitespace so
+        adjacent runs do not merge into one word. This reads ONLY `w:t` text --
+        after AlternateContent dedupe there is exactly one text-bearing branch,
+        so a text box's runs are counted once."""
+        t_tag = "{%s}t" % cls._W_NS
+        tab_tag = "{%s}tab" % cls._W_NS
+        br_tag = "{%s}br" % cls._W_NS
+        cr_tag = "{%s}cr" % cls._W_NS
+        parts = []
+        for node in element.iter():
+            if node.tag == t_tag:
+                parts.append(node.text or "")
+            elif node.tag == tab_tag:
+                parts.append("\t")
+            elif node.tag in (br_tag, cr_tag):
+                parts.append("\n")
+        return "".join(parts)
+
+    @classmethod
+    def _deduped_part(cls, xml_bytes: bytes):
+        """Parse `xml_bytes`, deduping AlternateContent first, and return the root
+        Element -- or None if it cannot be parsed."""
+        import xml.etree.ElementTree as ET
+
+        if b"AlternateContent" in xml_bytes:
+            rewritten = cls._dedupe_alternate_content(xml_bytes)
+            if rewritten is not None:
+                xml_bytes = rewritten
+        try:
+            return ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return None
+
+    @classmethod
+    def _body_units(cls, root):
+        """Yield the text of each text-bearing block of `w:body`, in document
+        order. A `w:p` is one unit (a heading and a body paragraph are both single
+        paragraph blocks); a `w:tbl` yields one unit per cell, row-major; a
+        block-level `w:sdt` content control is descended into (its `w:sdtContent`
+        blocks are read at body level, contiguous with the surrounding blocks).
+        Nested content (a text box's paragraphs, a cell's runs) is folded into its
+        containing block via `_text_of`, so nothing is emitted twice.
+
+        Fail-safe (applied UNIFORMLY at every level the walk enumerates children by
+        tag -- body/sdtContent here, and the row/cell levels in
+        `_table_units`/`_row_units`): any child that is NEITHER a handled element NOR
+        a text-free structural tag (w:sectPr, w:bookmarkStart/End, w:proofErr,
+        w:commentRangeStart/End, w:tblPr, w:tblGrid, w:trPr, ... -- none carry
+        `w:t`) but STILL carries non-whitespace text raises `_UnrepresentableBody`,
+        which aborts the whole walk to the flat fallback rather than dropping that
+        text. A `w:sdt` is descended into at whichever level it appears (block, row
+        or cell), preserving both the text AND contiguous indices. So the structured
+        walk never silently loses authored text at ANY container level."""
+        body = root.find("{%s}body" % cls._W_NS)
+        if body is None:
+            return
+        yield from cls._block_units(list(body))
+
+    @classmethod
+    def _block_units(cls, children):
+        """Yield the text of each text-bearing block among `children` -- the direct
+        children of `w:body` or of a `w:sdtContent` -- in document order, applying
+        the same rules at every level so a content control's blocks are contiguous
+        with the blocks around it.
+
+        - `w:p`  -> one unit (empty paragraphs skipped).
+        - `w:tbl` -> one unit per cell, row-major, via `_table_units` (which applies
+          this SAME descent/fail-safe invariant at the row and cell levels).
+        - `w:sdt` -> descend into `w:sdtContent` and process its blocks HERE; a
+          nested `w:sdt` recurses through this same branch. An sdt with NO
+          `w:sdtContent` wrapper is skipped ONLY when it is genuinely text-free; if
+          such a control still bears `w:t` text (hand-edited / third-party markup),
+          it raises `_UnrepresentableBody` so the text is not silently dropped.
+        - anything else -> a text-free structural tag is skipped; but if it carries
+          non-whitespace `w:t` text this walk cannot place, raise
+          `_UnrepresentableBody` (Part B fail-safe) so `load()` degrades to the
+          flat path and keeps the text, instead of emitting a lossy partial list."""
+        p_tag = "{%s}p" % cls._W_NS
+        tbl_tag = "{%s}tbl" % cls._W_NS
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
+            if child.tag == p_tag:
+                text = cls._text_of(child)
+                if text.strip():
+                    yield text
+            elif child.tag == tbl_tag:
+                yield from cls._table_units(list(child))
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    # A content control with NO sdtContent wrapper: if it still
+                    # bears authored text (hand-edited / third-party markup), fail
+                    # closed to the flat path so that text is not silently dropped
+                    # -- the same invariant the sibling branch enforces. A genuinely
+                    # empty control (no w:t) skips cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
+                    continue
+                yield from cls._block_units(list(content))
+            elif cls._has_text(child):
+                # A body/sdtContent child this walk does not handle still bears
+                # authored text -- fail closed to the flat fallback (see the class
+                # docstring's fail-safe invariant) rather than drop it.
+                raise _UnrepresentableBody(child.tag)
+
+    @classmethod
+    def _table_units(cls, children):
+        """Yield one unit per cell for table-level `children` -- the children of a
+        `w:tbl`, OR of a `w:sdtContent` that wraps rows (a repeating-section content
+        control) -- in document order, row-major. The SAME descent/fail-safe
+        invariant as `_block_units`, applied at the ROW level:
+
+        - `w:tr`  -> its cells, via `_row_units`.
+        - `w:sdt` -> descend into `w:sdtContent` and process the rows it wraps HERE
+          (a repeating-section content control emits `w:tr` as sdt-wrapped children
+          of the `w:tbl`; a repeating-section ITEM nests another `w:sdt` per row --
+          handled by recursion). An sdt with no `w:sdtContent` wrapper is skipped
+          only when text-free; if it bears `w:t` text it raises `_UnrepresentableBody`.
+        - table-structural children (`w:tblPr`, `w:tblGrid`) carry no `w:t` and are
+          skipped; but ANY other child bearing non-whitespace text (e.g. a stray
+          `w:p` directly under `w:tbl`) raises `_UnrepresentableBody` so the whole
+          document degrades to flat rather than dropping it silently."""
+        tr_tag = "{%s}tr" % cls._W_NS
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
+            if child.tag == tr_tag:
+                yield from cls._row_units(list(child))
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    # sdt with no sdtContent wrapper at the ROW level: fail closed if
+                    # it bears text (do not silently drop), else skip a genuinely
+                    # empty control cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
+                    continue
+                yield from cls._table_units(list(content))
+            elif cls._has_text(child):
+                raise _UnrepresentableBody(child.tag)
+
+    @classmethod
+    def _row_units(cls, children):
+        """Yield one unit per cell for row-level `children` -- the children of a
+        `w:tr`, OR of a `w:sdtContent` that wraps cells -- in document order. The
+        SAME descent/fail-safe invariant, applied at the CELL level:
+
+        - `w:tc`  -> one unit; `_text_of(cell)` captures ALL descendant text
+          wholesale (see its docstring), so nothing BELOW cell level -- nested
+          tables, nested sdt, paragraphs -- can be lost. Empty cells are skipped.
+        - `w:sdt` -> descend into `w:sdtContent` and process the cells it wraps HERE
+          (a cell-level content control); nested sdt recurses. An sdt with no
+          `w:sdtContent` wrapper is skipped only when text-free; if it bears `w:t`
+          text it raises `_UnrepresentableBody`.
+        - row-structural children (`w:trPr`) carry no `w:t` and are skipped; ANY
+          other child bearing non-whitespace text raises `_UnrepresentableBody`."""
+        tc_tag = "{%s}tc" % cls._W_NS
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
+            if child.tag == tc_tag:
+                text = cls._text_of(child)
+                if text.strip():
+                    yield text
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    # sdt with no sdtContent wrapper at the CELL level: fail closed if
+                    # it bears text (do not silently drop), else skip a genuinely
+                    # empty control cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
+                    continue
+                yield from cls._row_units(list(content))
+            elif cls._has_text(child):
+                raise _UnrepresentableBody(child.tag)
+
+    def _structured_units(self):
+        """Return `(body_units, aux_units)` -- the ordered text of the BODY blocks
+        and, separately, the header/footer text -- or None to fall back to flat
+        extraction.
+
+        `body_units` is the document-order text of each body-level block (each
+        `w:p`, each table cell, and blocks descended from a block-level `w:sdt`
+        content control). These are the units that receive a `block_index`.
+        `aux_units` is the text of every header and footer part (the same parts
+        docx2txt reads), deduping AlternateContent so a text box is read once.
+        Header/footer text has NO position in the body reading sequence, so it is
+        returned SEPARATELY and stamped with NO locator key by `load()` (ruling
+        2026-09-23): it must never inherit a body block's index.
+
+        Returns None -- so the caller degrades to `Docx2txtLoader` and no authored
+        text is dropped, never a lossy partial -- on any zip/parse problem, when
+        the body carries a text-bearing child the walk cannot faithfully represent
+        (`_UnrepresentableBody`), OR when there is NO body-level block to cite (an
+        empty body, or a document whose only text is in header/footer parts). In
+        that last case the flat path keeps the header/footer text honestly at
+        `locator_kind=none`. NOTE (measured limitation, receipt contract): a
+        no-body document and a fail-safe degradation BOTH report `locator_kind=none`
+        and are not distinguished at the document level on the current wire."""
+        try:
+            with zipfile.ZipFile(self.filepath) as zin:
+                names = zin.namelist()
+                if self._DOC_PART not in names:
+                    return None
+                doc_root = self._deduped_part(zin.read(self._DOC_PART))
+                if doc_root is None:
+                    return None
+                body_units = list(self._body_units(doc_root))
+                # No citable body block: degrade to flat so header/footer text is
+                # still kept (locator_kind none), rather than emit only unnamed
+                # units. block_index exists to cite body position; there is none.
+                if not body_units:
+                    return None
+                # Headers then footers, each in stable filename order, so the same
+                # text docx2txt appends is still extracted (never silently dropped).
+                # These are AUX units: emitted WITHOUT a block_index by load().
+                aux_units = []
+                for part_re in (self._HEADER_RE, self._FOOTER_RE):
+                    for name in sorted(n for n in names if part_re.match(n)):
+                        part_root = self._deduped_part(zin.read(name))
+                        if part_root is None:
+                            # A header/footer part present but UNPARSEABLE. Do not
+                            # skip it and report `complete` on the body units: the
+                            # flat reader (docx2txt) reads this same part and raises
+                            # a ParseError, so skipping here would turn that honest
+                            # failure into a fake success. Degrade to the flat path
+                            # (symmetric with the doc_root handling above) so the
+                            # real verdict surfaces. Well-formed parts never hit this.
+                            return None
+                        text = self._text_of(part_root)
+                        if text.strip():
+                            aux_units.append(text)
+                return body_units, aux_units
+        except zipfile.BadZipFile:
+            return None  # let the flat fallback raise docx2txt's honest verdict
+        except _UnrepresentableBody as e:
+            # Fail-safe: an unrepresentable text-bearing body child. Degrade to the
+            # flat path so the text is kept (locator_kind none), never a lossy
+            # partial. This is expected for unusual documents, not an error.
+            logger.info(
+                "DOCX body child %s carries text the structured walk cannot place "
+                "for %s; degrading to flat extraction", e, self.filepath,
+            )
+            return None
+        except Exception as e:  # noqa: BLE001 - never fatal; degrade to flat text
+            logger.warning("DOCX structured walk failed for %s: %s", self.filepath, e)
+            return None
+
+    def _flat_load(self) -> List[Document]:
+        """#85 behaviour: one flattened Document, AlternateContent deduped. The
+        degradation path -- a .docx whose structure the walk cannot read still
+        extracts its text (with locator_kind `none`, honestly), never nothing."""
         with tempfile.TemporaryDirectory() as workdir:
             parse_path = self._deduped_copy(workdir) or self.filepath
             documents = Docx2txtLoader(parse_path).load()
@@ -1208,6 +1527,47 @@ class SafeDocxLoader:
                 for doc in documents:
                     doc.metadata["source"] = self.filepath
         return documents
+
+    def load(self) -> List[Document]:
+        """Emit one Document per authored unit, in document order.
+
+        BODY units (each paragraph, each table cell, blocks descended from a
+        block-level `w:sdt`) each carry the DOCX per-unit locator
+        (`_DOCX_LOCATOR_KEY` = a 0-based index, CONTIGUOUS over the body blocks
+        actually emitted, so a citation can open the block it came from).
+
+        HEADER/FOOTER units carry NO locator key at all -- the key is ABSENT, not
+        None -- because header/footer text has no position in the body reading
+        sequence and must never inherit a body block's index (ruling 2026-09-23).
+        They surface in the receipt as unnamed unit(s), grouped under the receipt's
+        `None` unit. So a chunk with no `block_index` in a `locator_kind=block`
+        document is a header/footer unit (absent by nature), NOT lost content.
+
+        A text box is read once (the #85 AlternateContent dedupe is preserved).
+        `source` is always the uploaded file. No cmetadata key beyond the locator
+        family is stamped. Falls back to flat extraction (one `locator_kind=none`
+        Document) when the document cannot be structured OR has no body block to
+        cite."""
+        structured = self._structured_units()
+        if not structured:
+            return self._flat_load()
+        body_units, aux_units = structured
+        docs = [
+            Document(
+                page_content=text,
+                metadata={
+                    "source": self.filepath,
+                    self._DOCX_LOCATOR_KEY: block_index,
+                },
+            )
+            for block_index, text in enumerate(body_units)
+        ]
+        # Header/footer text: emitted WITHOUT the locator key (absent, not None).
+        docs.extend(
+            Document(page_content=text, metadata={"source": self.filepath})
+            for text in aux_units
+        )
+        return docs
 
     def lazy_load(self) -> Iterator[Document]:
         yield from self.load()

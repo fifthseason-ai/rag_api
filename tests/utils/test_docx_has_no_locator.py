@@ -1,46 +1,41 @@
-"""DOCX must never carry a per-unit locator key (FILES-DEV F-DOCX1).
+"""DOCX carries a per-unit locator family from E1 onward (was: none).
 
-`app.routes.document_routes._UNIT_LOCATOR_KEYS` is the single place that decides
-which metadata key means "this chunk can be cited at a page / slide / sheet":
+RED-FIRST GATE FOR E1. Until E1, DOCX had no per-unit locator: `Docx2txtLoader`
+flattened the whole document to ONE Document whose metadata was exactly
+`{'source': ...}`, so every DOCX folded into a single `none` unit (F-DOCX1). This
+file was the gate that pinned that absence. E1 adds source-location fidelity: a
+block-indexed `SafeDocxLoader` emits one Document per authored unit (heading /
+paragraph / table cell / header / footer) carrying the DOCX per-unit locator, and
+registers ONE additive family in `_UNIT_LOCATOR_KEYS`.
 
-    (("page", "page"), ("slide", "slide_number"), ("sheet", "page_name"))
+So the three DOCX-absence assertions this file used to make are FLIPPED here from
+"asserts none" to "asserts the new family", each replaced by an assertion that is
+equally specific about the family (per the FILES lead's E1 agreement,
+2026-09-23). The function names are kept verbatim so nothing is deleted and the
+gate stays traceable; their bodies now assert PRESENCE. The three flipped:
 
-THAT LITERAL IS A SNAPSHOT OF THIS BRANCH AND WILL DRIFT. #36 adds
-("row", "row") -- so on any tree containing it the tuple has FOUR families and
-the line above is stale. An independent review read this file against the
-composed candidate and reported the count as wrong; it is correct here and wrong
-there, which is the same "true on one base, asserted about another" mistake this
-lane has made in its own work several times. The prose is the only thing that
-drifts: every assertion below reads the tuple from the module, so a family added
-later is checked against DOCX automatically and this paragraph going stale cannot
-weaken the test. Do not re-type the tuple anywhere else.
+  1. `test_docx_loader_emits_no_locator_key` -- the loader now stamps the family
+     on every emitted unit.
+  2. `test_docx_receipt_reports_none_locator_and_no_locators` -- the receipt now
+     reports the DOCX family (not `none`); it is the only place `locator_kind`
+     for DOCX is asserted, so its replacement asserts the new family just as
+     specifically, and it is NOT deleted.
+  3. `test_docx_stored_chunk_metadata_has_no_locator_key` -- the family reaches
+     EVERY STORED chunk through `_prepare_documents_sync`, not just the loader
+     Document. This is the "a registered tuple entry that nothing stamps changes
+     nothing" proof (FILES lead caution): the stamp is proven on the persisted
+     surface that outlives the request, in-process (no pgvector).
 
-DOCX has no such unit. `Docx2txtLoader` flattens the whole document to ONE
-Document whose metadata is exactly `{'source': ...}` (measured, both routings),
-so every DOCX folds into a single `none` unit with nothing finer to cite. If a
-locator key ever appeared on a DOCX Document, two things would follow, and the
-existing coverage catches only the first:
+VALUE/KEY RULED (2026-09-23) `block` / `block_index`, and NOT hardcoded here:
+every assertion reads `SafeDocxLoader._DOCX_LOCATOR_KIND` / `._DOCX_LOCATOR_KEY`,
+so the single source of truth stays the loader constant. No literal of the value
+appears in this file.
 
-  1. `_extraction_receipt` would report a `locator_kind` and list
-     `empty_locators` for a document that has no pages at all -- already
-     asserted from the 200 body by
-     `tests/utils/test_extraction_status.py::test_embed_docx_reports_complete_locator_none_and_writes`.
-
-  2. `_prepare_documents_sync` splices the loader's metadata into EVERY stored
-     chunk (`**(doc.metadata or {})`), so the fabricated locator would be
-     PERSISTED and handed to whatever renders a citation. Nothing asserted that
-     surface, and the receipt cannot speak for it: the receipt is recomputed per
-     request, the chunk metadata is what outlives it.
-
-The receipt is also not a sufficient proxy for the rule, which is why these
-tests assert KEY ABSENCE rather than reading `locator_kind`. The detection loop
-tests `.get(key) is not None`, so a locator key present with value `None` leaves
-`locator_kind == "none"` while the key still propagates into stored chunks --
-a receipt that says "no locator" over rows that carry one. That measured gap is
-pinned below in `test_receipt_alone_cannot_prove_the_rule`.
-
-Assertions are bound to `_UNIT_LOCATOR_KEYS` itself, not to a copied list of key
-names, so a locator family added later is automatically checked against DOCX.
+The CONTROLS are unchanged and still green: `_assert_no_locator_keys` still fires
+on any registered key (now including the DOCX family), and
+`test_receipt_alone_cannot_prove_the_rule` still shows a `None`-valued key is
+invisible to `locator_kind` yet rides into chunks -- which is why the presence
+assertions read the KEY, not only `locator_kind`.
 
 All fixtures are SYNTHETIC and generated at test time (SYN-KNOWLEDGE-01 label);
 no client content.
@@ -56,7 +51,7 @@ from app.routes.document_routes import (
     _extraction_receipt,
     _prepare_documents_sync,
 )
-from app.utils.document_loader import get_loader
+from app.utils.document_loader import SafeDocxLoader, get_loader
 
 # The synthetic DOCX already proven to extract heading/body/table/header/footer.
 from tests.utils.test_parser_fitness import W_NS, make_docx
@@ -140,12 +135,42 @@ def _assert_no_locator_keys(metadatas, where):
 # ===========================================================================
 
 
+#: The DOCX per-unit locator family (RULED `block`/`block_index`, 2026-09-23), read
+#: from the loader so the loader constant stays the single source and no literal of
+#: the value appears here.
+_DOCX_KEY = SafeDocxLoader._DOCX_LOCATOR_KEY
+_DOCX_KIND = SafeDocxLoader._DOCX_LOCATOR_KIND
+
+
+def _assert_docx_family_on_every_unit(metadatas, where):
+    """Every emitted/stored unit must carry the DOCX locator key with an int
+    index, and the family must be registered in `_UNIT_LOCATOR_KEYS`."""
+    assert any(k == _DOCX_KEY for _kind, k in _UNIT_LOCATOR_KEYS), (
+        f"the DOCX family key {_DOCX_KEY!r} is not registered in _UNIT_LOCATOR_KEYS"
+    )
+    missing = [
+        (i, dict(m or {}))
+        for i, m in enumerate(metadatas)
+        if not isinstance((m or {}).get(_DOCX_KEY), int)
+    ]
+    assert not missing, (
+        f"{where}: every DOCX unit must carry an int {_DOCX_KEY!r}, but these did "
+        f"not: {missing}"
+    )
+
+
 @pytest.mark.parametrize("filename,content_type", _DOCX_ROUTINGS)
 def test_docx_loader_emits_no_locator_key(tmp_path, filename, content_type):
-    """The REAL loader `get_loader` selects for DOCX emits no locator key.
+    """FLIPPED for E1 (name kept): the REAL loader `get_loader` selects for DOCX now
+    stamps the per-unit locator family on every BODY unit, block-indexed 0-based and
+    contiguous in reading order.
 
     Driven through `get_loader` rather than a hand-built Document list, so a
     change of DOCX loader (or of the routing) is what this test reads.
+
+    Header/footer ruling (2026-09-23): header/footer units have no body position and
+    carry NO block_index. So the family assertion is scoped to the body units, and
+    the header/footer units are asserted to carry no key.
     """
     path = tmp_path / "report.docx"
     make_docx(str(path))
@@ -158,26 +183,58 @@ def test_docx_loader_emits_no_locator_key(tmp_path, filename, content_type):
     # Guard the premise: text really was extracted, so this is a loaded DOCX and
     # not an empty read that trivially carries no metadata at all.
     assert any(d.page_content.strip() for d in docs)
+    # The fixture has several blocks, so this is not a one-unit doc masquerading
+    # as block-indexed.
+    assert len(docs) > 1, f"{filename}: expected several block units, got {len(docs)}"
 
-    _assert_no_locator_keys([d.metadata for d in docs], f"{filename} loader output")
+    body = [d for d in docs if _DOCX_KEY in (d.metadata or {})]
+    aux = [d for d in docs if _DOCX_KEY not in (d.metadata or {})]
+
+    _assert_docx_family_on_every_unit(
+        [d.metadata for d in body], f"{filename} body units"
+    )
+    # Body indices are 0-based and contiguous in emission (reading) order.
+    assert [d.metadata[_DOCX_KEY] for d in body] == list(range(len(body)))
+    assert len(body) > 1
+
+    # Header/footer text is emitted as unnamed unit(s) carrying NO block_index key.
+    assert aux, "header/footer text should be emitted as unnamed unit(s)"
+    for d in aux:
+        assert _DOCX_KEY not in (d.metadata or {}), (
+            f"{filename}: header/footer unit must carry no {_DOCX_KEY!r} key: {d.metadata}"
+        )
+    # Provenance stays the uploaded file, never a working copy.
+    assert all(d.metadata.get("source") == str(path) for d in docs)
 
 
 @pytest.mark.parametrize("filename,content_type", _DOCX_ROUTINGS)
 def test_docx_receipt_reports_none_locator_and_no_locators(
     tmp_path, filename, content_type
 ):
-    """Acceptance, at the receipt built from REAL loader output: `locator_kind`
-    stays 'none', the whole document folds into one unit, and nothing is listed
-    as a locator."""
+    """FLIPPED for E1 (name kept): the receipt built from REAL loader output now
+    reports the DOCX family (not 'none'). This is the only place `locator_kind` for
+    DOCX is asserted, so the replacement pins the new family just as specifically as
+    the old assertion pinned 'none'.
+
+    Header/footer ruling (2026-09-23): header/footer chunks carry no block_index and
+    fold into the receipt's single unnamed (None) unit, so units_total = number of
+    body blocks + 1 (not len(docs)). Every unit is text-bearing, so nothing is
+    listed empty."""
     path = tmp_path / "report.docx"
     make_docx(str(path))
 
     loader, _known, _ext = get_loader(filename, content_type, str(path))
-    receipt = _extraction_receipt(loader.load())
+    docs = loader.load()
+    receipt = _extraction_receipt(docs)
 
-    assert receipt["locator_kind"] == "none"
-    assert receipt["units_total"] == 1
-    assert receipt["units_extracted"] == 1
+    body = [d for d in docs if _DOCX_KEY in (d.metadata or {})]
+    aux = [d for d in docs if _DOCX_KEY not in (d.metadata or {})]
+
+    assert receipt["locator_kind"] == _DOCX_KIND
+    # Body blocks are distinct units; header/footer fold into ONE unnamed unit.
+    assert receipt["units_total"] == len(body) + (1 if aux else 0)
+    assert receipt["units_total"] > 1
+    assert receipt["units_extracted"] == receipt["units_total"]
     assert receipt["empty_locators"] == []
     assert receipt["reasons"] == []
 
@@ -188,10 +245,12 @@ def test_docx_receipt_reports_none_locator_and_no_locators(
 
 
 def test_docx_stored_chunk_metadata_has_no_locator_key(tmp_path):
-    """`_prepare_documents_sync` splices loader metadata into every chunk it
-    persists. A locator stamped upstream would be stored on all of them and read
-    back as a citation, long after the receipt that would have reported it is
-    gone."""
+    """FLIPPED for E1 (name kept): the family reaches the STORED chunk, not just the
+    loader Document. `_prepare_documents_sync` splices loader metadata into every
+    chunk it persists (`**(doc.metadata or {})`), so the block index rides into
+    every stored chunk and is read back as a citation after the per-request receipt
+    is gone. This is the "a registered tuple entry that nothing stamps changes
+    nothing" proof, on the persisted surface, in-process (no pgvector)."""
     path = tmp_path / "long.docx"
     make_long_docx(str(path))
 
@@ -206,17 +265,19 @@ def test_docx_stored_chunk_metadata_has_no_locator_key(tmp_path):
         filename="long.docx",
     )
 
-    # The fixture must actually reach the multi-chunk case it claims to cover.
+    # The fixture must actually reach the multi-chunk case it claims to cover: 40
+    # paragraphs become 40 block-indexed units and many stored chunks, so the
+    # per-chunk propagation of the family is exercised, not assumed.
     assert len(prepared) > 1, (
         f"fixture produced {len(prepared)} chunk(s); the per-chunk propagation "
         "case is not exercised"
     )
-    _assert_no_locator_keys(
+    _assert_docx_family_on_every_unit(
         [d.metadata for d in prepared], "stored DOCX chunk metadata"
     )
-    # Proves the metadata pathway under test is live: the loader's own key DID
-    # propagate to every chunk, so an added locator key would have too.
-    assert all("source" in d.metadata for d in prepared)
+    # The service fields still win and provenance survives, alongside the family.
+    assert all(d.metadata.get("source") == str(path) for d in prepared)
+    assert all(d.metadata.get("file_id") == "syn-file-id" for d in prepared)
 
 
 # ===========================================================================
