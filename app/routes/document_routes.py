@@ -1942,10 +1942,11 @@ def _worse_image_coverage(a: Optional[str], b: Optional[str]) -> Optional[str]:
 def _extraction_receipt(data: Iterable[Document]) -> dict:
     """Build the additive extraction receipt for the /embed response (KI-02 WP-G1).
 
-    Reports, per page/slide/sheet UNIT, whether real text was extracted — derived
-    ONLY from loader signals that already exist (empty `page_content` on a scanned
-    PDF page / image-only slide, the PPTX `image_only` marker, the per-slide/page/
-    sheet locator metadata), NEVER success-by-default. A unit counts as EXTRACTED
+    Reports, per UNIT (a page, slide, sheet, row, section or block -- the families
+    `_UNIT_LOCATOR_KEYS` registers; the tuple decides, this prose only describes),
+    whether real text was extracted — derived ONLY from loader signals that already
+    exist (empty `page_content` on a scanned PDF page / image-only slide, the PPTX
+    `image_only` marker, the per-unit locator metadata), NEVER success-by-default. A unit counts as EXTRACTED
     only when its content survives `clean_text(...).strip()` — the exact same
     normalization the empty guard uses and the pipeline persists — so
     `units_extracted` equals the units that actually contribute stored chunks
@@ -1962,15 +1963,21 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       never read as `complete` on the field consumers already check --
                       including when every page yielded some text the engine does not
                       vouch for. Nonempty text is not success.
-      locator_kind:   'page' | 'slide' | 'sheet' | 'row' | 'none'
+      locator_kind:   'page' | 'slide' | 'sheet' | 'row' | 'section' | 'block' | 'none'
+                      One member per family in `_UNIT_LOCATOR_KEYS`, in that order, plus
+                      'none'; a test pins this line against the tuple because it went
+                      stale once (2026-09-23: four listed, six registered, found by CORE).
                       NEW 2026-09-20: 'row' (CSV). Core's two consumers of this field
                       (sourceLifecycle.js, ingestionReceipts.js) pass any string through
                       and default only a NON-string to 'none', so a new member is additive
                       -- measured at release head e3dbdf296, not assumed.
+                      NEW 2026-09-23: 'section' (Markdown, #92) and 'block' (DOCX, #90).
+                      They rely on the same pass-through; NOT re-measured against Core
+                      here -- the consumer side is CORE-LOCATOR-ENUMERATION-FOR-90-91.
       units_total / units_extracted / units_empty / units_image_only
-      empty_locators: sorted locators (page ints / slide ints / sheet names / row ints) of
-                      every unit that yielded NO extractable text (locator-bearing
-                      units only)
+      empty_locators: sorted locators (page ints / slide ints / sheet names / row ints /
+                      section ints / block ints) of every unit that yielded NO
+                      extractable text (locator-bearing units only)
       reasons:        [{locator, reason: 'image_only' | 'empty'}] per non-extracted
                       locator-bearing unit
       ocr:            PRESENT ONLY when local OCR ran on at least one unit (FILES-01) —

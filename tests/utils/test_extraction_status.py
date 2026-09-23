@@ -9,7 +9,8 @@ signals that already exist — never success-by-default.
 Receipt shape (see app.routes.document_routes._extraction_receipt):
     extraction: {
       status: 'complete' | 'partial' | 'empty',
-      locator_kind: 'page' | 'slide' | 'sheet' | 'none',
+      locator_kind: 'page' | 'slide' | 'sheet' | 'row' | 'section' | 'block' | 'none',
+                    # one per family in _UNIT_LOCATOR_KEYS; the tuple decides
       units_total, units_extracted, units_empty, units_image_only,
       empty_locators: [...],           # locator-bearing units with no text
       reasons: [{locator, reason}],     # 'image_only' | 'empty' per non-extracted unit

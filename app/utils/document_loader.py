@@ -1250,7 +1250,7 @@ class SafeDocxLoader:
 
     #: The DOCX per-unit locator family (E1), RULED by the FILES lead
     #: (PACKET-1-LOCATOR-TUPLE-AGREEMENT-ADDENDUM 2026-09-23). The vocabulary names
-    #: a UNIT (page / slide / sheet / row), never the format, so the value is
+    #: a UNIT (page / slide / sheet / row / section / block), never the format, so the value is
     #: `block`, not `docx`. `block_index` is an ADDRESS -- a 0-indexed, contiguous
     #: position over the BODY-LEVEL blocks (each `w:p`, and each table cell) in
     #: document order -- NOT a human-readable display label; no heading path or
