@@ -1309,6 +1309,27 @@ class SheetExcelLoader:
             fmt = fmt[fmt.index("]") + 1 :]
         return fmt.strip().lower() in ("yy", "yyy", "yyyy")
 
+    @staticmethod
+    def _reduction_discards_a_date(value) -> bool:
+        """True when rewriting this value to its year would throw information away.
+
+        A cell holding 2016-01-01 behind a `yyyy` format carries nothing beyond the
+        year, so the rewrite discards nothing and must not be reported as a loss. A
+        cell holding 2016-06-30 does: a fiscal year end lives in the month and day,
+        and after the rewrite a mid-year reporter is indistinguishable from a
+        calendar-year one.
+
+        Stated as a fact about the VALUE, not about authorial intent. rag_api cannot
+        know whether the author typed a year or a date; it can know whether anything
+        other than the January-the-first default was present. That is the honest
+        claim, and it is the one available here -- the value still has its month and
+        day at this point in the rewrite.
+        """
+        if (getattr(value, "month", 1), getattr(value, "day", 1)) != (1, 1):
+            return True
+        # A time component is information too: 2016-01-01 09:30 is not a bare year.
+        return any(getattr(value, unit, 0) for unit in ("hour", "minute", "second"))
+
     def _year_only_copy(self, workdir: str) -> Optional[str]:
         """Return a copy of the workbook with year-only date cells as the year.
 
@@ -1321,6 +1342,11 @@ class SheetExcelLoader:
         workbook is parsed from the original file, untouched. Bounded like the
         formula scan; past a bound (or on any failure) the original is parsed.
         """
+        # Reset before every early return below, so `load()` can never read a count
+        # left by a previous call. A stale count is the disclosure being wrong in the
+        # quietest possible way.
+        self._year_normalised = 0
+        self._year_reduced = []
         if not self._head(4).startswith(self._ZIP_MAGIC):
             return None
         try:
@@ -1360,6 +1386,17 @@ class SheetExcelLoader:
                             and hasattr(cell.value, "year")
                             and self._is_year_only_format(cell.number_format)
                         ):
+                            if self._reduction_discards_a_date(cell.value):
+                                # Record WHAT WAS LOST, not merely that something
+                                # happened. A flag on every rewritten cell would be
+                                # true on thousands where nothing was discarded, and
+                                # an alarm that fires on the normal case is one that
+                                # readers learn to ignore -- which puts the rare
+                                # destructive case back where it started.
+                                self._year_reduced.append(
+                                    "%s!%s" % (ws.title, cell.coordinate)
+                                )
+                            self._year_normalised += 1
                             cell.value = cell.value.year
                             cell.number_format = "0"
             copy_path = os.path.join(workdir, os.path.basename(self.filepath))
@@ -1388,6 +1425,21 @@ class SheetExcelLoader:
                 doc.metadata["source"] = self.filepath
                 if "file_directory" in doc.metadata:
                     doc.metadata["file_directory"] = os.path.dirname(self.filepath)
+            # DISCLOSURE (F-XLSX-YEAR-FORMAT-DESTROYS-DATE). The year pass is the only
+            # content-changing step in this loader that left no trace on success, so a
+            # rewritten year was indistinguishable from a year that was always a year.
+            # Stamped only when the pass actually ran.
+            #
+            # `date_display_reduced` is the one that matters: it names the cells whose
+            # month and day were discarded. ABSENT, never empty, when nothing was lost
+            # -- an empty list reads as a measurement that found nothing, which is a
+            # different claim from "every rewrite was lossless".
+            normalised = getattr(self, "_year_normalised", 0)
+            reduced = getattr(self, "_year_reduced", [])
+            for doc in documents:
+                doc.metadata["date_display_normalised"] = normalised
+                if reduced:
+                    doc.metadata["date_display_reduced"] = list(reduced)
         return self._annotate(documents)
 
     def lazy_load(self) -> Iterator[Document]:

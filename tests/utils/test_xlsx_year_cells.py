@@ -18,6 +18,32 @@ integer year; every workbook without such cells is parsed from the original.
 How other date formats are displayed (the " 00:00:00" suffix) is an OPEN
 display choice, not decided here, and is pinned only so a change is deliberate.
 
+F-XLSX-YEAR-FORMAT-DESTROYS-DATE (2026-09-23) -- THE OPEN CHOICE, CLOSED
+-----------------------------------------------------------------------
+The line above ("an OPEN display choice, not decided here") was left open when this
+card completed, and nothing ever closed it. It became a default by attrition, and the
+default destroys data: the rewrite gates on the cell's FORMAT, not on the value's
+precision, so a genuine 30 June 2016 displayed as `2016` enters the index as `2016`.
+A fiscal year end becomes unanswerable and a mid-year reporter is indistinguishable
+from a calendar-year one.
+
+RULED: keep the behaviour, disclose it. In the common case the author typed only a
+year and this pass removes a January-the-first timestamp the source never showed --
+usually right, occasionally wrong, which is the inverse of a heuristic worth removing.
+What was missing is that it was the only content-changing step in this loader that
+left no trace on success.
+
+The disclosure names WHAT WAS LOST rather than merely that something happened:
+`extraction.dates.reduced` lists the cells whose month and day were discarded, and is
+ABSENT when nothing was. A flag on every rewritten year cell would be true on
+thousands where nothing was lost, and an alarm that fires on the normal case is one
+readers learn to ignore -- which would put the rare destructive case back where it
+started.
+
+Stated as a fact about the VALUE, never about intent: rag_api cannot know what the
+author typed, only whether anything other than the January-the-first default was
+present.
+
 Fixtures are SYNTHETIC, built at test time. No client content.
 """
 
@@ -37,7 +63,8 @@ from tests.utils.test_xlsx_capability import (  # noqa: F401 - pytest fixture
 )
 
 
-def make_year_workbook(path, *, year_format="yyyy", with_year_cell=True, formula=None):
+def make_year_workbook(path, *, year_format="yyyy", with_year_cell=True, formula=None,
+                       year_cell_value=None):
     """One sheet of labelled values covering every way a year can be held."""
     from openpyxl import Workbook
 
@@ -51,7 +78,7 @@ def make_year_workbook(path, *, year_format="yyyy", with_year_cell=True, formula
     ws.append(["Revenue 2019", 1234.5])
     ws.append(["date_default", datetime.date(2017, 3, 4)])
     if with_year_cell:
-        ws.append(["date_yyyy", datetime.datetime(2016, 1, 1)])
+        ws.append(["date_yyyy", year_cell_value or datetime.datetime(2016, 1, 1)])
         ws.cell(row=ws.max_row, column=2).number_format = year_format
     if formula:
         ws.append(["Total", formula])
@@ -144,9 +171,21 @@ def test_numeric_and_text_years_are_unchanged(tmp_path):
         assert "Revenue 2019 1234.5" in content
 
 
-def test_a_full_date_is_never_reduced_to_its_year(tmp_path):
-    """The rewrite is for year-only cells only; a real date keeps day and month,
-    including in a workbook that also has a year-only cell (the copy path)."""
+def test_a_full_date_with_a_normal_format_is_never_reduced_to_its_year(tmp_path):
+    """A date shown in full keeps its day and month, including in a workbook that also
+    has a year-only cell (the copy path).
+
+    RENAMED. This was `test_a_full_date_is_never_reduced_to_its_year`, which claimed a
+    property its fixture never built. The rewrite gates on the cell's FORMAT, not on
+    the value's precision, so a real date displayed as `2016` IS reduced -- and the
+    only date this fixture builds is `date_default`, which carries a normal format.
+    Anyone grepping to find out whether the destructive case was guarded found a test
+    whose name said yes.
+
+    The name now states what the fixture actually proves. The case the old name implied
+    is covered -- with its loss DISCLOSED rather than prevented, which is the ruling --
+    by `test_a_real_date_behind_a_year_only_format_is_reduced_and_the_loss_is_disclosed`.
+    """
     path = tmp_path / "years.xlsx"
     make_year_workbook(str(path))
 
@@ -250,3 +289,121 @@ def test_year_pass_failure_parses_the_original(tmp_path, monkeypatch):
 )
 def test_year_only_format_recognition(fmt, expected):
     assert SheetExcelLoader._is_year_only_format(fmt) is expected
+
+
+# ===========================================================================
+# F-XLSX-YEAR-FORMAT-DESTROYS-DATE — the case this file's own name promised
+# ===========================================================================
+
+
+def test_a_real_date_behind_a_year_only_format_is_reduced_and_the_loss_is_disclosed(
+    tmp_path,
+):
+    """RED-FIRST for F-XLSX-YEAR-FORMAT-DESTROYS-DATE.
+
+    The rewrite gates on the FORMAT, not on the value's precision, so a genuine
+    30 June 2016 displayed as `2016` enters the index as `2016` and its month and day
+    are gone. "What is this entity's fiscal year end" becomes unanswerable, and a
+    mid-year fiscal reporter is indistinguishable from a calendar-year one.
+
+    The behaviour is KEPT -- in the common case the author typed only a year and this
+    pass removes a January-the-first timestamp the source never showed. What was
+    missing is that it is the only content-changing step in this module that left no
+    trace on success. So the requirement is disclosure, not removal.
+
+    The disclosure must distinguish the two cases. A flag that fires on every year cell
+    is an alarm on the normal case: it would be true on thousands of cells where
+    nothing was lost, readers would learn to ignore it, and the rare destructive case
+    would be back where it started. The distinguishing fact is available at the rewrite
+    site, because the value still has its month and day at that moment.
+    """
+    path = tmp_path / "fiscal.xlsx"
+    make_year_workbook(
+        str(path), year_cell_value=datetime.datetime(2016, 6, 30)
+    )
+
+    doc = sheet_text(path)
+
+    # The reduction itself is intended and stays.
+    assert "date_yyyy 2016" in doc.page_content, doc.page_content
+
+    # ...but it must no longer be silent.
+    assert doc.metadata.get("date_display_reduced"), (
+        "a real date (2016-06-30) was reduced to its year with NO disclosure. The "
+        "receipt cannot tell a reader that month and day were discarded, and a year "
+        "that was rewritten is indistinguishable from a year that was always a year. "
+        "metadata=%r" % (sorted(doc.metadata),))
+
+
+def test_a_january_first_year_cell_is_not_reported_as_a_loss(tmp_path):
+    """THE OTHER HALF, and the reason the disclosure is not a blanket flag.
+
+    A cell holding 2016-01-01 behind a year-only format carries no information beyond
+    the year, so rewriting it discards nothing. Reporting it as a loss would fire the
+    alarm on the normal case and teach readers to ignore it.
+
+    Stated as a fact about the VALUE, not about intent: rag_api cannot know what the
+    author typed, only whether month and day were anything other than the default.
+    """
+    path = tmp_path / "calendar.xlsx"
+    make_year_workbook(str(path))  # default year cell is 2016-01-01
+
+    doc = sheet_text(path)
+
+    assert "date_yyyy 2016" in doc.page_content, doc.page_content
+    assert not doc.metadata.get("date_display_reduced"), (
+        "a 2016-01-01 cell was reported as a lossy reduction; nothing was discarded, "
+        "and an alarm that fires on the normal case is worse than no alarm. "
+        "metadata=%r" % (doc.metadata,))
+
+
+def test_the_receipt_names_the_cells_whose_date_was_reduced(client, tmp_path):
+    """THE DISCLOSURE ON THE WIRE, not just in loader metadata.
+
+    A stamp a consumer never receives is not a disclosure. The receipt is what /embed
+    returns, so this is the surface that decides whether anyone can learn the month and
+    day were dropped.
+    """
+    path = tmp_path / "fiscal.xlsx"
+    make_year_workbook(str(path), year_cell_value=datetime.datetime(2016, 6, 30))
+
+    r = _embed(client, "fiscal.xlsx", path.read_bytes(), file_id="f-fiscal")
+    assert r.status_code == 200, r.text
+
+    dates = r.json()["extraction"].get("dates")
+    assert dates, (
+        "the receipt carries no `dates` block, so nothing on the wire says a real date "
+        "was reduced to its year. extraction=%r" % (r.json()["extraction"],))
+    assert dates["display_normalised"] == 1
+    assert dates["reduced"] == ["Years!B7"], dates
+
+
+def test_a_lossless_year_pass_reports_no_reduced_cells(client, tmp_path):
+    """The block appears (the pass ran) but names nothing, because nothing was lost.
+
+    `reduced` is ABSENT rather than an empty list. An empty list reads as a measurement
+    that found none, which is a different claim from "every rewrite was lossless", and
+    it is the shape that trains a reader to skim past the key.
+    """
+    path = tmp_path / "calendar.xlsx"
+    make_year_workbook(str(path))  # default year cell is 2016-01-01
+
+    r = _embed(client, "calendar.xlsx", path.read_bytes(), file_id="f-cal")
+    assert r.status_code == 200, r.text
+
+    dates = r.json()["extraction"].get("dates")
+    assert dates == {"display_normalised": 1}, dates
+
+
+def test_a_workbook_with_no_year_cells_has_no_dates_block_at_all(client, tmp_path):
+    """Receipt shape is unchanged for every file the pass does not touch.
+
+    An additive field that appears on receipts it has nothing to say about is not
+    additive in practice: every consumer has to learn to ignore it.
+    """
+    path = tmp_path / "plain.xlsx"
+    make_year_workbook(str(path), with_year_cell=False)
+
+    r = _embed(client, "plain.xlsx", path.read_bytes(), file_id="f-plain")
+    assert r.status_code == 200, r.text
+    assert "dates" not in r.json()["extraction"], r.json()["extraction"]
