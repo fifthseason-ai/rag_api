@@ -52,7 +52,9 @@ ASSERTS the file wherever a checkout is identifiable. Same shape as `needs_deplo
 tests/test_build_provenance.py, for the same reason.
 """
 import ast
+import importlib.util
 import re
+import sys
 from importlib.metadata import version as installed_version
 from pathlib import Path
 
@@ -111,15 +113,24 @@ def _pinned_unstructured() -> str:
 def _requested_resources() -> set:
     """The nltk resource names the INSTALLED tokenizer module asks for.
 
-    Parsed from its source with `ast`, not imported: importing it runs
-    `download_nltk_packages()` at module scope when AUTO_DOWNLOAD_NLTK is unset, which
-    would reach nltk.org from a test. Collects both the `nltk.download("X")` arguments and
-    the `check_for_nltk_package(package_name="Y")` keywords, because a future version could
+    Parsed from its source with `ast`, not imported: MEASURED on 0.18.32, tokenize.py:47 is
+    `if os.getenv("AUTO_DOWNLOAD_NLTK", "True").lower() == "true":` at MODULE SCOPE, so an
+    import runs the download routine wherever a resource is missing and that variable is
+    unset -- the guard that exists to keep nltk.org out of the runtime would reach it itself.
+
+    LOCATED with `importlib.util.find_spec`, which imports the parent package
+    `unstructured.nlp` (an empty `__init__`) and NOT the module. The first version of this
+    file did `import unstructured.nlp.tokenize` to find the path -- running the module scope
+    this docstring says must not run -- and nothing showed it, because every environment it
+    ran in already carried the bake. The fixture's self-check pins it now.
+
+    Collects both the `nltk.download("X")` arguments and the
+    `check_for_nltk_package(package_name="Y")` keywords, because a future version could
     check one set and download another and this guard should see both.
     """
-    import unstructured.nlp.tokenize as tok
-
-    tree = ast.parse(Path(tok.__file__).read_text(encoding="utf-8"))
+    spec = importlib.util.find_spec("unstructured.nlp.tokenize")
+    assert spec is not None and spec.origin, "unstructured.nlp.tokenize is not installed"
+    tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
     found = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -148,7 +159,19 @@ def resources():
         "card exists to remove." % (actual, pinned)
     )
 
+    # SELF-CHECK: the guard must not import the module it reads. Decidable only when nothing
+    # earlier in the session imported it (a full run may have, through any loader test); a
+    # single-file run always decides it, and the printed line below says which happened.
+    imported_before = "unstructured.nlp.tokenize" in sys.modules
     found = _requested_resources()
+    if not imported_before:
+        assert "unstructured.nlp.tokenize" not in sys.modules, (
+            "this guard IMPORTED unstructured.nlp.tokenize while locating it. Its module scope "
+            "runs the nltk download routine unless AUTO_DOWNLOAD_NLTK is false, so the guard "
+            "that exists to keep nltk.org out of the runtime would itself reach it wherever a "
+            "resource is missing. Locate the file with importlib.util.find_spec; never import "
+            "the module."
+        )
     assert len(found) == EXPECTED_RESOURCE_COUNT, (
         "parsed %d resource name(s) out of unstructured/nlp/tokenize.py, expected exactly "
         "%d: %r.\n"
@@ -172,6 +195,8 @@ def resources():
     # shows them automatically on any failure.
     print("\n[nltk-guard] pinned/installed unstructured : %s" % actual)
     print("[nltk-guard] requested by the library      : %s" % sorted(found))
+    print("[nltk-guard] tokenizer module imported here : %s"
+          % ("not decidable -- imported earlier in the session" if imported_before else "no"))
     return found
 
 
