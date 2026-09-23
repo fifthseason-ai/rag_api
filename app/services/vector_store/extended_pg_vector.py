@@ -6,7 +6,7 @@ from typing import Optional, Any, Dict, List, Union
 from sqlalchemy import event
 from sqlalchemy import delete, func
 from sqlalchemy.orm import Session
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from langchain_core.documents import Document
 from langchain_community.vectorstores.pgvector import PGVector
 
@@ -17,6 +17,32 @@ class ExtendedPgVector(PGVector):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setup_query_logging()
+
+    def __del__(self) -> None:
+        """Close an owned Connection, without assuming __init__ ever finished.
+
+        `PGVector.__del__` reads `self._bind` unguarded. `_bind` is set at the END of
+        PGVector's initialisation, so ANY instance that did not get there -- a
+        `__new__`-constructed double, or a real store whose constructor raised while
+        connecting -- raises AttributeError when it is collected. A finalizer cannot
+        propagate that: Python routes it to sys.unraisablehook and the process prints
+        "Exception ignored in: <function PGVector.__del__>". Under pytest that surfaces
+        as a PytestUnraisableExceptionWarning attributed to whichever test happened to be
+        running when the collection occurred, which is not where the object was made.
+
+        A destructor must therefore assume NOTHING about the constructor having run. The
+        `Connection is not None` check is the same rule applied to module teardown, where
+        globals can already be cleared by the time the last objects are collected.
+
+        Behaviour for a bound store is unchanged, deliberately: an owned Connection is
+        still closed, an Engine is still left alone (PGVector only closes what it did not
+        create), and a failing close() still raises exactly as before rather than being
+        swallowed here -- silencing that would hide a real resource leak behind a fix for
+        a cosmetic warning.
+        """
+        bind = getattr(self, "_bind", None)
+        if Connection is not None and isinstance(bind, Connection):
+            bind.close()
 
     @staticmethod
     def _sanitize_parameters_for_logging(
