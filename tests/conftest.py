@@ -81,3 +81,40 @@ from app.routes import document_routes as _document_routes  # noqa: E402
 from app.services.file_write_lock import NoFileWriteLock  # noqa: E402
 
 _document_routes.file_write_lock = NoFileWriteLock()
+
+
+# -- PAID-CALL HAZARD: the real Bedrock rerank client is unreachable from tests ---------
+# MEASURED (RV-122 on #106, 2026-09-23): `rerank()` is ON by default (`RERANK_ENABLED`
+# defaults True) and several suites drive a query route WITHOUT stubbing it -- notably
+# tests/test_main.py and tests/test_entitlement_routes.py, which stub nothing. A plain
+# `pytest` run therefore reached the REAL Bedrock Rerank endpoint. The reviewer only
+# found it because their container had the network blocked; on a host with working
+# egress the call goes out. With dummy credentials it is rejected (no inference, so no
+# charge), but "probably not billed" is not the standard: under the standing
+# no-paid-calls hold (MASTER-PLAN ...0L.md:854, :1232) a test suite must not be able to
+# call a paid provider AT ALL, and a suite that only stays free because the credentials
+# happen to be wrong is one real `.env` away from spending money.
+#
+# The block is on `_get_client`, NOT on `_rerank_sync`, and that placement is the point:
+# a test that stubs `_rerank_sync` never reaches the client, so the ~10 suites that
+# legitimately exercise rerank (fallbacks, score kinds, tie order) are untouched. Only
+# the path that would open a socket is closed.
+#
+# Failure mode is deliberately the SAME as before, minus the network: `rerank()` already
+# catches Exception and falls back to the pre-rerank order, so any test that used to see
+# an auth failure now sees this instead and behaves identically -- while a test that
+# genuinely needs rerank output must say so by stubbing `_rerank_sync`.
+import pytest  # noqa: E402
+
+from app.services import reranker as _reranker  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _block_the_real_rerank_provider(monkeypatch):
+    def _blocked(*_args, **_kwargs):
+        raise RuntimeError(
+            "hermetic tests: the real Bedrock rerank client is blocked. "
+            "Stub app.services.reranker._rerank_sync if this test needs rerank output."
+        )
+
+    monkeypatch.setattr(_reranker, "_get_client", _blocked, raising=False)
