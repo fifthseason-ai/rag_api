@@ -58,6 +58,7 @@ from app.models import (
     QueryRequestBody,
     QueryByEntityBody,
     QueryHit,
+    QueryDocument,
     DocumentResponse,
     QueryMultipleBody,
     DeleteDocumentsBody,
@@ -79,6 +80,16 @@ from app.services.file_write_lock import (
 )
 from app.services.hybrid_search import keyword_search, reciprocal_rank_fusion
 from app.services.reranker import rerank
+from app.services.score_kind import (
+    COSINE_DISTANCE,
+    DIRECTION,
+    RRF,
+    VECTOR_SEARCH_SCORE,
+    ScoredHits,
+    kind_of,
+)
+from app.services.vector_store.atlas_mongo_vector import AtlasMongoVector
+from langchain_community.vectorstores.pgvector import DistanceStrategy, PGVector
 from app.utils.document_loader import (
     get_loader,
     clean_text,
@@ -1096,6 +1107,22 @@ def _to_langchain_filter(filters: dict) -> dict:
     return lc_filter
 
 
+def _dense_kind(store) -> Optional[str]:
+    """What a DENSE search on this store returns as its score -- declared only when KNOWN.
+
+    pgvector returns a DISTANCE for its configured strategy; only COSINE is declared, because
+    the consumer's calibration (relevance = 1 - distance, its 0.45 floor) is cosine-shaped and
+    a euclidean or inner-product number is not that. Atlas returns MongoDB's
+    `vectorSearchScore`, a similarity. Anything else -- including every fake store a test
+    installs -- is UNKNOWN (None), never a guess.
+    """
+    if isinstance(store, AtlasMongoVector):
+        return VECTOR_SEARCH_SCORE
+    if isinstance(store, PGVector) and getattr(store, "_distance_strategy", None) == DistanceStrategy.COSINE:
+        return COSINE_DISTANCE
+    return None
+
+
 async def _hybrid_or_dense_search(
     request: Request,
     query: str,
@@ -1108,7 +1135,9 @@ async def _hybrid_or_dense_search(
 
     `filters` is a plain {key: value} dict (e.g. {"file_id": ..., "user_id": ...});
     list values are supported (matched with IN/ANY semantics). Returns a list of
-    (Document, score) tuples, ordered best-first.
+    (Document, score) tuples, ordered best-first, as a `ScoredHits` that declares what
+    the scores mean for the branch that ACTUALLY ran -- so the keyword-failure fallback
+    declares the dense kind, not RRF.
     """
     lc_filter = _to_langchain_filter(filters)
 
@@ -1121,7 +1150,7 @@ async def _hybrid_or_dense_search(
             embedding, k=k, filter=lc_filter
         )
         logger.info("[retrieve] dense-only returned %d documents", len(results))
-        return results
+        return ScoredHits(results, _dense_kind(vector_store))
 
     dense_coro = vector_store.asimilarity_search_with_score_by_vector(
         embedding,
@@ -1137,7 +1166,7 @@ async def _hybrid_or_dense_search(
         )
         results = await dense_coro
         logger.info("[retrieve] dense-only returned %d documents", len(results))
-        return results
+        return ScoredHits(results, _dense_kind(vector_store))
 
     logger.info(
         "[retrieve] mode=hybrid (dense + keyword) | k=%d | filters=%s | query=%r",
@@ -1161,7 +1190,8 @@ async def _hybrid_or_dense_search(
             "(dense=%d documents): %s",
             len(dense_results), keyword_results,
         )
-        return dense_results
+        # The configuration says hybrid; what RAN is dense. Declare what ran.
+        return ScoredHits(dense_results, _dense_kind(vector_store))
 
     # Intermediate results, before fusion.
     logger.info(
@@ -1182,7 +1212,7 @@ async def _hybrid_or_dense_search(
         "[retrieve] fused (RRF) -> %d documents returned (from %d dense + %d keyword)",
         len(fused), len(dense_results), len(keyword_results),
     )
-    return fused
+    return ScoredHits(fused, RRF)
 
 
 def _cohere_rerank_enabled(args: Optional[dict]) -> bool:
@@ -1236,11 +1266,44 @@ def _authorized_only(documents, entity_ids):
     token entitlement. The retrieval arms already filter by user_id; this is defence in
     depth, so a filter dropped from any arm (dense, keyword, fused, reranked) can never
     put another entity's row on the wire. On correct data it is the identity.
+
+    It rebuilds the list, so it carries the input's declared score kind across explicitly;
+    dropping a pair never changes what the remaining scores mean.
     """
+    return ScoredHits(
+        [
+            (doc, score)
+            for (doc, score) in documents
+            if doc.metadata.get("user_id") in entity_ids
+        ],
+        kind_of(documents),
+    )
+
+
+def _on_the_wire(documents) -> list:
+    """The `[document, score]` pairs a query route returns, each document declaring what the
+    score means (`score_kind`, `score_direction`; P06-5 contract addendum 2).
+
+    The ONE place every query route builds its response, so the three routes cannot disagree.
+    The pair shape and the number are unchanged; the two fields are additive and top-level on
+    the document, never inside `metadata`. An undeclared list (built outside the pipeline)
+    goes out as null/null: UNKNOWN, stated rather than guessed.
+    """
+    kind = kind_of(documents)
+    direction = DIRECTION.get(kind) if kind else None
     return [
-        (doc, score)
+        (
+            QueryDocument(
+                id=getattr(doc, "id", None),
+                metadata=getattr(doc, "metadata", None) or {},
+                page_content=doc.page_content,
+                type=getattr(doc, "type", None),
+                score_kind=kind,
+                score_direction=direction,
+            ),
+            score,
+        )
         for (doc, score) in documents
-        if doc.metadata.get("user_id") in entity_ids
     ]
 
 
@@ -1285,7 +1348,7 @@ async def query_embeddings_by_file_id(
                 body.file_id,
             )
 
-        return authorized_documents
+        return _on_the_wire(authorized_documents)
 
     except HTTPException as http_exc:
         logger.error(
@@ -1351,7 +1414,7 @@ async def query_embeddings_by_entity_id(
                 entity_id,
             )
 
-        return authorized_documents
+        return _on_the_wire(authorized_documents)
 
     except HTTPException as http_exc:
         logger.error(
@@ -3344,7 +3407,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
         if not documents:
             return []
 
-        return documents
+        return _on_the_wire(documents)
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in query_embeddings_by_file_ids | Status: %d | Detail: %s",

@@ -20,6 +20,7 @@ from app.config import (
     RERANK_MODEL,
     logger,
 )
+from app.services.score_kind import RERANK_RELEVANCE, ScoredHits, kind_of
 
 _client = None
 
@@ -69,20 +70,27 @@ async def rerank(
 ) -> List[Tuple[Document, float]]:
     """Rerank (Document, score) candidates, returning the top_n as
     (Document, relevance_score). Falls back to candidates[:top_n] on any failure
-    or when disabled."""
+    or when disabled.
+
+    The result declares what its scores mean (`app.services.score_kind`): a successful
+    rerank is `rerank_relevance`; EVERY fallback keeps the candidates' own kind, because
+    those numbers are still the candidates' numbers. A slice is a plain list, so each
+    fallback re-wraps it -- otherwise the kind would silently fall off on exactly the
+    paths (a failed Bedrock call, the default region) where it matters most."""
+    kind = kind_of(candidates)
     if not candidates:
-        return []
+        return ScoredHits([], kind)
 
     top_n = max(1, min(top_n, len(candidates)))
     if not RERANK_ENABLED:
-        return candidates[:top_n]
+        return ScoredHits(candidates[:top_n], kind)
 
     documents = [doc.page_content for doc, _score in candidates]
     try:
         results = await asyncio.to_thread(_rerank_sync, query, documents, top_n)
     except Exception as exc:
         logger.warning("[rerank] failed; using pre-rerank order: %s", exc)
-        return candidates[:top_n]
+        return ScoredHits(candidates[:top_n], kind)
 
     reranked = [
         (candidates[r["index"]][0], float(r.get("relevanceScore", 0.0)))
@@ -90,10 +98,10 @@ async def rerank(
         if 0 <= r.get("index", -1) < len(candidates)
     ]
     if not reranked:
-        return candidates[:top_n]
+        return ScoredHits(candidates[:top_n], kind)
 
     logger.info(
         "[rerank] cohere via bedrock (%s) | %d candidates -> top %d",
         RERANK_MODEL, len(candidates), len(reranked),
     )
-    return reranked
+    return ScoredHits(reranked, RERANK_RELEVANCE)
