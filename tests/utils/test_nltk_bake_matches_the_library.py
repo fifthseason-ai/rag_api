@@ -33,8 +33,23 @@ A skip would turn a version bump into a silent no-op, which is precisely the ine
 shape this card exists to remove -- the guard would go quiet at the exact moment the thing
 it guards became most likely to have moved.
 
-The pinned version is read from requirements.txt rather than hardcoded here, so bumping
+The pinned version is read from the requirements files rather than hardcoded here, so bumping
 the pin and bumping the installed library stay one action instead of two.
+
+THE ONE SKIP IN THIS FILE, AND WHY IT IS NOT THE SKIP FORBIDDEN ABOVE
+---------------------------------------------------------------------
+Two tests READ `.github/workflows/ci.yml`. `.dockerignore` excludes `.github/` from the shipped
+image on purpose, so inside the CI job that runs this suite IN the shipped runtime there is
+nothing to read -- found by that job (run 35859305310: FileNotFoundError at
+/app/.github/workflows/ci.yml) after the same tests passed on the bare runner and in a
+mounted-source container. Their subject is the REPOSITORY; the image is not the repository.
+
+A version mismatch is skipped-never because it makes the guard MEANINGLESS. An absent workflow
+inside the image means the SUBJECT is absent from the artifact by design. But "absent" is also
+what a DELETED or MOVED workflow looks like, and that is the inert-guard shape this file exists
+to remove -- so the skip is paired with `test_the_workflow_is_present_in_a_checkout`, which
+ASSERTS the file wherever a checkout is identifiable. Same shape as `needs_deploy_dir` in
+tests/test_build_provenance.py, for the same reason.
 """
 import ast
 import re
@@ -46,7 +61,20 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 
 DOCKERFILES = ("Dockerfile", "Dockerfile.lite")
+#: Two files because there are two images: `Dockerfile` installs the first, `Dockerfile.lite`
+#: (production) installs the second, and this suite runs INSIDE each of them on CI. Reading only
+#: `requirements.txt` -- which the first version of this file did -- compares the lite image's
+#: installed library against the OTHER image's pin.
+REQUIREMENTS = ("requirements.txt", "requirements.lite.txt")
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+
+#: Narrow on purpose -- see the module docstring. The file's absence is the ONLY condition, and
+#: the paired checkout test below is what stops that condition from meaning "deleted".
+needs_the_workflow = pytest.mark.skipif(
+    not WORKFLOW.is_file(),
+    reason=".github/ is excluded from the shipped image by .dockerignore, so a test that READS "
+    "the workflow has nothing to read here; its subject is the repository, not the runtime",
+)
 
 #: How many nltk resources unstructured==0.18.32 requests. A DELIBERATE INDEPENDENT anchor,
 #: not derived from the parse it checks -- deriving it from the same parse would make it
@@ -56,12 +84,28 @@ EXPECTED_RESOURCE_COUNT = 2
 
 
 def _pinned_unstructured() -> str:
-    """The pin, read from requirements.txt -- never hardcoded in this file."""
-    for line in (REPO / "requirements.txt").read_text(encoding="utf-8").splitlines():
-        m = re.match(r"^unstructured==(\S+)", line.strip())
-        if m:
-            return m.group(1)
-    pytest.fail("no `unstructured==` pin found in requirements.txt")
+    """The pin, read from BOTH requirements files -- never hardcoded in this file.
+
+    Both Dockerfiles bake the SAME resource names, which is only right while both install the
+    SAME library. Two files pinning two versions is therefore a defect in its own right -- the
+    bake for one image may be inert -- and it fails here, loudly, rather than being averaged
+    away by whichever file happened to be read.
+    """
+    pins = {}
+    for name in REQUIREMENTS:
+        for line in (REPO / name).read_text(encoding="utf-8").splitlines():
+            m = re.match(r"^unstructured==(\S+)", line.strip())
+            if m:
+                pins[name] = m.group(1)
+                break
+        else:
+            pytest.fail("no `unstructured==` pin found in %s" % name)
+    assert len(set(pins.values())) == 1, (
+        "the two images pin DIFFERENT unstructured versions: %r. Dockerfile and Dockerfile.lite "
+        "bake the same NLTK resource names, which is only correct while both install the same "
+        "library; whichever image runs the other version may have an inert bake." % pins
+    )
+    return pins[REQUIREMENTS[0]]
 
 
 def _requested_resources() -> set:
@@ -146,6 +190,26 @@ def test_both_dockerfiles_bake_exactly_what_the_library_requests(resources):
                 % (name, res, installed_version("unstructured"), baked.strip()))
 
 
+@pytest.mark.skipif(
+    not (REPO / ".git").exists(),
+    # EXISTS, not is_dir(): in a git WORKTREE `.git` is a FILE pointing at the real directory,
+    # and every lane in this program checks out into worktrees (tests/test_build_provenance.py
+    # caught the is_dir() version by running it).
+    reason="not a checkout -- cannot distinguish 'not shipped' from 'deleted' without git metadata",
+)
+def test_the_workflow_is_present_in_a_checkout():
+    """The other half of `needs_the_workflow`. In any tree identifiable as a checkout the
+    workflow must EXIST -- otherwise moving or deleting it would silently turn the two guards
+    below into two skips, in the bare-runner job where they are the only thing checking the
+    prefetch and the cache key."""
+    assert WORKFLOW.is_file(), (
+        "%s is missing from a checkout: the prefetch/cache-key and offline-guard tests below "
+        "would SKIP rather than FAIL, which is the inert-guard shape this file exists to remove"
+        % WORKFLOW.relative_to(REPO)
+    )
+
+
+@needs_the_workflow
 def test_the_ci_prefetch_and_cache_key_name_the_same_resources(resources):
     """CI prefetches and caches BY NAME. A rename that reached the Dockerfiles but not the
     cache key would restore a stale cache over a correct prefetch."""
@@ -169,6 +233,7 @@ def test_the_ci_prefetch_and_cache_key_name_the_same_resources(resources):
             "prefetch and the run passes for the wrong reason." % (key.group(1), res))
 
 
+@needs_the_workflow
 def test_the_offline_guard_is_still_in_the_workflow(resources):
     """AUTO_DOWNLOAD_NLTK=false is what makes a missing resource FAIL rather than silently
     reach nltk.org. Without it every assertion above still passes and the runtime
