@@ -1094,6 +1094,17 @@ class SafePyPDFLoader:
         return list(self.lazy_load())
 
 
+class _UnrepresentableBody(Exception):
+    """Private sentinel: the structured DOCX walk found a body (or w:sdtContent)
+    child carrying non-whitespace ``w:t`` text that it cannot faithfully place as
+    a unit. ``_structured_units`` catches this and returns None, so ``load()``
+    degrades to the flat ``Docx2txtLoader`` path -- a single ``locator_kind=none``
+    Document that loses NO text -- rather than returning a partial, lossy unit
+    list that would falsely report ``status: complete``. This is the load-bearing
+    fail-safe invariant: the structured walk never silently drops authored text.
+    """
+
+
 class SafeDocxLoader:
     """A block-indexed DOCX loader whose text box is read only ONCE.
 
@@ -1109,9 +1120,18 @@ class SafeDocxLoader:
 
     The structured walk reads only ``w:t`` text after AlternateContent dedupe, so a
     text box is counted once, and it reads the same header/footer parts docx2txt
-    reads, so nothing is dropped. A document whose structure the walk cannot read
-    (a zip/parse problem, or no text-bearing block found) degrades to the flat
-    ``Docx2txtLoader`` path below -- text still extracted, honestly ``none``.
+    reads, so nothing is dropped. A block-level ``w:sdt`` content control (a Word
+    template/form field wrapping paragraphs or a table in ``w:sdtContent``) is
+    descended into and its blocks are read as body units, in document order,
+    contiguous with the surrounding blocks -- content controls are common in real
+    templates, so their text is NOT skipped. The fail-safe invariant is stronger
+    than any single tag: if a direct body child the walk cannot faithfully place as
+    a unit still carries authored text, the WHOLE structured walk abandons to the
+    flat path (rather than emitting a partial list), so the walk never silently
+    drops authored text. A document whose structure the walk cannot read (a
+    zip/parse problem, no text-bearing block found, or such an unrepresentable
+    text-bearing child) degrades to the flat ``Docx2txtLoader`` path below -- text
+    still extracted, honestly ``locator_kind=none``, never a lossy partial.
 
     #85 dedupe, preserved on both paths:
     Word and PowerPoint write a text box as an ``<mc:AlternateContent>`` element
@@ -1274,19 +1294,48 @@ class SafeDocxLoader:
     @classmethod
     def _body_units(cls, root):
         """Yield the text of each text-bearing block of `w:body`, in document
-        order. Direct children only: a `w:p` is one unit (a heading and a body
-        paragraph are both single paragraph blocks); a `w:tbl` yields one unit per
-        cell, row-major. Nested content (a text box's paragraphs, a cell's runs) is
-        folded into its containing block via `_text_of`, so nothing is emitted
-        twice."""
+        order. A `w:p` is one unit (a heading and a body paragraph are both single
+        paragraph blocks); a `w:tbl` yields one unit per cell, row-major; a
+        block-level `w:sdt` content control is descended into (its `w:sdtContent`
+        blocks are read at body level, contiguous with the surrounding blocks).
+        Nested content (a text box's paragraphs, a cell's runs) is folded into its
+        containing block via `_text_of`, so nothing is emitted twice.
+
+        Fail-safe: any direct body child that is NEITHER a handled block (p / tbl /
+        sdt) NOR a text-free structural tag (w:sectPr, w:bookmarkStart/End,
+        w:proofErr, w:commentRangeStart/End, ... -- none carry `w:t`) but STILL
+        carries non-whitespace text raises `_UnrepresentableBody`, which aborts the
+        whole walk to the flat fallback rather than dropping that text. So the
+        structured walk never silently loses authored text."""
         body = root.find("{%s}body" % cls._W_NS)
         if body is None:
             return
+        yield from cls._block_units(list(body))
+
+    @classmethod
+    def _block_units(cls, children):
+        """Yield the text of each text-bearing block among `children` -- the direct
+        children of `w:body` or of a `w:sdtContent` -- in document order, applying
+        the same rules at every level so a content control's blocks are contiguous
+        with the blocks around it.
+
+        - `w:p`  -> one unit (empty paragraphs skipped).
+        - `w:tbl` -> one unit per cell, row-major (empty cells skipped).
+        - `w:sdt` -> descend into `w:sdtContent` and process its blocks HERE; a
+          nested `w:sdt` recurses through this same branch; an sdt with no
+          `w:sdtContent` holds no body text (its `w:sdtPr` carries no `w:t`) and is
+          skipped cleanly.
+        - anything else -> a text-free structural tag is skipped; but if it carries
+          non-whitespace `w:t` text this walk cannot place, raise
+          `_UnrepresentableBody` (Part B fail-safe) so `load()` degrades to the
+          flat path and keeps the text, instead of emitting a lossy partial list."""
         p_tag = "{%s}p" % cls._W_NS
         tbl_tag = "{%s}tbl" % cls._W_NS
         tr_tag = "{%s}tr" % cls._W_NS
         tc_tag = "{%s}tc" % cls._W_NS
-        for child in list(body):
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
             if child.tag == p_tag:
                 text = cls._text_of(child)
                 if text.strip():
@@ -1297,13 +1346,26 @@ class SafeDocxLoader:
                         text = cls._text_of(cell)
                         if text.strip():
                             yield text
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    continue  # no wrapped body content to place
+                yield from cls._block_units(list(content))
+            elif cls._has_text(child):
+                # A body/sdtContent child this walk does not handle still bears
+                # authored text -- fail closed to the flat fallback (see the class
+                # docstring's fail-safe invariant) rather than drop it.
+                raise _UnrepresentableBody(child.tag)
 
     def _structured_units(self):
         """The ordered text of each block of this .docx, or None to fall back to
-        flat extraction. Reads word/document.xml body in order, then every header
-        and footer part (the same parts docx2txt reads), deduping AlternateContent
-        so a text box is read once. Returns None on any zip/parse problem or when no
-        text-bearing unit is found, so the caller degrades to Docx2txtLoader."""
+        flat extraction. Reads word/document.xml body in order (descending into
+        block-level `w:sdt` content controls), then every header and footer part
+        (the same parts docx2txt reads), deduping AlternateContent so a text box is
+        read once. Returns None on any zip/parse problem, when no text-bearing unit
+        is found, OR when the body carries a text-bearing child the walk cannot
+        faithfully represent (`_UnrepresentableBody`) -- so the caller degrades to
+        Docx2txtLoader and no authored text is dropped, never a lossy partial."""
         try:
             with zipfile.ZipFile(self.filepath) as zin:
                 names = zin.namelist()
@@ -1326,6 +1388,15 @@ class SafeDocxLoader:
                 return units or None
         except zipfile.BadZipFile:
             return None  # let the flat fallback raise docx2txt's honest verdict
+        except _UnrepresentableBody as e:
+            # Fail-safe: an unrepresentable text-bearing body child. Degrade to the
+            # flat path so the text is kept (locator_kind none), never a lossy
+            # partial. This is expected for unusual documents, not an error.
+            logger.info(
+                "DOCX body child %s carries text the structured walk cannot place "
+                "for %s; degrading to flat extraction", e, self.filepath,
+            )
+            return None
         except Exception as e:  # noqa: BLE001 - never fatal; degrade to flat text
             logger.warning("DOCX structured walk failed for %s: %s", self.filepath, e)
             return None
