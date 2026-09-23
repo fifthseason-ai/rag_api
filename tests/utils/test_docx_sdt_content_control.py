@@ -31,6 +31,8 @@ shape; it is NOT proof against a real client original (Graph/Box consent
 outstanding, A3/A4).
 """
 
+import pytest
+
 from app.routes.document_routes import (
     _UNIT_LOCATOR_KEYS,
     _extraction_receipt,
@@ -353,4 +355,116 @@ def test_failsafe_fires_on_unanticipated_real_ooxml_customxml_SYNTHETIC(tmp_path
         for _kind, key in _UNIT_LOCATOR_KEYS:
             assert key not in meta, (
                 f"flat-fallback chunk carries per-unit locator key {key!r}: {meta}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 7. The descent/fail-safe invariant is UNIFORM below the body: at the ROW level
+#    (w:tbl children that are not w:tr) and the CELL level (w:tr children that are
+#    not w:tc). The row-level content-loss defect (a repeating-section content
+#    control wrapping w:tr) is the recurrence these pin. RED-FIRST vs head 671c10e.
+# ---------------------------------------------------------------------------
+
+
+def _row_sdt_table(plain_cell, a, b):
+    """A w:tbl with a plain row (one cell = `plain_cell`) followed by a REPEATING-
+    SECTION content control: <w:sdt><w:sdtContent><w:tr>..</w:tr></w:sdtContent></w:sdt>
+    as a child of w:tbl (a real, common Word feature)."""
+    plain_row = "<w:tr><w:tc>" + _para(plain_cell) + "</w:tc></w:tr>"
+    wrapped_row = _sdt("<w:tr><w:tc>" + _para(a) + "</w:tc><w:tc>" + _para(b) + "</w:tc></w:tr>")
+    return "<w:tbl>" + plain_row + wrapped_row + "</w:tbl>"
+
+
+def test_row_level_sdt_wrapped_row_cells_are_emitted_in_order_SYNTHETIC(tmp_path):
+    """RED-FIRST for the repeating-section (row-level sdt) content-loss defect.
+
+    PRE-FIX (head 671c10e): `_block_units` matched only DIRECT w:tr children of the
+    table via `findall`, so an sdt-wrapped row was never visited and its cells were
+    DROPPED, while the receipt still reported status complete -- exactly the
+    content-loss-as-success class, in a path the body-level fail-safe never reached.
+    This test FAILS there. POST-FIX: `_table_units` descends the row-level sdt and
+    emits its cells in authored order with contiguous block_index."""
+    B0, PLAIN, A, B = "BODY0", "PLAINROW", "SDTROW_A", "SDTROW_B"
+    authored = [B0, PLAIN, A, B]
+    body = _para(B0) + _row_sdt_table(PLAIN, A, B)
+    _path, loader = _load(tmp_path, "row_sdt.docx", body)
+
+    docs = loader.load()
+    assert [_which(d.page_content, authored) for d in docs] == authored
+    assert [d.metadata[_KEY] for d in docs] == list(range(len(authored)))
+
+
+@pytest.mark.parametrize("case", ["row_level_sdt", "cell_level_sdt"])
+def test_structured_path_loses_no_text_at_every_container_level_SYNTHETIC(tmp_path, case):
+    """INTEGRATION no-loss guarantee EXTENDED to the container levels the walk now
+    guards below the body: the ROW level (a repeating-section sdt wrapping w:tr) and
+    the CELL level (an sdt wrapping w:tc). The original no-loss test covered only
+    BODY-level sdt -- which is why the row-level defect slipped through. On the SAME
+    input, the structured path must not drop any token the flat path captures.
+
+    RED-FIRST (head 671c10e): for `row_level_sdt` the wrapped row's cells, and for
+    `cell_level_sdt` the wrapped cell's text, were absent from the structured output
+    while the flat path captured them -- both FAIL there."""
+    if case == "row_level_sdt":
+        tokens = ["B0", "PLAINCELL", "RSDT_A", "RSDT_B"]
+        body = _para("B0") + _row_sdt_table("PLAINCELL", "RSDT_A", "RSDT_B")
+    else:  # cell_level_sdt: an sdt wrapping a w:tc inside an ordinary row
+        wrapped_cell = _sdt("<w:tc>" + _para("CSDT_TEXT") + "</w:tc>")
+        row = "<w:tr><w:tc>" + _para("PLAINCELL") + "</w:tc>" + wrapped_cell + "</w:tr>"
+        tokens = ["B0", "PLAINCELL", "CSDT_TEXT"]
+        body = _para("B0") + "<w:tbl>" + row + "</w:tbl>"
+
+    _path, loader = _load(tmp_path, f"{case}.docx", body)
+    structured_text = "\n".join(d.page_content for d in loader.load())
+    flat_text = "\n".join(d.page_content for d in loader._flat_load())
+
+    for t in tokens:
+        assert t in flat_text, f"{case}: flat path did not capture {t!r}: {flat_text!r}"
+    for t in tokens:
+        assert t in structured_text, (
+            f"{case}: structured path DROPPED {t!r} the flat path captured: {structured_text!r}"
+        )
+
+
+@pytest.mark.parametrize("case", ["stray_p_under_tbl", "stray_elem_under_tr"])
+def test_failsafe_fires_on_unhandled_text_bearing_child_inside_a_table_SYNTHETIC(tmp_path, case):
+    """RED-FIRST for the fail-safe INSIDE a table. A text-bearing child that is
+    neither handled nor an sdt, at the table level (a stray w:p directly under
+    w:tbl) or the row level (a stray element directly under w:tr), must degrade the
+    WHOLE document to flat -- text preserved, locator_kind none, NO partial stamp --
+    never a silent drop.
+
+    PRE-FIX (head 671c10e): `findall(w:tr)` / `findall(w:tc)` skipped these, so the
+    text was dropped and `_structured_units` returned a NON-EMPTY partial -- FAILS
+    the `is None` assertion here. POST-FIX: `_table_units`/`_row_units` raise the
+    sentinel and the document degrades to flat."""
+    if case == "stray_p_under_tbl":
+        table = (
+            "<w:tbl><w:tr><w:tc>" + _para("CELLTXT") + "</w:tc></w:tr>"
+            "<w:p><w:r><w:t>STRAY_IN_TABLE</w:t></w:r></w:p></w:tbl>"
+        )
+        lost = "STRAY_IN_TABLE"
+    else:  # stray_elem_under_tr: a text-bearing element that is not w:tc/w:sdt
+        table = (
+            "<w:tbl><w:tr><w:tc>" + _para("CELLTXT") + "</w:tc>"
+            "<w:futureCell><w:p><w:r><w:t>STRAY_IN_ROW</w:t></w:r></w:p></w:futureCell>"
+            "</w:tr></w:tbl>"
+        )
+        lost = "STRAY_IN_ROW"
+    body = _para("BODY0") + table
+    _path, loader = _load(tmp_path, f"{case}.docx", body)
+
+    # The whole walk abandons rather than emit a partial that drops the stray text.
+    assert loader._structured_units() is None
+
+    docs = loader.load()
+    joined = "\n".join(d.page_content for d in docs)
+    assert lost in joined, f"{case}: fail-safe dropped the stray text: {joined!r}"
+    assert "BODY0" in joined and "CELLTXT" in joined
+    assert _extraction_receipt(docs)["locator_kind"] == "none"
+    for d in docs:
+        meta = d.metadata or {}
+        for _kind, key in _UNIT_LOCATOR_KEYS:
+            assert key not in meta, (
+                f"{case}: flat-fallback chunk carries locator key {key!r}: {meta}"
             )

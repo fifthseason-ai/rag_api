@@ -1308,12 +1308,16 @@ class SafeDocxLoader:
         Nested content (a text box's paragraphs, a cell's runs) is folded into its
         containing block via `_text_of`, so nothing is emitted twice.
 
-        Fail-safe: any direct body child that is NEITHER a handled block (p / tbl /
-        sdt) NOR a text-free structural tag (w:sectPr, w:bookmarkStart/End,
-        w:proofErr, w:commentRangeStart/End, ... -- none carry `w:t`) but STILL
-        carries non-whitespace text raises `_UnrepresentableBody`, which aborts the
-        whole walk to the flat fallback rather than dropping that text. So the
-        structured walk never silently loses authored text."""
+        Fail-safe (applied UNIFORMLY at every level the walk enumerates children by
+        tag -- body/sdtContent here, and the row/cell levels in
+        `_table_units`/`_row_units`): any child that is NEITHER a handled element NOR
+        a text-free structural tag (w:sectPr, w:bookmarkStart/End, w:proofErr,
+        w:commentRangeStart/End, w:tblPr, w:tblGrid, w:trPr, ... -- none carry
+        `w:t`) but STILL carries non-whitespace text raises `_UnrepresentableBody`,
+        which aborts the whole walk to the flat fallback rather than dropping that
+        text. A `w:sdt` is descended into at whichever level it appears (block, row
+        or cell), preserving both the text AND contiguous indices. So the structured
+        walk never silently loses authored text at ANY container level."""
         body = root.find("{%s}body" % cls._W_NS)
         if body is None:
             return
@@ -1327,7 +1331,8 @@ class SafeDocxLoader:
         with the blocks around it.
 
         - `w:p`  -> one unit (empty paragraphs skipped).
-        - `w:tbl` -> one unit per cell, row-major (empty cells skipped).
+        - `w:tbl` -> one unit per cell, row-major, via `_table_units` (which applies
+          this SAME descent/fail-safe invariant at the row and cell levels).
         - `w:sdt` -> descend into `w:sdtContent` and process its blocks HERE; a
           nested `w:sdt` recurses through this same branch; an sdt with no
           `w:sdtContent` holds no body text (its `w:sdtPr` carries no `w:t`) and is
@@ -1338,8 +1343,6 @@ class SafeDocxLoader:
           flat path and keeps the text, instead of emitting a lossy partial list."""
         p_tag = "{%s}p" % cls._W_NS
         tbl_tag = "{%s}tbl" % cls._W_NS
-        tr_tag = "{%s}tr" % cls._W_NS
-        tc_tag = "{%s}tc" % cls._W_NS
         sdt_tag = "{%s}sdt" % cls._W_NS
         sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
         for child in children:
@@ -1348,11 +1351,7 @@ class SafeDocxLoader:
                 if text.strip():
                     yield text
             elif child.tag == tbl_tag:
-                for row in child.findall(tr_tag):
-                    for cell in row.findall(tc_tag):
-                        text = cls._text_of(cell)
-                        if text.strip():
-                            yield text
+                yield from cls._table_units(list(child))
             elif child.tag == sdt_tag:
                 content = child.find(sdtcontent_tag)
                 if content is None:
@@ -1362,6 +1361,66 @@ class SafeDocxLoader:
                 # A body/sdtContent child this walk does not handle still bears
                 # authored text -- fail closed to the flat fallback (see the class
                 # docstring's fail-safe invariant) rather than drop it.
+                raise _UnrepresentableBody(child.tag)
+
+    @classmethod
+    def _table_units(cls, children):
+        """Yield one unit per cell for table-level `children` -- the children of a
+        `w:tbl`, OR of a `w:sdtContent` that wraps rows (a repeating-section content
+        control) -- in document order, row-major. The SAME descent/fail-safe
+        invariant as `_block_units`, applied at the ROW level:
+
+        - `w:tr`  -> its cells, via `_row_units`.
+        - `w:sdt` -> descend into `w:sdtContent` and process the rows it wraps HERE
+          (a repeating-section content control emits `w:tr` as sdt-wrapped children
+          of the `w:tbl`; a repeating-section ITEM nests another `w:sdt` per row --
+          handled by recursion). An sdt with no `w:sdtContent` is skipped cleanly.
+        - table-structural children (`w:tblPr`, `w:tblGrid`) carry no `w:t` and are
+          skipped; but ANY other child bearing non-whitespace text (e.g. a stray
+          `w:p` directly under `w:tbl`) raises `_UnrepresentableBody` so the whole
+          document degrades to flat rather than dropping it silently."""
+        tr_tag = "{%s}tr" % cls._W_NS
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
+            if child.tag == tr_tag:
+                yield from cls._row_units(list(child))
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    continue
+                yield from cls._table_units(list(content))
+            elif cls._has_text(child):
+                raise _UnrepresentableBody(child.tag)
+
+    @classmethod
+    def _row_units(cls, children):
+        """Yield one unit per cell for row-level `children` -- the children of a
+        `w:tr`, OR of a `w:sdtContent` that wraps cells -- in document order. The
+        SAME descent/fail-safe invariant, applied at the CELL level:
+
+        - `w:tc`  -> one unit; `_text_of(cell)` captures ALL descendant text
+          wholesale (see its docstring), so nothing BELOW cell level -- nested
+          tables, nested sdt, paragraphs -- can be lost. Empty cells are skipped.
+        - `w:sdt` -> descend into `w:sdtContent` and process the cells it wraps HERE
+          (a cell-level content control); nested sdt recurses. No `w:sdtContent` ->
+          skipped cleanly.
+        - row-structural children (`w:trPr`) carry no `w:t` and are skipped; ANY
+          other child bearing non-whitespace text raises `_UnrepresentableBody`."""
+        tc_tag = "{%s}tc" % cls._W_NS
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
+            if child.tag == tc_tag:
+                text = cls._text_of(child)
+                if text.strip():
+                    yield text
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    continue
+                yield from cls._row_units(list(content))
+            elif cls._has_text(child):
                 raise _UnrepresentableBody(child.tag)
 
     def _structured_units(self):

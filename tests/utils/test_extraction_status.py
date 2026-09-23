@@ -396,6 +396,17 @@ def test_embed_docx_reports_block_locator_family_units_and_writes(rec_client, tm
     assert body_idx == list(range(len(body_idx)))  # 0-based contiguous body blocks
     assert None in locs  # the unnamed header/footer unit is present
 
+    # ABSOLUTE anchor (reviewer Finding 2): make_docx has 6 body blocks -- 1 heading
+    # + 1 body paragraph + 4 table cells (2x2). Pinned as a literal at ONE site, the
+    # way the card fixture is anchored to 9 named tokens. This is what the derived
+    # `units_total == len(locs)` agreement above cannot catch on its own: a
+    # regression collapsing all body indices to a single value moves BOTH sides of
+    # that equality together and still passes, but would break this count.
+    # (units_total itself is NOT asserted as a literal -- ruling (c): the test must
+    # not name that number; it is pinned via the derived agreement + this body count
+    # + the None group, i.e. 6 body blocks + 1 unnamed header/footer unit.)
+    assert len(body_idx) == 6, f"expected 6 body blocks for make_docx, got {body_idx}"
+
     assert rec["units_extracted"] == rec["units_total"]  # every unit text-bearing
     assert rec["empty_locators"] == []
     assert len(rec_client.inserted_batches) >= 1  # rows written
