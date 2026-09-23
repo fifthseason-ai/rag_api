@@ -9,6 +9,18 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
 
+    # The exact NLTK data unstructured needs to partition markdown/text, fetched ONCE in a
+    # named step below and pinned here so the test phase never reaches nltk.org. This job runs
+    # on the BARE runner (no Docker image, so no baked NLTK_DATA), and `.md` -> UnstructuredMarkdownLoader
+    # -> unstructured.nlp.tokenize imports at test time. On unstructured==0.18.32 that module's
+    # download_nltk_packages() runs at import and, if the resources are absent, calls
+    # nltk.download(...) against nltk.org -- which made test_embed_markdown_reports_complete FAIL
+    # on run 35789487009 attempt 1 and PASS on attempt 2 with no code change: a green that
+    # depended on a third-party server being reachable. Prefetching + AUTO_DOWNLOAD_NLTK=false
+    # (in the test env) removes that dependency from the test phase.
+    env:
+      NLTK_DATA: ${{ github.workspace }}/.nltk_data
+
     # A real, disposable Postgres for the tests that exercise the per-file write lock
     # (tests/utils/test_simultaneous_write.py) and the entitlement query path against a
     # real vector store (tests/utils/test_empty_entitlement_query_path.py). Without it
@@ -56,6 +68,41 @@ jobs:
           pip install -r requirements.txt
           pip install -r test_requirements.txt
 
+      # Cache the NLTK data across runs so a green does not depend on nltk.org being up every
+      # time. The key is the RESOURCE NAMES this job fetches, not a lockfile: the names are what
+      # unstructured==0.18.32 requests (averaged_perceptron_tagger_eng + punkt_tab -- nltk 3.9.x
+      # renamed the tagger; the OLD `averaged_perceptron_tagger` does NOT satisfy the check), so
+      # the cache invalidates only when those names change. On a cache HIT the prefetch step is a
+      # no-op and the job is fully offline for NLTK. On a cold miss the prefetch step -- a named,
+      # retryable step -- is the ONLY place that touches nltk.org; the test phase never does.
+      - name: Cache NLTK data
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NLTK_DATA }}
+          key: ${{ runner.os }}-nltk-punkt_tab-averaged_perceptron_tagger_eng-v1
+
+      # Fetch the EXACT resources unstructured==0.18.32 needs for markdown/text partitioning,
+      # by the names its source requests (unstructured/nlp/tokenize.py:download_nltk_packages).
+      # Programmatic download_dir= is used rather than the `python -m nltk.downloader -d <dir>`
+      # CLI, because requirements.txt pins nltk==3.9.1 specifically to avoid the CVE-2026-33236
+      # patch that regressed that CLI flag. Idempotent: nltk.download is a no-op when the
+      # resource is already present (e.g. restored from cache).
+      - name: Prefetch NLTK data (no runtime download during tests)
+        run: |
+          python - <<'PY'
+          import os, nltk
+          d = os.environ["NLTK_DATA"]
+          os.makedirs(d, exist_ok=True)
+          for pkg in ("punkt_tab", "averaged_perceptron_tagger_eng"):
+              ok = nltk.download(pkg, download_dir=d, quiet=True)
+              assert ok, f"nltk.download failed for {pkg}"
+          # Prove the resources resolve OFFLINE exactly as unstructured checks them, so a
+          # broken prefetch fails HERE (named step) instead of silently mid-test.
+          nltk.find("tokenizers/punkt_tab")
+          nltk.find("taggers/averaged_perceptron_tagger_eng")
+          print("NLTK data present at", d, ":", sorted(os.listdir(d)))
+          PY
+
       - name: Run tests and generate report
         env:
           # Pin the embeddings provider to Bedrock (Amazon Titan), the provider
@@ -73,6 +120,11 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           RAG_TEST_PG_DSN: postgresql://postgres:ci@localhost:5432/postgres
           RAG_TEST_PG_REQUIRED: "1"
+          # Disable unstructured's runtime nltk.org download during the test phase. With the
+          # resources prefetched above, the markdown/text path resolves them locally; if they
+          # were somehow missing, the test now FAILS LOUDLY with a LookupError instead of
+          # silently reaching for nltk.org and turning an outage into a flaky red.
+          AUTO_DOWNLOAD_NLTK: "false"
         run: |
           pytest --maxfail=1 --disable-warnings --junitxml=test-results.xml
 
@@ -206,6 +258,29 @@ jobs:
           FROM rag-api-shipped:ci
           RUN pip install --no-cache-dir -r test_requirements.txt "psycopg[binary]"
           DOCKERFILE
+
+      # OFFLINE markdown ingestion -- the invariant this whole card exists for. `.md` ->
+      # UnstructuredMarkdownLoader -> unstructured.nlp.tokenize, which at runtime loads the NLTK
+      # POS tagger. `--network none` PROVES the shipped image carries the tagger it needs and does
+      # NOT reach nltk.org when a user ingests markdown in production. This is red-first by
+      # construction: it FAILS with LookupError('averaged_perceptron_tagger_eng') on the pre-fix
+      # image (which baked the OLD `averaged_perceptron_tagger` -- MEASURED inert, F-CI-NLTK control A)
+      # and PASSES once the Dockerfiles bake `averaged_perceptron_tagger_eng`. If the bake name ever
+      # regresses again, this reddens instead of silently depending on a third-party server.
+      - name: Prove markdown ingestion works OFFLINE (no nltk.org at runtime)
+        env:
+          JWT_SECRET: test_key
+          EMBEDDINGS_PROVIDER: bedrock
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          docker run --rm --network none \
+            -e JWT_SECRET -e EMBEDDINGS_PROVIDER \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+            rag-api-shipped-test:ci \
+            python -m pytest tests/utils/test_extraction_status.py::test_embed_markdown_reports_complete \
+                             -p no:cacheprovider --disable-warnings -q
 
       # A requirements grep or an import check is NOT proof of extraction. This runs
       # real synthetic workbooks through the real loader inside the shipped image:

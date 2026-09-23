@@ -3,6 +3,7 @@
 import os
 import codecs
 import csv
+import re
 import tempfile
 import zipfile
 
@@ -482,7 +483,10 @@ def get_loader(
         "application/markdown",
         "application/x-markdown",
     ]:
-        loader = UnstructuredMarkdownLoader(filepath)
+        # PACKET-1 E4: one Document per heading-introduced section, each carrying a
+        # 0-indexed `section_index` address (and a proposed display heading_path). Built
+        # on UnstructuredMarkdownLoader(mode="elements") -- same extractor, no new dep.
+        loader = HeadingMarkdownLoader(filepath)
     elif file_ext == "epub" or file_content_type == "application/epub+zip":
         loader = UnstructuredEPubLoader(filepath)
     elif file_ext in ["doc", "docx"] or file_content_type in [
@@ -491,7 +495,11 @@ def get_loader(
     ]:
         # A legacy binary .doc can never be read by docx2txt (see refuse_legacy_word_binary).
         refuse_legacy_word_binary(filepath, filename)
-        loader = Docx2txtLoader(filepath)
+        # SafeDocxLoader delegates to Docx2txtLoader but reads an mc:AlternateContent
+        # text box only ONCE (docx2txt otherwise emits both the Choice and the
+        # Fallback -- P06-3-EXTRACTION-QUALITY). A DOCX without AlternateContent is
+        # parsed from the original file, byte-untouched.
+        loader = SafeDocxLoader(filepath)
     elif file_ext in ["xls", "xlsx"] or file_content_type in [
         "application/vnd.ms-excel",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1089,6 +1097,522 @@ class SafePyPDFLoader:
         return list(self.lazy_load())
 
 
+class _UnrepresentableBody(Exception):
+    """Private sentinel: the structured DOCX walk found a body (or w:sdtContent)
+    child carrying non-whitespace ``w:t`` text that it cannot faithfully place as
+    a unit. ``_structured_units`` catches this and returns None, so ``load()``
+    degrades to the flat ``Docx2txtLoader`` path -- a single ``locator_kind=none``
+    Document that loses NO text -- rather than returning a partial, lossy unit
+    list that would falsely report ``status: complete``. This is the load-bearing
+    fail-safe invariant: the structured walk never silently drops authored text.
+    """
+
+
+class SafeDocxLoader:
+    """A block-indexed DOCX loader whose text box is read only ONCE.
+
+    Emits one ``Document`` per authored unit. BODY units -- heading / paragraph /
+    table cell (row-major), and blocks descended from a block-level ``w:sdt`` --
+    come in ``word/document.xml`` body order, each carrying the per-unit DOCX
+    locator (``_DOCX_LOCATOR_KEY``, a 0-based index CONTIGUOUS over the body blocks
+    actually emitted) so a citation can open the block it came from. HEADER/FOOTER
+    units carry NO locator key (absent, not None): that text has no position in the
+    body reading sequence and must never inherit a body block's index (ruling
+    2026-09-23), so it surfaces as unnamed unit(s) under the receipt's ``None``
+    unit. This is the source-location fidelity ``Docx2txtLoader`` cannot give: it
+    flattens the whole file to ONE ``locator_kind="none"`` Document (E1, on top of
+    the #85 dedupe below). The locator family's value/key are RULED
+    (``block`` / ``block_index``); see ``_DOCX_LOCATOR_KIND`` / ``_DOCX_LOCATOR_KEY``.
+
+    The structured walk reads only ``w:t`` text after AlternateContent dedupe, so a
+    text box is counted once, and it reads the same header/footer parts docx2txt
+    reads, so nothing is dropped. A block-level ``w:sdt`` content control (a Word
+    template/form field wrapping paragraphs or a table in ``w:sdtContent``) is
+    descended into and its blocks are read as body units, in document order,
+    contiguous with the surrounding blocks -- content controls are common in real
+    templates, so their text is NOT skipped. The fail-safe invariant is stronger
+    than any single tag: if a direct body child the walk cannot faithfully place as
+    a unit still carries authored text, the WHOLE structured walk abandons to the
+    flat path (rather than emitting a partial list), so the walk never silently
+    drops authored text. A document whose structure the walk cannot read (a
+    zip/parse problem, no text-bearing block found, or such an unrepresentable
+    text-bearing child) degrades to the flat ``Docx2txtLoader`` path below -- text
+    still extracted, honestly ``locator_kind=none``, never a lossy partial.
+
+    #85 dedupe, preserved on both paths:
+    Word and PowerPoint write a text box as an ``<mc:AlternateContent>`` element
+    carrying the SAME runs in two branches: a modern ``<mc:Choice>`` (DrawingML
+    ``wps:txbx``) and a legacy ``<mc:Fallback>`` (VML ``v:textbox``). A conformant
+    reader renders exactly one branch, chosen by the ``Requires`` attribute. But
+    ``docx2txt`` (0.9) flattens ``word/document.xml`` with ``ElementTree.iter()``,
+    which visits every descendant regardless of those rules, so BOTH branches'
+    ``<w:t>`` are emitted and the text box's content is stored TWICE -- retrieval
+    then double-counts it and a citation shows it twice (P06-3-EXTRACTION-QUALITY,
+    reproduced on 5816e133).
+
+    The fix keeps exactly one text-bearing branch per ``AlternateContent`` before
+    ``docx2txt`` sees the file, in a temp copy -- the same parse-a-copy pattern
+    `SheetExcelLoader._year_only_copy` uses. A DOCX with no ``AlternateContent`` is
+    parsed from the ORIGINAL file, byte-untouched, so ordinary documents behave
+    exactly as before. Provenance always names the uploaded file, never the copy.
+    """
+
+    _MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+    _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    #: The parts docx2txt actually reads: document body plus every header/footer.
+    _PART_RE = re.compile(r"^word/(document|header\d*|footer\d*)\.xml$")
+
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self._temp_filepath = None  # For compatibility with cleanup function
+
+    @classmethod
+    def _has_text(cls, element) -> bool:
+        return any(
+            (t.text or "").strip()
+            for t in element.iter("{%s}t" % cls._W_NS)
+        )
+
+    @classmethod
+    def _dedupe_alternate_content(cls, xml_bytes: bytes) -> Optional[bytes]:
+        """Return rewritten XML keeping one branch per AlternateContent, or None
+        if there was nothing to change (so the caller can skip the copy)."""
+        import xml.etree.ElementTree as ET
+
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return None  # not our problem to diagnose here; let docx2txt read it
+        ac_tag = "{%s}AlternateContent" % cls._MC_NS
+        choice_tag = "{%s}Choice" % cls._MC_NS
+        fallback_tag = "{%s}Fallback" % cls._MC_NS
+        changed = False
+        for ac in list(root.iter(ac_tag)):
+            branches = [c for c in list(ac) if c.tag in (choice_tag, fallback_tag)]
+            if len(branches) < 2:
+                continue
+            # Prefer the first branch that actually carries text; a Choice over a
+            # Fallback when both do (the Choice is the richer, modern content).
+            keep = next((b for b in branches if b.tag == choice_tag and cls._has_text(b)), None)
+            if keep is None:
+                keep = next((b for b in branches if cls._has_text(b)), None)
+            if keep is None:
+                keep = branches[0]  # nothing text-bearing; keep one, drop the rest
+            for b in branches:
+                if b is not keep:
+                    ac.remove(b)
+                    changed = True
+        if not changed:
+            return None
+        return ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+    def _deduped_copy(self, workdir: str) -> Optional[str]:
+        """Write a copy of the .docx with AlternateContent branches deduped, or
+        None when the file has none (parse the original) or cannot be opened as a
+        zip (let docx2txt raise the honest error)."""
+        try:
+            with zipfile.ZipFile(self.filepath) as zin:
+                names = zin.namelist()
+                targets = [n for n in names if self._PART_RE.match(n)]
+                rewritten = {}
+                for n in targets:
+                    data = zin.read(n)
+                    if b"AlternateContent" not in data:
+                        continue
+                    new = self._dedupe_alternate_content(data)
+                    if new is not None:
+                        rewritten[n] = new
+                if not rewritten:
+                    return None
+                copy_path = os.path.join(workdir, os.path.basename(self.filepath))
+                with zipfile.ZipFile(copy_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                    for item in zin.infolist():
+                        zout.writestr(item, rewritten.get(item.filename, zin.read(item.filename)))
+            stat = os.stat(self.filepath)
+            os.utime(copy_path, (stat.st_atime, stat.st_mtime))
+            return copy_path
+        except zipfile.BadZipFile:
+            return None  # docx2txt on the original raises the real verdict
+        except Exception as e:  # noqa: BLE001 - never fatal; parse the original
+            # DEGRADATION, stated so it is not mistaken for a guarantee: on any
+            # rewrite failure we fall back to parsing the ORIGINAL, which silently
+            # RE-INTRODUCES the AlternateContent double-count (only this warning is
+            # logged). The choice matches _year_only_copy -- double text beats a
+            # failed extraction -- but the dedupe is best-effort, not guaranteed.
+            logger.warning("DOCX AlternateContent dedupe failed for %s: %s", self.filepath, e)
+            return None
+
+    #: docx2txt reads these body parts; the structured walk reads the same set so
+    #: headers/footers are not dropped (test_parser_fitness header/footer rule).
+    _DOC_PART = "word/document.xml"
+    _HEADER_RE = re.compile(r"^word/header\d*\.xml$")
+    _FOOTER_RE = re.compile(r"^word/footer\d*\.xml$")
+
+    #: The DOCX per-unit locator family (E1), RULED by the FILES lead
+    #: (PACKET-1-LOCATOR-TUPLE-AGREEMENT-ADDENDUM 2026-09-23). The vocabulary names
+    #: a UNIT (page / slide / sheet / row), never the format, so the value is
+    #: `block`, not `docx`. `block_index` is an ADDRESS -- a 0-indexed, contiguous
+    #: position over the BODY-LEVEL blocks (each `w:p`, and each table cell) in
+    #: document order -- NOT a human-readable display label; no heading path or
+    #: title is carried (out of scope by ruling). Header/footer text has no position
+    #: in the body reading sequence, so it carries NO `block_index` key at all.
+    #: These two constants are the SINGLE SOURCE OF TRUTH: the loader stamps
+    #: `_DOCX_LOCATOR_KEY`, the `_UNIT_LOCATOR_KEYS` tuple line in document_routes.py
+    #: mirrors this exact pair (a test pins them equal), and every test reads these
+    #: constants.
+    _DOCX_LOCATOR_KIND = "block"        # RULED 2026-09-23 (FILES lead)
+    _DOCX_LOCATOR_KEY = "block_index"   # RULED 2026-09-23 (FILES lead)
+
+    @classmethod
+    def _text_of(cls, element) -> str:
+        """Concatenate the run text under `element` in document order.
+
+        `iter()` visits descendants in document order, so runs come out in the
+        order they were authored; `w:tab`/`w:br`/`w:cr` become whitespace so
+        adjacent runs do not merge into one word. This reads ONLY `w:t` text --
+        after AlternateContent dedupe there is exactly one text-bearing branch,
+        so a text box's runs are counted once."""
+        t_tag = "{%s}t" % cls._W_NS
+        tab_tag = "{%s}tab" % cls._W_NS
+        br_tag = "{%s}br" % cls._W_NS
+        cr_tag = "{%s}cr" % cls._W_NS
+        parts = []
+        for node in element.iter():
+            if node.tag == t_tag:
+                parts.append(node.text or "")
+            elif node.tag == tab_tag:
+                parts.append("\t")
+            elif node.tag in (br_tag, cr_tag):
+                parts.append("\n")
+        return "".join(parts)
+
+    @classmethod
+    def _deduped_part(cls, xml_bytes: bytes):
+        """Parse `xml_bytes`, deduping AlternateContent first, and return the root
+        Element -- or None if it cannot be parsed."""
+        import xml.etree.ElementTree as ET
+
+        if b"AlternateContent" in xml_bytes:
+            rewritten = cls._dedupe_alternate_content(xml_bytes)
+            if rewritten is not None:
+                xml_bytes = rewritten
+        try:
+            return ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return None
+
+    @classmethod
+    def _body_units(cls, root):
+        """Yield the text of each text-bearing block of `w:body`, in document
+        order. A `w:p` is one unit (a heading and a body paragraph are both single
+        paragraph blocks); a `w:tbl` yields one unit per cell, row-major; a
+        block-level `w:sdt` content control is descended into (its `w:sdtContent`
+        blocks are read at body level, contiguous with the surrounding blocks).
+        Nested content (a text box's paragraphs, a cell's runs) is folded into its
+        containing block via `_text_of`, so nothing is emitted twice.
+
+        Fail-safe (applied UNIFORMLY at every level the walk enumerates children by
+        tag -- body/sdtContent here, and the row/cell levels in
+        `_table_units`/`_row_units`): any child that is NEITHER a handled element NOR
+        a text-free structural tag (w:sectPr, w:bookmarkStart/End, w:proofErr,
+        w:commentRangeStart/End, w:tblPr, w:tblGrid, w:trPr, ... -- none carry
+        `w:t`) but STILL carries non-whitespace text raises `_UnrepresentableBody`,
+        which aborts the whole walk to the flat fallback rather than dropping that
+        text. A `w:sdt` is descended into at whichever level it appears (block, row
+        or cell), preserving both the text AND contiguous indices. So the structured
+        walk never silently loses authored text at ANY container level."""
+        body = root.find("{%s}body" % cls._W_NS)
+        if body is None:
+            return
+        yield from cls._block_units(list(body))
+
+    @classmethod
+    def _block_units(cls, children):
+        """Yield the text of each text-bearing block among `children` -- the direct
+        children of `w:body` or of a `w:sdtContent` -- in document order, applying
+        the same rules at every level so a content control's blocks are contiguous
+        with the blocks around it.
+
+        - `w:p`  -> one unit (empty paragraphs skipped).
+        - `w:tbl` -> one unit per cell, row-major, via `_table_units` (which applies
+          this SAME descent/fail-safe invariant at the row and cell levels).
+        - `w:sdt` -> descend into `w:sdtContent` and process its blocks HERE; a
+          nested `w:sdt` recurses through this same branch. An sdt with NO
+          `w:sdtContent` wrapper is skipped ONLY when it is genuinely text-free; if
+          such a control still bears `w:t` text (hand-edited / third-party markup),
+          it raises `_UnrepresentableBody` so the text is not silently dropped.
+        - anything else -> a text-free structural tag is skipped; but if it carries
+          non-whitespace `w:t` text this walk cannot place, raise
+          `_UnrepresentableBody` (Part B fail-safe) so `load()` degrades to the
+          flat path and keeps the text, instead of emitting a lossy partial list."""
+        p_tag = "{%s}p" % cls._W_NS
+        tbl_tag = "{%s}tbl" % cls._W_NS
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
+            if child.tag == p_tag:
+                text = cls._text_of(child)
+                if text.strip():
+                    yield text
+            elif child.tag == tbl_tag:
+                yield from cls._table_units(list(child))
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    # A content control with NO sdtContent wrapper: if it still
+                    # bears authored text (hand-edited / third-party markup), fail
+                    # closed to the flat path so that text is not silently dropped
+                    # -- the same invariant the sibling branch enforces. A genuinely
+                    # empty control (no w:t) skips cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
+                    continue
+                yield from cls._block_units(list(content))
+            elif cls._has_text(child):
+                # A body/sdtContent child this walk does not handle still bears
+                # authored text -- fail closed to the flat fallback (see the class
+                # docstring's fail-safe invariant) rather than drop it.
+                raise _UnrepresentableBody(child.tag)
+
+    @classmethod
+    def _table_units(cls, children):
+        """Yield one unit per cell for table-level `children` -- the children of a
+        `w:tbl`, OR of a `w:sdtContent` that wraps rows (a repeating-section content
+        control) -- in document order, row-major. The SAME descent/fail-safe
+        invariant as `_block_units`, applied at the ROW level:
+
+        - `w:tr`  -> its cells, via `_row_units`.
+        - `w:sdt` -> descend into `w:sdtContent` and process the rows it wraps HERE
+          (a repeating-section content control emits `w:tr` as sdt-wrapped children
+          of the `w:tbl`; a repeating-section ITEM nests another `w:sdt` per row --
+          handled by recursion). An sdt with no `w:sdtContent` wrapper is skipped
+          only when text-free; if it bears `w:t` text it raises `_UnrepresentableBody`.
+        - table-structural children (`w:tblPr`, `w:tblGrid`) carry no `w:t` and are
+          skipped; but ANY other child bearing non-whitespace text (e.g. a stray
+          `w:p` directly under `w:tbl`) raises `_UnrepresentableBody` so the whole
+          document degrades to flat rather than dropping it silently."""
+        tr_tag = "{%s}tr" % cls._W_NS
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
+            if child.tag == tr_tag:
+                yield from cls._row_units(list(child))
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    # sdt with no sdtContent wrapper at the ROW level: fail closed if
+                    # it bears text (do not silently drop), else skip a genuinely
+                    # empty control cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
+                    continue
+                yield from cls._table_units(list(content))
+            elif cls._has_text(child):
+                raise _UnrepresentableBody(child.tag)
+
+    @classmethod
+    def _row_units(cls, children):
+        """Yield one unit per cell for row-level `children` -- the children of a
+        `w:tr`, OR of a `w:sdtContent` that wraps cells -- in document order. The
+        SAME descent/fail-safe invariant, applied at the CELL level:
+
+        - `w:tc`  -> one unit; `_text_of(cell)` captures ALL descendant text
+          wholesale (see its docstring), so nothing BELOW cell level -- nested
+          tables, nested sdt, paragraphs -- can be lost. Empty cells are skipped.
+        - `w:sdt` -> descend into `w:sdtContent` and process the cells it wraps HERE
+          (a cell-level content control); nested sdt recurses. An sdt with no
+          `w:sdtContent` wrapper is skipped only when text-free; if it bears `w:t`
+          text it raises `_UnrepresentableBody`.
+        - row-structural children (`w:trPr`) carry no `w:t` and are skipped; ANY
+          other child bearing non-whitespace text raises `_UnrepresentableBody`."""
+        tc_tag = "{%s}tc" % cls._W_NS
+        sdt_tag = "{%s}sdt" % cls._W_NS
+        sdtcontent_tag = "{%s}sdtContent" % cls._W_NS
+        for child in children:
+            if child.tag == tc_tag:
+                text = cls._text_of(child)
+                if text.strip():
+                    yield text
+            elif child.tag == sdt_tag:
+                content = child.find(sdtcontent_tag)
+                if content is None:
+                    # sdt with no sdtContent wrapper at the CELL level: fail closed if
+                    # it bears text (do not silently drop), else skip a genuinely
+                    # empty control cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
+                    continue
+                yield from cls._row_units(list(content))
+            elif cls._has_text(child):
+                raise _UnrepresentableBody(child.tag)
+
+    def _structured_units(self):
+        """Return `(body_units, aux_units)` -- the ordered text of the BODY blocks
+        and, separately, the header/footer text -- or None to fall back to flat
+        extraction.
+
+        `body_units` is the document-order text of each body-level block (each
+        `w:p`, each table cell, and blocks descended from a block-level `w:sdt`
+        content control). These are the units that receive a `block_index`.
+        `aux_units` is the text of every header and footer part (the same parts
+        docx2txt reads), deduping AlternateContent so a text box is read once.
+        Header/footer text has NO position in the body reading sequence, so it is
+        returned SEPARATELY and stamped with NO locator key by `load()` (ruling
+        2026-09-23): it must never inherit a body block's index.
+
+        Returns None -- so the caller degrades to `Docx2txtLoader` and no authored
+        text is dropped, never a lossy partial -- on any zip/parse problem, when
+        the body carries a text-bearing child the walk cannot faithfully represent
+        (`_UnrepresentableBody`), OR when there is NO body-level block to cite (an
+        empty body, or a document whose only text is in header/footer parts). In
+        that last case the flat path keeps the header/footer text honestly at
+        `locator_kind=none`. NOTE (measured limitation, receipt contract): a
+        no-body document and a fail-safe degradation BOTH report `locator_kind=none`
+        and are not distinguished at the document level on the current wire."""
+        try:
+            with zipfile.ZipFile(self.filepath) as zin:
+                names = zin.namelist()
+                if self._DOC_PART not in names:
+                    return None
+                doc_root = self._deduped_part(zin.read(self._DOC_PART))
+                if doc_root is None:
+                    return None
+                body_units = list(self._body_units(doc_root))
+                # No citable body block: degrade to flat so header/footer text is
+                # still kept (locator_kind none), rather than emit only unnamed
+                # units. block_index exists to cite body position; there is none.
+                if not body_units:
+                    return None
+                # Headers then footers, each in stable filename order, so the same
+                # text docx2txt appends is still extracted (never silently dropped).
+                # These are AUX units: emitted WITHOUT a block_index by load().
+                aux_units = []
+                for part_re in (self._HEADER_RE, self._FOOTER_RE):
+                    for name in sorted(n for n in names if part_re.match(n)):
+                        part_root = self._deduped_part(zin.read(name))
+                        if part_root is None:
+                            # A header/footer part present but UNPARSEABLE. Do not
+                            # skip it and report `complete` on the body units: the
+                            # flat reader (docx2txt) reads this same part and raises
+                            # a ParseError, so skipping here would turn that honest
+                            # failure into a fake success. Degrade to the flat path
+                            # (symmetric with the doc_root handling above) so the
+                            # real verdict surfaces. Well-formed parts never hit this.
+                            return None
+                        text = self._text_of(part_root)
+                        if text.strip():
+                            aux_units.append(text)
+                return body_units, aux_units
+        except zipfile.BadZipFile:
+            return None  # let the flat fallback raise docx2txt's honest verdict
+        except _UnrepresentableBody as e:
+            # Fail-safe: an unrepresentable text-bearing body child. Degrade to the
+            # flat path so the text is kept (locator_kind none), never a lossy
+            # partial. This is expected for unusual documents, not an error.
+            logger.info(
+                "DOCX body child %s carries text the structured walk cannot place "
+                "for %s; degrading to flat extraction", e, self.filepath,
+            )
+            return None
+        except Exception as e:  # noqa: BLE001 - never fatal; degrade to flat text
+            logger.warning("DOCX structured walk failed for %s: %s", self.filepath, e)
+            return None
+
+    def _flat_load(self) -> List[Document]:
+        """#85 behaviour: one flattened Document, AlternateContent deduped. The
+        degradation path -- a .docx whose structure the walk cannot read still
+        extracts its text (with locator_kind `none`, honestly), never nothing."""
+        with tempfile.TemporaryDirectory() as workdir:
+            parse_path = self._deduped_copy(workdir) or self.filepath
+            documents = Docx2txtLoader(parse_path).load()
+            if parse_path != self.filepath:
+                # Provenance names the uploaded file, never the working copy.
+                for doc in documents:
+                    doc.metadata["source"] = self.filepath
+        return documents
+
+    def load(self) -> List[Document]:
+        """Emit one Document per authored unit, in document order.
+
+        BODY units (each paragraph, each table cell, blocks descended from a
+        block-level `w:sdt`) each carry the DOCX per-unit locator
+        (`_DOCX_LOCATOR_KEY` = a 0-based index, CONTIGUOUS over the body blocks
+        actually emitted, so a citation can open the block it came from).
+
+        HEADER/FOOTER units carry NO locator key at all -- the key is ABSENT, not
+        None -- because header/footer text has no position in the body reading
+        sequence and must never inherit a body block's index (ruling 2026-09-23).
+        They surface in the receipt as unnamed unit(s), grouped under the receipt's
+        `None` unit. So a chunk with no `block_index` in a `locator_kind=block`
+        document is a header/footer unit (absent by nature), NOT lost content.
+
+        A text box is read once (the #85 AlternateContent dedupe is preserved).
+        `source` is always the uploaded file. No cmetadata key beyond the locator
+        family is stamped. Falls back to flat extraction (one `locator_kind=none`
+        Document) when the document cannot be structured OR has no body block to
+        cite."""
+        structured = self._structured_units()
+        if not structured:
+            return self._flat_load()
+        body_units, aux_units = structured
+        docs = [
+            Document(
+                page_content=text,
+                metadata={
+                    "source": self.filepath,
+                    self._DOCX_LOCATOR_KEY: block_index,
+                },
+            )
+            for block_index, text in enumerate(body_units)
+        ]
+        # Header/footer text: emitted WITHOUT the locator key (absent, not None).
+        docs.extend(
+            Document(page_content=text, metadata={"source": self.filepath})
+            for text in aux_units
+        )
+        return docs
+
+    def lazy_load(self) -> Iterator[Document]:
+        yield from self.load()
+
+
+# --- XLSX finer-than-sheet precision fields (card E3, OPTION 3) -------------------
+#
+# Single-source. These name the finer-than-sheet precision XLSX gained in card E3,
+# defined ONCE here so the loader stamp and the tests never drift apart.
+#
+# `CELL_RANGE_LOCATOR_KEY` = the cmetadata key each sheet chunk carries; its value is
+#     the sheet-qualified occupied extent (e.g. "Revenue!A1:C5") -- a UNIT-named
+#     precision (a range of cells), never the format.
+# `CELL_RANGE_LOCATOR_KIND` = the value a `locator_kind` would take IF this were ever
+#     promoted to a `_UNIT_LOCATOR_KEYS` family. It is defined only so a future
+#     promotion has one source of truth; it is NOT used today.
+#
+# OPTION 3 RULING (FILES lead, 2026-09-23, PACKET-1-E3-XLSX-PLACEMENT-RULING): these
+# ship as ADDITIVE, OPTIONAL cmetadata fields and are DELIBERATELY NOT registered in
+# `_UNIT_LOCATOR_KEYS`. XLSX `locator_kind` stays `sheet` -- a stable TYPE TAG naming
+# which family the citable position belongs to; precision lives in the VALUE
+# (`cell_range`), which Core reads directly, never in the tag. Registering `cell_range`
+# is a deliberate future act that must trip CONTROL A in
+# test_receipt_locator_agrees_with_chunks.py; the non-promotion is pinned executably by
+# test_xlsx_cell_locator.py. ABSENCE of `cell_range` means UNKNOWN extent, never
+# "no cells" (see the CONTRACT DELTA in the return record for P06-5 §2).
+CELL_RANGE_LOCATOR_KEY = "cell_range"
+CELL_RANGE_LOCATOR_KIND = "cell_range"
+
+# Additive optional structural fields carried alongside cell_range (declared in the
+# CONTRACT DELTA for P06-5 §2). Not locator families. Absence means UNKNOWN.
+#
+# BEST-EFFORT: `_detect_header_row` picks the first row with >=2 non-empty, not-all-
+# identical cells. It cannot tell a real column header from a two-column key/value
+# preamble (e.g. row 1 ["Prepared by","John Smith"] above a real header at row 3), so
+# it can stamp a CONFIDENTLY WRONG header/header_row. A consumer must treat these as
+# hints, never authoritative; precision lives in cell_range. Absence is still honest
+# UNKNOWN (the field is omitted, never `header: []`).
+XLSX_HEADER_KEY = "header"          # the detected header row's cell values (list[str])
+XLSX_HEADER_ROW_KEY = "header_row"  # 1-indexed worksheet row number of the header
+
+
 class SheetExcelLoader:
     """Load a workbook as sheet-cited Documents, with honest terminal verdicts.
 
@@ -1282,14 +1806,27 @@ class SheetExcelLoader:
 
     def _annotate(self, documents: List[Document]) -> List[Document]:
         per_sheet, scan_status = self._uncached_formulas()
+        sheet_locators = self._sheet_locators()
         for doc in documents:
             doc.metadata["formula_scan"] = scan_status
-            cells = per_sheet.get(doc.metadata.get("page_name"), [])
+            page_name = doc.metadata.get("page_name")
+            cells = per_sheet.get(page_name, [])
             if cells:
                 doc.metadata["formula_uncached"] = len(cells)
                 doc.metadata["formula_uncached_cells"] = cells[
                     : self._MAX_REPORTED_CELLS
                 ]
+            # Finer-than-sheet locator + header, keyed by the same sheet name the
+            # element already carries. Every element of a sheet gets the same
+            # cell_range (the sheet's occupied extent), so grouping by cell_range
+            # yields one unit per sheet -- the same count as grouping by sheet.
+            loc = sheet_locators.get(page_name)
+            if loc:
+                if loc.get(CELL_RANGE_LOCATOR_KEY) is not None:
+                    doc.metadata[CELL_RANGE_LOCATOR_KEY] = loc[CELL_RANGE_LOCATOR_KEY]
+                if loc.get(XLSX_HEADER_ROW_KEY) is not None:
+                    doc.metadata[XLSX_HEADER_ROW_KEY] = loc[XLSX_HEADER_ROW_KEY]
+                    doc.metadata[XLSX_HEADER_KEY] = loc[XLSX_HEADER_KEY]
         return documents
 
     # -- year-only date cells -----------------------------------------------
@@ -1309,6 +1846,27 @@ class SheetExcelLoader:
             fmt = fmt[fmt.index("]") + 1 :]
         return fmt.strip().lower() in ("yy", "yyy", "yyyy")
 
+    @staticmethod
+    def _reduction_discards_a_date(value) -> bool:
+        """True when rewriting this value to its year would throw information away.
+
+        A cell holding 2016-01-01 behind a `yyyy` format carries nothing beyond the
+        year, so the rewrite discards nothing and must not be reported as a loss. A
+        cell holding 2016-06-30 does: a fiscal year end lives in the month and day,
+        and after the rewrite a mid-year reporter is indistinguishable from a
+        calendar-year one.
+
+        Stated as a fact about the VALUE, not about authorial intent. rag_api cannot
+        know whether the author typed a year or a date; it can know whether anything
+        other than the January-the-first default was present. That is the honest
+        claim, and it is the one available here -- the value still has its month and
+        day at this point in the rewrite.
+        """
+        if (getattr(value, "month", 1), getattr(value, "day", 1)) != (1, 1):
+            return True
+        # A time component is information too: 2016-01-01 09:30 is not a bare year.
+        return any(getattr(value, unit, 0) for unit in ("hour", "minute", "second"))
+
     def _year_only_copy(self, workdir: str) -> Optional[str]:
         """Return a copy of the workbook with year-only date cells as the year.
 
@@ -1321,6 +1879,12 @@ class SheetExcelLoader:
         workbook is parsed from the original file, untouched. Bounded like the
         formula scan; past a bound (or on any failure) the original is parsed.
         """
+        # Reset before every early return below, so `load()` can never read a count
+        # left by a previous call. A stale count is the disclosure being wrong in the
+        # quietest possible way.
+        self._year_normalised = 0
+        self._year_reduced = []
+        self._year_preserved = {}
         if not self._head(4).startswith(self._ZIP_MAGIC):
             return None
         try:
@@ -1355,11 +1919,35 @@ class SheetExcelLoader:
             for ws in wb.worksheets:
                 for row in ws.iter_rows():
                     for cell in row:
+                        # getattr, not `cell.is_date`: a MergedCell (a merged range's
+                        # non-anchor cell) has no `is_date`, so a workbook that is both
+                        # merged AND holds a year-only cell would otherwise crash this
+                        # pass and silently lose the year conversion.
                         if (
-                            cell.is_date
+                            getattr(cell, "is_date", False)
                             and hasattr(cell.value, "year")
                             and self._is_year_only_format(cell.number_format)
                         ):
+                            # PRESERVE FIRST, THEN RENDER (Richard, 2026-09-23). The
+                            # extracted TEXT shows what the author sees -- `2016`,
+                            # never an invented `2016-01-01` -- while the full
+                            # underlying date is kept on the record.
+                            #
+                            # The earlier remedy was to keep the reduction and
+                            # DISCLOSE it. That was wrong: year-only is a
+                            # PRESENTATION choice and it was being resolved at
+                            # INGESTION, which is where the data dies. A disclosure
+                            # can tell a reader that month and day were destroyed; it
+                            # cannot give them back, and it converts a fixable defect
+                            # into a permanent caveat.
+                            ref = "%s!%s" % (ws.title, cell.coordinate)
+                            self._year_preserved[ref] = cell.value.isoformat()
+                            if self._reduction_discards_a_date(cell.value):
+                                # Still recorded, but its meaning has changed: this
+                                # cell's full date now lives ONLY in metadata, not in
+                                # the text. It is a pointer, no longer an epitaph.
+                                self._year_reduced.append(ref)
+                            self._year_normalised += 1
                             cell.value = cell.value.year
                             cell.number_format = "0"
             copy_path = os.path.join(workdir, os.path.basename(self.filepath))
@@ -1371,12 +1959,170 @@ class SheetExcelLoader:
             logger.warning("Year-only date pass failed for %s: %s", self.filepath, e)
             return None
 
+    # -- merged cells -------------------------------------------------------
+
+    def _resolve_merged_cells(self, src_path: str, workdir: str) -> Optional[str]:
+        """Return a copy of ``src_path`` with every merged range unmerged and its
+        anchor value FILLED across the range, or ``None`` to parse ``src_path`` as is.
+
+        A merged cell stores its value only in the top-left cell; every other cell of
+        the range reads back empty. MEASURED against the pinned UnstructuredExcelLoader
+        (mode="elements"): it does NOT propagate a merged value across its span -- it
+        emits the value once on the anchor row and renders the continuation rows as
+        SEPARATE elements with the merged cell empty. So a value merged down a column
+        (a category label spanning several rows) is LOST for every continuation row,
+        and because those rows become their own chunks, the STORED chunk that cites a
+        continuation row has no idea which category it belongs to. Concretely, a
+        vertical "Hardware" merged over three rows extracts as
+        ``'... Hardware Widget | Gadget | Gizmo'`` (once) at base, and as
+        ``'... Hardware Widget Hardware Gadget Hardware Gizmo'`` (per row) after this
+        fill. Unmerging and writing the anchor value into every cell of the range puts
+        the value on every spanned row so each row -- and each resulting chunk -- keeps
+        it. This is the observable difference pinned by
+        test_xlsx_cell_locator.py::test_SYNTHETIC_merged_label_reaches_every_row_no_year.
+
+        ``None`` is returned (parse the source untouched) when there is nothing to
+        do (no merged ranges) or the workbook cannot be opened by openpyxl -- never
+        fatal, exactly like the year-only pass. Bounded the same way as the other
+        diagnostic passes so a hostile upload cannot make this expensive.
+        """
+        if not self._head(4).startswith(self._ZIP_MAGIC):
+            return None
+        try:
+            if os.path.getsize(src_path) > self._MAX_SCAN_BYTES:
+                return None
+            from openpyxl import load_workbook
+
+            wb = load_workbook(src_path, data_only=True)
+            try:
+                found = False
+                for ws in wb.worksheets:
+                    # `ws.merged_cells.ranges` mutates as we unmerge, so snapshot it.
+                    for rng in list(ws.merged_cells.ranges):
+                        anchor = ws.cell(row=rng.min_row, column=rng.min_col).value
+                        ws.unmerge_cells(str(rng))
+                        if anchor is None:
+                            continue
+                        found = True
+                        for row in range(rng.min_row, rng.max_row + 1):
+                            for col in range(rng.min_col, rng.max_col + 1):
+                                ws.cell(row=row, column=col).value = anchor
+                if not found:
+                    return None
+                copy_path = os.path.join(workdir, os.path.basename(src_path))
+                wb.save(copy_path)
+            finally:
+                wb.close()
+            stat = os.stat(src_path)
+            os.utime(copy_path, (stat.st_atime, stat.st_mtime))
+            return copy_path
+        except Exception as e:  # noqa: BLE001 - never fatal; parse the source as is
+            logger.warning("Merged-cell resolution failed for %s: %s", src_path, e)
+            return None
+
+    # -- finer-than-sheet locators + header row -----------------------------
+
+    #: How far down a sheet the header search looks. A column header lives at the
+    #: top; scanning the whole sheet for it would be both pointless and unbounded.
+    _HEADER_SEARCH_ROWS = 20
+
+    @staticmethod
+    def _detect_header_row(rows):
+        """Return ``(row_1indexed, [str values])`` for the header, or ``(None, None)``.
+
+        ``rows`` is a list of ``(row_number, [cell values])`` pairs. The header is
+        the first row carrying at least two non-empty cells whose non-empty values
+        are NOT all identical. That rule skips a merged title row on purpose: read
+        from the ORIGINAL workbook a merged title's value sits only in the anchor
+        cell (one non-empty cell), and after merged-cell resolution every cell holds
+        the same value (all identical) -- either way it is not mistaken for a header.
+        """
+        for row_number, values in rows:
+            non_empty = [v for v in values if v is not None and str(v).strip() != ""]
+            if len(non_empty) >= 2 and len(set(map(str, non_empty))) >= 2:
+                return row_number, ["" if v is None else str(v) for v in values]
+        return None, None
+
+    def _sheet_locators(self) -> dict:
+        """Per-sheet ``{sheet_name: {cell_range, header_row, header}}`` for the
+        finer-than-sheet locator family, from a bounded read of the ORIGINAL file.
+
+        ``cell_range`` is the sheet-qualified occupied extent (``'Revenue!A1:B4'``):
+        finer than the unbounded sheet reference because it names exactly the cells
+        that hold content, and sheet-qualified so it is unique per unit even when two
+        sheets share the same A1-notation range. Sheets with no content are omitted.
+        """
+        if not self._head(4).startswith(self._ZIP_MAGIC):
+            return {}
+        try:
+            if os.path.getsize(self.filepath) > self._MAX_SCAN_BYTES:
+                return {}
+            from openpyxl import load_workbook
+            from openpyxl.utils import get_column_letter
+
+            out: dict = {}
+            cells_seen = 0
+            # Not read_only: read_only mode yields `EmptyCell`/`MergedCell` proxies for
+            # blank and merged-continuation cells that lack `.row`/`.column`, so a
+            # merged workbook (or any row whose first column is blank) would crash the
+            # scan. A normal load gives every cell a coordinate; bounded by size above
+            # and by the cell budget below, exactly like the year/merge passes.
+            wb = load_workbook(self.filepath, data_only=True)
+            try:
+                for ws in wb.worksheets:
+                    min_r = min_c = None
+                    max_r = max_c = 0
+                    header_buf = []
+                    for row in ws.iter_rows():
+                        if not row:
+                            continue
+                        cells_seen += len(row)
+                        if cells_seen > self._MAX_SCAN_CELLS:
+                            return {}
+                        r_idx = row[0].row  # real coordinate (non read_only)
+                        values = [c.value for c in row]
+                        if r_idx <= self._HEADER_SEARCH_ROWS:
+                            header_buf.append((r_idx, values))
+                        for cell in row:
+                            if cell.value is None or str(cell.value).strip() == "":
+                                continue
+                            r, c = cell.row, cell.column
+                            min_r = r if min_r is None else min(min_r, r)
+                            min_c = c if min_c is None else min(min_c, c)
+                            max_r = max(max_r, r)
+                            max_c = max(max_c, c)
+                    if min_r is None:
+                        continue  # empty sheet: no data extent to cite
+                    cell_range = "%s!%s%d:%s%d" % (
+                        ws.title,
+                        get_column_letter(min_c), min_r,
+                        get_column_letter(max_c), max_r,
+                    )
+                    header_row, header = self._detect_header_row(header_buf)
+                    out[ws.title] = {
+                        CELL_RANGE_LOCATOR_KEY: cell_range,
+                        XLSX_HEADER_ROW_KEY: header_row,
+                        XLSX_HEADER_KEY: header,
+                    }
+            finally:
+                wb.close()
+            return out
+        except Exception as e:  # noqa: BLE001 - diagnostic; never fatal
+            logger.warning("Sheet-locator scan failed for %s: %s", self.filepath, e)
+            return {}
+
     # -- loader interface ---------------------------------------------------
 
     def load(self) -> List[Document]:
         self._precheck_container()
         with tempfile.TemporaryDirectory() as workdir:
-            parse_path = self._year_only_copy(workdir) or self.filepath
+            # Two optional working-copy passes, chained. Each copy keeps the
+            # ORIGINAL basename (so the parser reports the uploaded filename), so
+            # when both fire the merged copy is written over the year copy in the
+            # same workdir -- intended: the merged pass reads the year-converted
+            # values and re-saves them alongside the unmerged/filled cells.
+            base_path = self._year_only_copy(workdir) or self.filepath
+            parse_path = self._resolve_merged_cells(base_path, workdir) or base_path
             inner = UnstructuredExcelLoader(parse_path, mode="elements")
             try:
                 documents = inner.load()
@@ -1388,6 +2134,29 @@ class SheetExcelLoader:
                 doc.metadata["source"] = self.filepath
                 if "file_directory" in doc.metadata:
                     doc.metadata["file_directory"] = os.path.dirname(self.filepath)
+            # PRESERVATION + DISCLOSURE (F-XLSX-YEAR-FORMAT-DESTROYS-DATE).
+            #
+            # `date_values` is the load-bearing one: the FULL underlying date of every
+            # cell the year pass rendered down, keyed by sheet-qualified reference. The
+            # text shows `2016` because that is what the author sees; the date itself
+            # is still here. Nothing is destroyed at ingestion.
+            #
+            # `date_display_reduced` names the cells whose month and day are now ONLY
+            # in `date_values` — a pointer for a reader who needs the real date, not a
+            # record of a loss. ABSENT, never empty, when every rendered cell was a
+            # bare January-the-first: an empty list reads as a measurement that found
+            # nothing, which is a different claim.
+            #
+            # Stamped only when the pass actually ran.
+            normalised = getattr(self, "_year_normalised", 0)
+            reduced = getattr(self, "_year_reduced", [])
+            preserved = getattr(self, "_year_preserved", {})
+            for doc in documents:
+                doc.metadata["date_display_normalised"] = normalised
+                if preserved:
+                    doc.metadata["date_values"] = dict(preserved)
+                if reduced:
+                    doc.metadata["date_display_reduced"] = list(reduced)
         return self._annotate(documents)
 
     def lazy_load(self) -> Iterator[Document]:
@@ -1582,6 +2351,104 @@ class SlidePowerPointLoader:
                     "slide_title": title,
                 },
             )
+
+    def load(self) -> List[Document]:
+        return list(self.lazy_load())
+
+
+# ---------------------------------------------------------------------------
+# Markdown heading-hierarchy locators (PACKET-1 E4)
+# ---------------------------------------------------------------------------
+
+#: Durable machine ADDRESS for a markdown section: the 0-indexed position of the
+#: section (the span introduced by a heading) in document order. This is the
+#: locator family registered in app/routes/document_routes.py::_UNIT_LOCATOR_KEYS
+#: as ("section", "section_index"). It names the UNIT (a section), not the format,
+#: and is 0-indexed to match the loader-native majority (`page`, `row`, `block`).
+#: SINGLE SOURCE: rename the address key here and it changes everywhere.
+MD_SECTION_INDEX_KEY = "section_index"
+
+#: PROPOSED, PENDING the Core consuming lane (locator-tuple agreement criterion (d)):
+#: a human-readable heading path for DISPLAY only, e.g. "Setup > Prerequisites".
+#: It is NOT an address and MUST NOT be used to locate or reopen a source -- that is
+#: MD_SECTION_INDEX_KEY's job alone. It is carried behind this one constant and the
+#: single emission site in HeadingMarkdownLoader.lazy_load so that, if Core declines
+#: to consume it, removing it is a one-line change rather than a sweep.
+MD_HEADING_PATH_KEY = "heading_path"
+
+#: Display separator between heading levels in MD_HEADING_PATH_KEY (display-only).
+MD_HEADING_PATH_SEP = " > "
+
+
+class HeadingMarkdownLoader:
+    """Load a Markdown file as one Document per SECTION, carrying a per-section locator.
+
+    A *section* is the span of content introduced by a heading, running until the next
+    heading. Content before the first heading (preamble) is a unit with NO address and
+    NO heading path: its position in the heading hierarchy is UNKNOWN, not "no headings",
+    so no locator is fabricated for it (parity with DOCX header/footer and the XLSX
+    empty-sheet ruling -- unpositioned content gets no position).
+
+    Built on UnstructuredMarkdownLoader(mode="elements") -- the SAME extractor the plain
+    (mode="single") path uses -- so no new dependency is added. The wrapper only regroups
+    the elements into sections and stamps the locator; every non-heading element kind is
+    captured as section content, so no text-bearing element is silently dropped. Each
+    emitted Document carries:
+      * source        -- the uploaded file path (provenance unchanged)
+      * section_index -- 0-indexed section position in document order (the ADDRESS)
+      * heading_path  -- PROPOSED display-only readable path (pending Core; see the
+                         constant above)
+    """
+
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self._temp_filepath = None  # parity with the loader cleanup contract
+
+    def _elements(self) -> List[Document]:
+        return UnstructuredMarkdownLoader(self.filepath, mode="elements").load()
+
+    def lazy_load(self) -> Iterator[Document]:
+        heading_stack: List[list] = []   # active heading path: [[depth, text], ...]
+        section_index = -1               # becomes 0 at the first heading
+        units: List[dict] = []           # sections, in document order
+        preamble: Optional[dict] = None  # pre-first-heading unit, if any element appears
+
+        for el in self._elements():
+            meta = getattr(el, "metadata", None) or {}
+            text = getattr(el, "page_content", None) or ""
+            if meta.get("category") == "Title":
+                depth = meta.get("category_depth")
+                depth = depth if isinstance(depth, int) else 0
+                # A heading of depth D closes every open heading at depth >= D.
+                while heading_stack and heading_stack[-1][0] >= depth:
+                    heading_stack.pop()
+                heading_stack.append([depth, text.strip()])
+                section_index += 1
+                unit_meta = {MD_SECTION_INDEX_KEY: section_index}
+                # SINGLE EMISSION SITE for the PROPOSED, PENDING-Core display field.
+                path = MD_HEADING_PATH_SEP.join(t for _d, t in heading_stack if t)
+                if path:
+                    unit_meta[MD_HEADING_PATH_KEY] = path
+                # The heading text is part of the section content so no text is lost.
+                units.append({"meta": unit_meta, "parts": [text]})
+            elif units:
+                units[-1]["parts"].append(text)
+            else:
+                if preamble is None:
+                    preamble = {"meta": None, "parts": []}
+                preamble["parts"].append(text)
+
+        ordered = ([preamble] if preamble is not None else []) + units
+        for unit in ordered:
+            content = "\n\n".join(p for p in unit["parts"] if p and p.strip()).strip()
+            doc_meta = {"source": self.filepath}
+            if unit["meta"]:
+                doc_meta.update(unit["meta"])
+            # A heading section is always citable (its heading is itself content). A
+            # preamble with no text is nothing to cite -> dropped, never emitted as a
+            # phantom no-locator unit.
+            if content or unit["meta"]:
+                yield Document(page_content=content, metadata=doc_meta)
 
     def load(self) -> List[Document]:
         return list(self.lazy_load())
