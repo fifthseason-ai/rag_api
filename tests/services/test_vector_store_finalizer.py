@@ -14,11 +14,18 @@ it is collected. Reproduced at 5816e13 as:
 from tests/utils/test_delete_by_text_source.py, which builds a store with
 `AsyncPgVector.__new__` to exercise the delete filter without a database.
 
-WHY THIS IS TESTED AT THE PRODUCT AND NOT PATCHED IN THE TEST. Six test files already work
-around it by hand-assigning `_bind = None`; two of them say so in a comment. That is a
-product class leaking a construction requirement onto every double, and the seventh double
-to forget it re-opens the same warning. The guard belongs in ExtendedPgVector, which is the
-shared base of both AsyncPgVector and ExtendedPgVector, so neither can regress.
+WHY THIS IS TESTED AT THE PRODUCT AND NOT PATCHED IN THE TEST. FOUR test files already work
+around it by hand-assigning `_bind = None`, at SIX sites, and three of the four say why in a
+comment (`grep -rn "_bind = None" tests/`, excluding this file):
+
+    tests/services/test_async_pg_vector.py:15      (commented)
+    tests/services/test_vector_store.py:6
+    tests/test_ids_entitlement_scope.py:62,208,238 (commented at :58)
+    tests/utils/test_replace_not_accumulate.py:105 (commented at :103-104)
+
+That is a product class leaking a construction requirement onto every double, and the next
+double to forget it re-opens the same warning. The guard belongs in ExtendedPgVector, which
+is the shared base of both AsyncPgVector and ExtendedPgVector, so neither can regress.
 
 WHY THE WARNING IS WORTH REMOVING AT ALL. An unraisable exception is attributed to whichever
 test happened to be running when the collection occurred, NOT to the test that created the
