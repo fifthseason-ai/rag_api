@@ -1095,8 +1095,25 @@ class SafePyPDFLoader:
 
 
 class SafeDocxLoader:
-    """`Docx2txtLoader`, but a markup-compatibility text box is read only ONCE.
+    """A block-indexed DOCX loader whose text box is read only ONCE.
 
+    Emits one ``Document`` per authored unit -- heading / paragraph / table cell
+    (row-major) / header / footer -- in ``word/document.xml`` body order, each
+    carrying the per-unit DOCX locator (``_DOCX_LOCATOR_KEY``, a 0-based index that
+    is contiguous over the text-bearing units actually emitted) so a citation can
+    open the block it came from. This is the source-location fidelity
+    ``Docx2txtLoader`` cannot give: it flattens the whole file to ONE
+    ``locator_kind="none"`` Document (E1, on top of the #85 dedupe below). The
+    locator family's vocabulary value and cmetadata key are PENDING the FILES lead;
+    see ``_DOCX_LOCATOR_KIND`` / ``_DOCX_LOCATOR_KEY`` below.
+
+    The structured walk reads only ``w:t`` text after AlternateContent dedupe, so a
+    text box is counted once, and it reads the same header/footer parts docx2txt
+    reads, so nothing is dropped. A document whose structure the walk cannot read
+    (a zip/parse problem, or no text-bearing block found) degrades to the flat
+    ``Docx2txtLoader`` path below -- text still extracted, honestly ``none``.
+
+    #85 dedupe, preserved on both paths:
     Word and PowerPoint write a text box as an ``<mc:AlternateContent>`` element
     carrying the SAME runs in two branches: a modern ``<mc:Choice>`` (DrawingML
     ``wps:txbx``) and a legacy ``<mc:Fallback>`` (VML ``v:textbox``). A conformant
@@ -1199,7 +1216,124 @@ class SafeDocxLoader:
             logger.warning("DOCX AlternateContent dedupe failed for %s: %s", self.filepath, e)
             return None
 
-    def load(self) -> List[Document]:
+    #: docx2txt reads these body parts; the structured walk reads the same set so
+    #: headers/footers are not dropped (test_parser_fitness header/footer rule).
+    _DOC_PART = "word/document.xml"
+    _HEADER_RE = re.compile(r"^word/header\d*\.xml$")
+    _FOOTER_RE = re.compile(r"^word/footer\d*\.xml$")
+
+    #: The DOCX per-unit locator family (E1). BOTH the locator_kind vocabulary
+    #: VALUE and the cmetadata KEY are PENDING the FILES lead's ruling: the existing
+    #: vocabulary names a UNIT (page / slide / sheet / row), never the format, so the
+    #: value is NOT "docx". These two constants are the SINGLE SOURCE OF TRUTH -- the
+    #: loader stamps `_DOCX_LOCATOR_KEY`, the `_UNIT_LOCATOR_KEYS` tuple line in
+    #: document_routes.py mirrors this exact pair (a test pins them equal), and every
+    #: test reads these constants -- so the ruling is a one-token change here plus the
+    #: mirrored tuple line. Values below are PROVISIONAL, not decided.
+    _DOCX_LOCATOR_KIND = "block"        # PROVISIONAL — PENDING FILES lead ruling
+    _DOCX_LOCATOR_KEY = "block_index"   # PROVISIONAL — PENDING FILES lead ruling
+
+    @classmethod
+    def _text_of(cls, element) -> str:
+        """Concatenate the run text under `element` in document order.
+
+        `iter()` visits descendants in document order, so runs come out in the
+        order they were authored; `w:tab`/`w:br`/`w:cr` become whitespace so
+        adjacent runs do not merge into one word. This reads ONLY `w:t` text --
+        after AlternateContent dedupe there is exactly one text-bearing branch,
+        so a text box's runs are counted once."""
+        t_tag = "{%s}t" % cls._W_NS
+        tab_tag = "{%s}tab" % cls._W_NS
+        br_tag = "{%s}br" % cls._W_NS
+        cr_tag = "{%s}cr" % cls._W_NS
+        parts = []
+        for node in element.iter():
+            if node.tag == t_tag:
+                parts.append(node.text or "")
+            elif node.tag == tab_tag:
+                parts.append("\t")
+            elif node.tag in (br_tag, cr_tag):
+                parts.append("\n")
+        return "".join(parts)
+
+    @classmethod
+    def _deduped_part(cls, xml_bytes: bytes):
+        """Parse `xml_bytes`, deduping AlternateContent first, and return the root
+        Element -- or None if it cannot be parsed."""
+        import xml.etree.ElementTree as ET
+
+        if b"AlternateContent" in xml_bytes:
+            rewritten = cls._dedupe_alternate_content(xml_bytes)
+            if rewritten is not None:
+                xml_bytes = rewritten
+        try:
+            return ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return None
+
+    @classmethod
+    def _body_units(cls, root):
+        """Yield the text of each text-bearing block of `w:body`, in document
+        order. Direct children only: a `w:p` is one unit (a heading and a body
+        paragraph are both single paragraph blocks); a `w:tbl` yields one unit per
+        cell, row-major. Nested content (a text box's paragraphs, a cell's runs) is
+        folded into its containing block via `_text_of`, so nothing is emitted
+        twice."""
+        body = root.find("{%s}body" % cls._W_NS)
+        if body is None:
+            return
+        p_tag = "{%s}p" % cls._W_NS
+        tbl_tag = "{%s}tbl" % cls._W_NS
+        tr_tag = "{%s}tr" % cls._W_NS
+        tc_tag = "{%s}tc" % cls._W_NS
+        for child in list(body):
+            if child.tag == p_tag:
+                text = cls._text_of(child)
+                if text.strip():
+                    yield text
+            elif child.tag == tbl_tag:
+                for row in child.findall(tr_tag):
+                    for cell in row.findall(tc_tag):
+                        text = cls._text_of(cell)
+                        if text.strip():
+                            yield text
+
+    def _structured_units(self):
+        """The ordered text of each block of this .docx, or None to fall back to
+        flat extraction. Reads word/document.xml body in order, then every header
+        and footer part (the same parts docx2txt reads), deduping AlternateContent
+        so a text box is read once. Returns None on any zip/parse problem or when no
+        text-bearing unit is found, so the caller degrades to Docx2txtLoader."""
+        try:
+            with zipfile.ZipFile(self.filepath) as zin:
+                names = zin.namelist()
+                if self._DOC_PART not in names:
+                    return None
+                doc_root = self._deduped_part(zin.read(self._DOC_PART))
+                if doc_root is None:
+                    return None
+                units = list(self._body_units(doc_root))
+                # Headers then footers, each in stable filename order, so the same
+                # text docx2txt appends is still extracted (never silently dropped).
+                for part_re in (self._HEADER_RE, self._FOOTER_RE):
+                    for name in sorted(n for n in names if part_re.match(n)):
+                        part_root = self._deduped_part(zin.read(name))
+                        if part_root is None:
+                            continue
+                        text = self._text_of(part_root)
+                        if text.strip():
+                            units.append(text)
+                return units or None
+        except zipfile.BadZipFile:
+            return None  # let the flat fallback raise docx2txt's honest verdict
+        except Exception as e:  # noqa: BLE001 - never fatal; degrade to flat text
+            logger.warning("DOCX structured walk failed for %s: %s", self.filepath, e)
+            return None
+
+    def _flat_load(self) -> List[Document]:
+        """#85 behaviour: one flattened Document, AlternateContent deduped. The
+        degradation path -- a .docx whose structure the walk cannot read still
+        extracts its text (with locator_kind `none`, honestly), never nothing."""
         with tempfile.TemporaryDirectory() as workdir:
             parse_path = self._deduped_copy(workdir) or self.filepath
             documents = Docx2txtLoader(parse_path).load()
@@ -1208,6 +1342,29 @@ class SafeDocxLoader:
                 for doc in documents:
                     doc.metadata["source"] = self.filepath
         return documents
+
+    def load(self) -> List[Document]:
+        """Emit one block-indexed Document per authored unit (heading / paragraph /
+        table cell / header / footer), in document order, each carrying the DOCX
+        per-unit locator (`_DOCX_LOCATOR_KEY` = a 0-based index, contiguous over the
+        text-bearing blocks actually emitted, so a citation can open the block it
+        came from). A text box is read once (the #85 AlternateContent dedupe is
+        preserved). `source` is always the uploaded file. No cmetadata key beyond
+        the locator family is stamped. Falls back to flat extraction (one `none`
+        Document) when the document cannot be structured."""
+        units = self._structured_units()
+        if not units:
+            return self._flat_load()
+        return [
+            Document(
+                page_content=text,
+                metadata={
+                    "source": self.filepath,
+                    self._DOCX_LOCATOR_KEY: block_index,
+                },
+            )
+            for block_index, text in enumerate(units)
+        ]
 
     def lazy_load(self) -> Iterator[Document]:
         yield from self.load()
