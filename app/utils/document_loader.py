@@ -592,18 +592,16 @@ def process_documents(documents: List[Document]) -> str:
     return processed_text.strip()
 
 
-#: E2 -- native multi-column reading order + running header/footer de-duplication.
-#: Tunables as single named constants. NATIVE-PATH-ONLY (SafePyPDFLoader._apply_layout):
+#: E2 -- running header/footer de-duplication on the NATIVE PDF path.
+#: Tunables as single named constants. NATIVE-PATH-ONLY (SafePyPDFLoader._dedup_running_hf):
 #: it runs strictly upstream of `_with_ocr`, sees only pypdf native text, never OCR
-#: output, and rewrites `page_content` ONLY. Column separation uses pypdf's
-#: extraction_mode="layout" (the visitor aggregates a two-column row to a single x and
-#: cannot separate interleaved columns -- see the PR body). Header/footer bands use the
-#: visitor's per-row y, which IS accurate, so a repeated mid-page line is never mistaken
-#: for a footer.
-_PDF_LAYOUT_MAX_PAGES = 200          # above this many pages, skip the pass (bounded cost)
-_PDF_COLUMN_MIN_GAP_SPACES = 3       # a run of >= this many spaces separates columns in layout text
-_PDF_COLUMN_MIN_OFFSET_GAP = 8       # min char-offset gap to treat two cells as different columns
-_PDF_MIN_TWO_COLUMN_LINES = 2        # >= this many lines with cells in >=2 columns => multi-column
+#: output, and rewrites `page_content` ONLY -- `page`, `page_label`, `total_pages`,
+#: `source` and `text_source` are never touched. Header/footer bands use the visitor's
+#: per-row y, which is accurate, so a repeated mid-page line is never mistaken for a
+#: footer. (Column REORDERING was investigated and dropped -- see the PR body: layout
+#: mode can separate columns, but distinguishing a data table from article columns on
+#: this finance/engagement corpus is not reliably possible and the failure is silent.)
+_PDF_DEDUP_MAX_PAGES = 200           # above this many pages, skip the pass (bounded cost)
 _PDF_HEADER_FOOTER_BAND_PT = 72.0    # top/bottom band (pt, from the page edge) for running h/f
 _PDF_HEADER_FOOTER_MIN_REPEAT = 2    # a band line repeated on >= this many pages is a running h/f
 
@@ -704,10 +702,10 @@ class SafePyPDFLoader:
             # No image extraction: no fallback needed, stream directly.
             # The read bound is applied BEFORE OCR so a page that will be dropped is never
             # OCR'd -- otherwise the expensive work would happen and then be thrown away.
-            # The layout pass sits BETWEEN the bounded native producer and OCR, so it only
-            # ever reorders native text and OCR output (produced downstream) is untouched.
+            # The dedup pass sits BETWEEN the bounded native producer and OCR, so it only
+            # ever touches native text and OCR output (produced downstream) is untouched.
             yield from self._with_ocr(
-                self._apply_layout(self._within_budget(loader.lazy_load()))
+                self._dedup_running_hf(self._within_budget(loader.lazy_load()))
             )
             return
 
@@ -741,7 +739,7 @@ class SafePyPDFLoader:
             else:
                 # Re-raise if it's a different error
                 raise
-        yield from self._with_ocr(self._apply_layout(iter(pages)))
+        yield from self._with_ocr(self._dedup_running_hf(iter(pages)))
 
     # -- bounded reading of a native PDF (FILES-01) ---------------------------------
     #
@@ -861,23 +859,29 @@ class SafePyPDFLoader:
                 )
             yield held
 
-    # -- native multi-column reading order + running header/footer dedup (E2) -------
+    # -- running header/footer de-duplication on the native path (E2) --------------
     #
     # NATIVE PATH ONLY. This pass runs between the native producer (`_within_budget`
-    # over PyPDFLoader) and `_with_ocr`, so it only ever transforms pypdf native
-    # text. A scanned page arrives here with EMPTY text, is left empty and untouched,
-    # and is OCR'd by `_with_ocr` DOWNSTREAM -- OCR output is produced after this pass
-    # and never reaches it. The pass rewrites `page_content` ONLY; `page`,
-    # `page_label`, `total_pages`, `source` and `text_source` are never touched, and a
-    # page whose reorder would come back empty keeps its original text (so a native
-    # page is never turned empty and never wrongly sent to OCR).
+    # over PyPDFLoader) and `_with_ocr`, so it only ever touches pypdf native text. A
+    # scanned page arrives with EMPTY text and passes straight through; it is OCR'd by
+    # `_with_ocr` DOWNSTREAM, so OCR output is produced after this pass and never
+    # reaches it. The pass rewrites `page_content` ONLY (drops a running header/footer
+    # LINE); `page`, `page_label`, `total_pages`, `source` and `text_source` are never
+    # touched, and a page is never turned empty.
     #
-    # BOUNDED. Columns come from a second pypdf `extraction_mode="layout"` read;
-    # running headers/footers from a bounded up-front visitor scan (a SEPARATE reader,
-    # never the budgeted generator). Above `_PDF_LAYOUT_MAX_PAGES` pages the whole pass
-    # is skipped and pages stream through byte-unchanged. The extra reads' cost on the
-    # native path is a LIMIT to be measured at runtime (like the extraction-bound
-    # overhead was), not reasoned about.
+    # STREAMING + BOUNDED. Running-h/f detection scans a bounded number of pages up
+    # front with a SEPARATE reader (never the budgeted generator, so streaming and the
+    # extraction-bound stamp / honestly-unknown page count are untouched -- a
+    # `list(pages)` here would drain the budget before the first yield). Above
+    # `_PDF_DEDUP_MAX_PAGES`, or on a document too short to have a repeat, or when
+    # nothing repeats, pages stream through byte-unchanged.
+    #
+    # NOTE. Column REORDERING was investigated and DROPPED (see the PR body).
+    # `extraction_mode="layout"` genuinely separates interleaved columns, but on this
+    # finance/engagement corpus a single-column DATA TABLE (which needs row order) is
+    # not reliably distinguishable from ARTICLE COLUMNS (which need column order), and
+    # a wrong reorder loses no token so the corruption is silent. Dedup keeps only what
+    # is safe and unambiguous.
 
     @staticmethod
     def _run_key(text: str) -> str:
@@ -887,13 +891,10 @@ class SafePyPDFLoader:
 
     def _visitor_band_keys(self, page):
         """Normalised text of the ROWS whose y is within `_PDF_HEADER_FOOTER_BAND_PT`
-        of the top or bottom edge. Uses the visitor's per-row y, which is ACCURATE
-        even where its x is not: pypdf's visitor aggregates a two-column row to a
-        single (first) x and cannot separate columns (see the PR body / the E2 probe),
-        but the row's y is correct, so a repeated MID-PAGE line is never mistaken for a
-        footer. `extraction_mode="layout"` (used for columns) would not do -- its
-        line-index carries no reliable geometry (a top-aligned block has no trailing
-        blank lines, so its last content line is not near the bottom)."""
+        of the top or bottom edge. Uses the visitor's per-row y, which is ACCURATE, so
+        a repeated MID-PAGE line is never mistaken for a footer. (Line-index geometry
+        from `extraction_mode="layout"` would not do: a top-aligned block has no
+        trailing blank lines, so its last content line is not near the page bottom.)"""
         keys = set()
         try:
             height = float(page.mediabox.height)
@@ -932,78 +933,16 @@ class SafePyPDFLoader:
         drop = {key for key, n in counts.items() if n >= _PDF_HEADER_FOOTER_MIN_REPEAT}
         return drop, per_page
 
-    @classmethod
-    def _split_cells(cls, line):
-        """A layout line split into (start_offset, text) cells at runs of >=
-        `_PDF_COLUMN_MIN_GAP_SPACES` spaces -- the horizontal gap layout mode renders
-        between columns. Single spaces inside a phrase are kept."""
-        import re
-
-        cells = []
-        pos = 0
-        for match in re.finditer(r"\s{%d,}" % _PDF_COLUMN_MIN_GAP_SPACES, line):
-            seg = line[pos:match.start()]
-            if seg.strip():
-                cells.append((pos + len(seg) - len(seg.lstrip()), seg.strip()))
-            pos = match.end()
-        seg = line[pos:]
-        if seg.strip():
-            cells.append((pos + len(seg) - len(seg.lstrip()), seg.strip()))
-        return cells
-
-    @staticmethod
-    def _cluster_columns(offsets):
-        """Representative start offset of each column cluster: a gap of >=
-        `_PDF_COLUMN_MIN_OFFSET_GAP` characters starts a new column."""
-        cols = []
-        for off in sorted(set(offsets)):
-            if not cols or off - cols[-1] >= _PDF_COLUMN_MIN_OFFSET_GAP:
-                cols.append(off)
-        return cols
-
-    def _reorder_multicolumn(self, layout, drop_keys, band_keys):
-        """Column reading order from an `extraction_mode="layout"` render, or None when
-        the page is NOT genuinely multi-column (so the caller keeps pypdf's original
-        text byte-for-byte). Multi-column requires >= `_PDF_MIN_TWO_COLUMN_LINES` lines
-        whose cells span >= 2 columns -- a centered title, a right-aligned date or a
-        deep indent is a single cell per line and does not qualify. A line is dropped
-        only when it is BOTH a running-h/f key AND in THIS page's band, so a mid-body
-        line that merely matches a running header survives."""
-        lines = [ln for ln in layout.split("\n") if ln.strip()]
-        if not lines:
-            return None
-        parsed = [self._split_cells(ln) for ln in lines]
-        cols = self._cluster_columns(off for cells in parsed for off, _t in cells)
-
-        def col_of(off):
-            return min(range(len(cols)), key=lambda i: abs(off - cols[i]))
-
-        multi_lines = sum(
-            1 for cells in parsed if len({col_of(off) for off, _t in cells}) >= 2
-        )
-        if len(cols) < 2 or multi_lines < _PDF_MIN_TWO_COLUMN_LINES:
-            return None
-
-        items = []
-        for line_idx, cells in enumerate(parsed):
-            line_key = self._run_key(" ".join(t for _o, t in cells))
-            if line_key in drop_keys and line_key in band_keys:
-                continue  # running header/footer on THIS page
-            for off, text in cells:
-                items.append((col_of(off), line_idx, text))
-        items.sort(key=lambda item: (item[0], item[1]))
-        return "\n".join(text for _c, _li, text in items)
-
-    def _dedup_single_column(self, default_text, drop_keys, band_keys):
-        """Remove a running header/footer from single-column text by dropping the
-        FIRST or LAST line when it is a running-h/f key AND in this page's band. The
-        body is byte-identical (pypdf's own text, not the layout render). Returns None
-        when nothing changes -- so a page with no running line is untouched."""
+    def _drop_running_hf_line(self, default_text, drop_keys, band_keys):
+        """Drop a running header/footer: the FIRST and/or LAST line of the page's text
+        when it is a running-h/f key AND in this page's band -- NEVER every matching
+        line, so a standalone mid-body line equal to a running-header phrase survives.
+        The body is byte-identical (pypdf's own text). Returns None when nothing
+        changes."""
         active = drop_keys & band_keys
         if not active:
             return None
-        lines = default_text.split("\n")
-        out = list(lines)
+        out = default_text.split("\n")
         if out and self._run_key(out[0]) in active:
             out = out[1:]
         if out and self._run_key(out[-1]) in active:
@@ -1011,52 +950,43 @@ class SafePyPDFLoader:
         new = "\n".join(out)
         return new if new != default_text else None
 
-    def _apply_layout(self, pages: Iterator[Document]) -> Iterator[Document]:
-        """STREAMING native layout pass. Columns are reordered from
-        `extraction_mode="layout"`; running headers/footers are dropped using the
-        visitor's geometric y-band. It NEVER materialises the budgeted producer, so
-        the extraction-bound stamp and the honestly-unknown remaining-page count are
-        preserved (a `list(pages)` here would drain the budget before the first yield
-        and turn an UNKNOWN count into a fabricated number). A scanned (empty) page
-        passes straight through for OCR downstream. Bounded by `_PDF_LAYOUT_MAX_PAGES`;
-        any failure degrades to pypdf's order."""
+    def _dedup_running_hf(self, pages: Iterator[Document]) -> Iterator[Document]:
+        """STREAMING native running-header/footer dedup. Detects running h/f from a
+        bounded up-front visitor scan (a SEPARATE reader), then drops the first/last
+        band line per page. NEVER materialises the budgeted producer, so the
+        extraction-bound stamp and the honestly-unknown remaining-page count are
+        preserved. A scanned (empty) page passes straight through for OCR downstream.
+        Any failure degrades to pypdf's text."""
         try:
             reader = PdfReader(self.filepath)
             total = len(reader.pages)
-        except Exception as error:  # noqa: BLE001 - never fatal; keep pypdf's order
-            logger.info("PDF layout pass could not open %s: %s", self.filepath, error)
+        except Exception as error:  # noqa: BLE001 - never fatal; keep pypdf's text
+            logger.info("PDF dedup pass could not open %s: %s", self.filepath, error)
             yield from pages
             return
-        if total == 0 or total > _PDF_LAYOUT_MAX_PAGES:
+        # Too big, or too short to possibly carry a REPEATED running line -> no work,
+        # no up-front scan cost.
+        if not (_PDF_HEADER_FOOTER_MIN_REPEAT <= total <= _PDF_DEDUP_MAX_PAGES):
             yield from pages
             return
 
-        # Header/footer detection scans a BOUNDED number of pages up front with a
-        # SEPARATE reader (never the budgeted generator), so streaming and the budget
-        # stamp are untouched. Bounded by the extraction budget's page cap when set.
         scan_n = total
         budget = self.extraction_budget
         if budget is not None and getattr(budget, "max_pages", None):
             scan_n = min(scan_n, budget.max_pages)
         drop_keys, per_page_band = self._running_hf_keys(reader, scan_n)
+        if not drop_keys:
+            # Nothing repeats in any band: no dedup to do, stream untouched.
+            yield from pages
+            return
 
         for doc in pages:  # STREAM -- one page at a time, never buffered ahead
             meta = doc.metadata or {}
             default_text = doc.page_content or ""
             page_index = meta.get("page")
-            if default_text.strip() and isinstance(page_index, int) and 0 <= page_index < total:
-                band = per_page_band[page_index] if page_index < len(per_page_band) else set()
-                try:
-                    layout = reader.pages[page_index].extract_text(extraction_mode="layout")
-                except Exception as error:  # noqa: BLE001 - keep pypdf's order
-                    logger.info(
-                        "PDF layout read failed for page %s of %s: %s",
-                        page_index, self.filepath, error,
-                    )
-                    layout = None
-                new = self._reorder_multicolumn(layout, drop_keys, band) if layout else None
-                if new is None:
-                    new = self._dedup_single_column(default_text, drop_keys, band)
+            if default_text.strip() and isinstance(page_index, int) and 0 <= page_index < len(per_page_band):
+                band = per_page_band[page_index]
+                new = self._drop_running_hf_line(default_text, drop_keys, band)
                 if new is not None and new.strip():
                     doc.page_content = new
             yield doc
