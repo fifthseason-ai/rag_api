@@ -26,10 +26,10 @@ gate stays traceable; their bodies now assert PRESENCE. The three flipped:
      nothing" proof (FILES lead caution): the stamp is proven on the persisted
      surface that outlives the request, in-process (no pgvector).
 
-VALUE/KEY ARE PENDING. The locator_kind vocabulary value and the cmetadata key
-are the FILES lead's decision and are NOT hardcoded here: every assertion reads
-`SafeDocxLoader._DOCX_LOCATOR_KIND` / `._DOCX_LOCATOR_KEY`, so the ruling is a
-one-token change in the loader. No literal of the value appears in this file.
+VALUE/KEY RULED (2026-09-23) `block` / `block_index`, and NOT hardcoded here:
+every assertion reads `SafeDocxLoader._DOCX_LOCATOR_KIND` / `._DOCX_LOCATOR_KEY`,
+so the single source of truth stays the loader constant. No literal of the value
+appears in this file.
 
 The CONTROLS are unchanged and still green: `_assert_no_locator_keys` still fires
 on any registered key (now including the DOCX family), and
@@ -135,8 +135,9 @@ def _assert_no_locator_keys(metadatas, where):
 # ===========================================================================
 
 
-#: The DOCX per-unit locator family, read from the loader so the PENDING value/key
-#: ruling is a one-token change and no literal of the value appears here.
+#: The DOCX per-unit locator family (RULED `block`/`block_index`, 2026-09-23), read
+#: from the loader so the loader constant stays the single source and no literal of
+#: the value appears here.
 _DOCX_KEY = SafeDocxLoader._DOCX_LOCATOR_KEY
 _DOCX_KIND = SafeDocxLoader._DOCX_LOCATOR_KIND
 
@@ -161,11 +162,15 @@ def _assert_docx_family_on_every_unit(metadatas, where):
 @pytest.mark.parametrize("filename,content_type", _DOCX_ROUTINGS)
 def test_docx_loader_emits_no_locator_key(tmp_path, filename, content_type):
     """FLIPPED for E1 (name kept): the REAL loader `get_loader` selects for DOCX now
-    stamps the per-unit locator family on EVERY emitted unit, block-indexed 0-based
-    and contiguous in reading order.
+    stamps the per-unit locator family on every BODY unit, block-indexed 0-based and
+    contiguous in reading order.
 
     Driven through `get_loader` rather than a hand-built Document list, so a
     change of DOCX loader (or of the routing) is what this test reads.
+
+    Header/footer ruling (2026-09-23): header/footer units have no body position and
+    carry NO block_index. So the family assertion is scoped to the body units, and
+    the header/footer units are asserted to carry no key.
     """
     path = tmp_path / "report.docx"
     make_docx(str(path))
@@ -182,11 +187,22 @@ def test_docx_loader_emits_no_locator_key(tmp_path, filename, content_type):
     # as block-indexed.
     assert len(docs) > 1, f"{filename}: expected several block units, got {len(docs)}"
 
+    body = [d for d in docs if _DOCX_KEY in (d.metadata or {})]
+    aux = [d for d in docs if _DOCX_KEY not in (d.metadata or {})]
+
     _assert_docx_family_on_every_unit(
-        [d.metadata for d in docs], f"{filename} loader output"
+        [d.metadata for d in body], f"{filename} body units"
     )
-    # Indices are 0-based and contiguous in emission (reading) order.
-    assert [d.metadata[_DOCX_KEY] for d in docs] == list(range(len(docs)))
+    # Body indices are 0-based and contiguous in emission (reading) order.
+    assert [d.metadata[_DOCX_KEY] for d in body] == list(range(len(body)))
+    assert len(body) > 1
+
+    # Header/footer text is emitted as unnamed unit(s) carrying NO block_index key.
+    assert aux, "header/footer text should be emitted as unnamed unit(s)"
+    for d in aux:
+        assert _DOCX_KEY not in (d.metadata or {}), (
+            f"{filename}: header/footer unit must carry no {_DOCX_KEY!r} key: {d.metadata}"
+        )
     # Provenance stays the uploaded file, never a working copy.
     assert all(d.metadata.get("source") == str(path) for d in docs)
 
@@ -196,10 +212,14 @@ def test_docx_receipt_reports_none_locator_and_no_locators(
     tmp_path, filename, content_type
 ):
     """FLIPPED for E1 (name kept): the receipt built from REAL loader output now
-    reports the DOCX family (not 'none'), one unit per emitted block, and every
-    block-bearing unit has extractable text so nothing is listed empty. This is the
-    only place `locator_kind` for DOCX is asserted, so the replacement pins the new
-    family just as specifically as the old assertion pinned 'none'."""
+    reports the DOCX family (not 'none'). This is the only place `locator_kind` for
+    DOCX is asserted, so the replacement pins the new family just as specifically as
+    the old assertion pinned 'none'.
+
+    Header/footer ruling (2026-09-23): header/footer chunks carry no block_index and
+    fold into the receipt's single unnamed (None) unit, so units_total = number of
+    body blocks + 1 (not len(docs)). Every unit is text-bearing, so nothing is
+    listed empty."""
     path = tmp_path / "report.docx"
     make_docx(str(path))
 
@@ -207,8 +227,13 @@ def test_docx_receipt_reports_none_locator_and_no_locators(
     docs = loader.load()
     receipt = _extraction_receipt(docs)
 
+    body = [d for d in docs if _DOCX_KEY in (d.metadata or {})]
+    aux = [d for d in docs if _DOCX_KEY not in (d.metadata or {})]
+
     assert receipt["locator_kind"] == _DOCX_KIND
-    assert receipt["units_total"] == len(docs) > 1
+    # Body blocks are distinct units; header/footer fold into ONE unnamed unit.
+    assert receipt["units_total"] == len(body) + (1 if aux else 0)
+    assert receipt["units_total"] > 1
     assert receipt["units_extracted"] == receipt["units_total"]
     assert receipt["empty_locators"] == []
     assert receipt["reasons"] == []

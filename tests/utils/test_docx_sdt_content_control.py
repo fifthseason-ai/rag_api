@@ -21,9 +21,9 @@ Two properties are pinned here:
   (test 3). Tests 4 and 5 close the two reviewer findings on the flat/exclusion
   paths.
 
-VALUE/KEY PENDING. The locator_kind vocabulary value and the cmetadata key are the
-FILES lead's decision; nothing here hardcodes them. Every assertion reads
-`SafeDocxLoader._DOCX_LOCATOR_KIND` / `._DOCX_LOCATOR_KEY`.
+VALUE/KEY RULED (2026-09-23) `block` / `block_index`; nothing here hardcodes them.
+Every assertion reads `SafeDocxLoader._DOCX_LOCATOR_KIND` / `._DOCX_LOCATOR_KEY`, so
+the loader constant stays the single source of truth.
 
 SYNTHETIC. Every fixture is hand-built OOXML generated at test time, reusing #85's
 `_write_docx` builder. Synthetic proof establishes loader behaviour on a KNOWN
@@ -41,8 +41,9 @@ from app.utils.document_loader import SafeDocxLoader, get_loader
 # Reuse #85's synthetic OOXML builder and MIME rather than inventing new ones.
 from tests.utils.test_docx_reading_order import DOCX_MIME, _write_docx
 
-# Read the family from the loader so the PENDING value/key ruling is a one-token
-# change and no literal of the value is written anywhere in this file.
+# Read the family from the loader (RULED `block`/`block_index`, 2026-09-23) so the
+# loader constant stays the single source and no literal of the value is written
+# anywhere in this file.
 _KEY = SafeDocxLoader._DOCX_LOCATOR_KEY
 _KIND = SafeDocxLoader._DOCX_LOCATOR_KIND
 
@@ -64,6 +65,20 @@ def _sdt(inner_blocks):
     return (
         '<w:sdt><w:sdtPr><w:tag w:val="SYNTHETIC_CC"/></w:sdtPr>'
         f"<w:sdtContent>{inner_blocks}</w:sdtContent></w:sdt>"
+    )
+
+
+def _customxml(inner_blocks):
+    """Wrap block-level XML in a legacy `w:customXml` markup element -- a GENUINE
+    OOXML body-level container that can be a direct child of w:body and wraps
+    paragraphs/tables. It is NOT one of {w:p, w:tbl, w:sdt}, and the loader
+    deliberately does not special-case it, so it is the 'unanticipated
+    text-bearing body child' the Part B fail-safe must catch (not a fabricated
+    nonsense tag). w:customXml/w:uri/w:element are in the already-declared w
+    namespace."""
+    return (
+        '<w:customXml w:uri="urn:synthetic:meta" w:element="Meta">'
+        f"{inner_blocks}</w:customXml>"
     )
 
 
@@ -263,3 +278,79 @@ def test_prepared_docx_chunk_carries_no_foreign_locator_key_by_presence_SYNTHETI
         assert not present_foreign, (
             f"stored DOCX chunk carries foreign locator key(s) {present_foreign}: {meta}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. INTEGRATION requirements for the sdt/fail-safe fix.
+#    (i)  structured path loses no text the flat path captures (same input).
+#    (ii) the fail-safe fires on a REALISTIC unanticipated OOXML element.
+#    Both are RED-FIRST against the pre-sdt-fix loader (head aa230fc).
+# ---------------------------------------------------------------------------
+
+
+def test_structured_path_loses_no_text_the_flat_path_captures_SYNTHETIC(tmp_path):
+    """INTEGRATION: on the SAME input, the structured (block-indexed) path must not
+    drop any text the flat (docx2txt) path captures. The fixture puts real content
+    INSIDE content controls (an sdt-wrapped paragraph and an sdt-wrapped table), so
+    the comparison exercises exactly what the fix added -- not a plain document
+    where the two paths agree trivially.
+
+    RED-FIRST (head aa230fc, before sdt handling): the structured path skipped the
+    sdt content, so SDT_PARA_TEXT / SDT_CELL_A / SDT_CELL_B were absent from the
+    structured output while the flat path captured them -- this test FAILS there.
+    POST-FIX: the structured output contains every token the flat output does."""
+    tokens = ["H1_TOP", "P_PLAIN", "SDT_PARA_TEXT", "SDT_CELL_A", "SDT_CELL_B", "P_BOTTOM"]
+    table = (
+        "<w:tbl>"
+        f"<w:tr><w:tc>{_para('SDT_CELL_A')}</w:tc><w:tc>{_para('SDT_CELL_B')}</w:tc></w:tr>"
+        "</w:tbl>"
+    )
+    body = (
+        _para("H1_TOP") + _para("P_PLAIN")
+        + _sdt(_para("SDT_PARA_TEXT")) + _sdt(table)
+        + _para("P_BOTTOM")
+    )
+    _path, loader = _load(tmp_path, "compare.docx", body)
+
+    structured_text = "\n".join(d.page_content for d in loader.load())
+    flat_text = "\n".join(d.page_content for d in loader._flat_load())
+
+    # Guard: the flat path really captured the tokens, else the subset is vacuous.
+    for t in tokens:
+        assert t in flat_text, f"flat path did not capture {t!r}: {flat_text!r}"
+    # The structured path loses none of them.
+    for t in tokens:
+        assert t in structured_text, (
+            f"structured path DROPPED {t!r} that the flat path captured: {structured_text!r}"
+        )
+
+
+def test_failsafe_fires_on_unanticipated_real_ooxml_customxml_SYNTHETIC(tmp_path):
+    """RED-FIRST for Part B on a REALISTIC element, not a fabricated nonsense tag.
+
+    WHY 'unanticipated': `w:customXml` is a genuine OOXML legacy custom-XML markup
+    block that can be a direct child of w:body and wraps paragraphs; the loader
+    special-cases only w:p / w:tbl / w:sdt, so w:customXml is outside the handled
+    set. A real document could carry one, and its text must not be silently dropped.
+
+    RED-FIRST (head aa230fc): `_body_units` skipped the customXml, so
+    `_structured_units` returned a NON-EMPTY partial and the customXml text was lost
+    -- this test FAILS there (both the `is None` and the text-preserved assertions).
+    POST-FIX: the fail-safe fires, `_structured_units` is None, load() takes the flat
+    path, the text is kept, locator_kind is honestly none, no block_index is stamped."""
+    H1, LOST, AFTER = "H1_TOP", "CUSTOMXML_BODY_TEXT", "P_AFTER"
+    body = _para(H1) + _customxml(_para(LOST)) + _para(AFTER)
+    _path, loader = _load(tmp_path, "customxml.docx", body)
+
+    assert loader._structured_units() is None
+    docs = loader.load()
+    joined = "\n".join(d.page_content for d in docs)
+    assert LOST in joined, f"fail-safe dropped the customXml text: {joined!r}"
+    assert H1 in joined and AFTER in joined
+    assert _extraction_receipt(docs)["locator_kind"] == "none"
+    for d in docs:
+        meta = d.metadata or {}
+        for _kind, key in _UNIT_LOCATOR_KEYS:
+            assert key not in meta, (
+                f"flat-fallback chunk carries per-unit locator key {key!r}: {meta}"
+            )

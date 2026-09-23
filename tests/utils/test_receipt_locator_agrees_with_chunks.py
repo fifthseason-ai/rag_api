@@ -79,9 +79,10 @@ _LOADER_NATIVE_LOCATOR_KEYS = {
     # per authored block. This key is a DELIBERATE HARDCODED LITERAL and must NOT be
     # imported from the loader or derived from _UNIT_LOCATOR_KEYS: this anchor is
     # independent of the module on purpose (see the module docstring) so it can catch
-    # the module being wrong. The value is PROVISIONAL — PENDING the FILES lead's
-    # ruling; when the final DOCX locator key is decided, HAND-UPDATE this literal.
-    "block_index": "docx",   # SafeDocxLoader (E1) -- HARDCODED, hand-update on ruling
+    # the module being wrong. The key is RULED (`block_index`, FILES lead 2026-09-23);
+    # this literal is a DELIBERATE independent anchor -- hand-update only if the ruling
+    # ever changes the key.
+    "block_index": "docx",   # SafeDocxLoader (E1) -- HARDCODED independent anchor (RULED)
 }
 # Formats that carry no per-unit locator at all -> must fold to a single `none` unit.
 # DOCX left this set at E1: it now carries the block_index per-unit family above.

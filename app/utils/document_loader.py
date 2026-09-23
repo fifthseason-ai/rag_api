@@ -1108,15 +1108,18 @@ class _UnrepresentableBody(Exception):
 class SafeDocxLoader:
     """A block-indexed DOCX loader whose text box is read only ONCE.
 
-    Emits one ``Document`` per authored unit -- heading / paragraph / table cell
-    (row-major) / header / footer -- in ``word/document.xml`` body order, each
-    carrying the per-unit DOCX locator (``_DOCX_LOCATOR_KEY``, a 0-based index that
-    is contiguous over the text-bearing units actually emitted) so a citation can
-    open the block it came from. This is the source-location fidelity
-    ``Docx2txtLoader`` cannot give: it flattens the whole file to ONE
-    ``locator_kind="none"`` Document (E1, on top of the #85 dedupe below). The
-    locator family's vocabulary value and cmetadata key are PENDING the FILES lead;
-    see ``_DOCX_LOCATOR_KIND`` / ``_DOCX_LOCATOR_KEY`` below.
+    Emits one ``Document`` per authored unit. BODY units -- heading / paragraph /
+    table cell (row-major), and blocks descended from a block-level ``w:sdt`` --
+    come in ``word/document.xml`` body order, each carrying the per-unit DOCX
+    locator (``_DOCX_LOCATOR_KEY``, a 0-based index CONTIGUOUS over the body blocks
+    actually emitted) so a citation can open the block it came from. HEADER/FOOTER
+    units carry NO locator key (absent, not None): that text has no position in the
+    body reading sequence and must never inherit a body block's index (ruling
+    2026-09-23), so it surfaces as unnamed unit(s) under the receipt's ``None``
+    unit. This is the source-location fidelity ``Docx2txtLoader`` cannot give: it
+    flattens the whole file to ONE ``locator_kind="none"`` Document (E1, on top of
+    the #85 dedupe below). The locator family's value/key are RULED
+    (``block`` / ``block_index``); see ``_DOCX_LOCATOR_KIND`` / ``_DOCX_LOCATOR_KEY``.
 
     The structured walk reads only ``w:t`` text after AlternateContent dedupe, so a
     text box is counted once, and it reads the same header/footer parts docx2txt
@@ -1242,16 +1245,20 @@ class SafeDocxLoader:
     _HEADER_RE = re.compile(r"^word/header\d*\.xml$")
     _FOOTER_RE = re.compile(r"^word/footer\d*\.xml$")
 
-    #: The DOCX per-unit locator family (E1). BOTH the locator_kind vocabulary
-    #: VALUE and the cmetadata KEY are PENDING the FILES lead's ruling: the existing
-    #: vocabulary names a UNIT (page / slide / sheet / row), never the format, so the
-    #: value is NOT "docx". These two constants are the SINGLE SOURCE OF TRUTH -- the
-    #: loader stamps `_DOCX_LOCATOR_KEY`, the `_UNIT_LOCATOR_KEYS` tuple line in
-    #: document_routes.py mirrors this exact pair (a test pins them equal), and every
-    #: test reads these constants -- so the ruling is a one-token change here plus the
-    #: mirrored tuple line. Values below are PROVISIONAL, not decided.
-    _DOCX_LOCATOR_KIND = "block"        # PROVISIONAL — PENDING FILES lead ruling
-    _DOCX_LOCATOR_KEY = "block_index"   # PROVISIONAL — PENDING FILES lead ruling
+    #: The DOCX per-unit locator family (E1), RULED by the FILES lead
+    #: (PACKET-1-LOCATOR-TUPLE-AGREEMENT-ADDENDUM 2026-09-23). The vocabulary names
+    #: a UNIT (page / slide / sheet / row), never the format, so the value is
+    #: `block`, not `docx`. `block_index` is an ADDRESS -- a 0-indexed, contiguous
+    #: position over the BODY-LEVEL blocks (each `w:p`, and each table cell) in
+    #: document order -- NOT a human-readable display label; no heading path or
+    #: title is carried (out of scope by ruling). Header/footer text has no position
+    #: in the body reading sequence, so it carries NO `block_index` key at all.
+    #: These two constants are the SINGLE SOURCE OF TRUTH: the loader stamps
+    #: `_DOCX_LOCATOR_KEY`, the `_UNIT_LOCATOR_KEYS` tuple line in document_routes.py
+    #: mirrors this exact pair (a test pins them equal), and every test reads these
+    #: constants.
+    _DOCX_LOCATOR_KIND = "block"        # RULED 2026-09-23 (FILES lead)
+    _DOCX_LOCATOR_KEY = "block_index"   # RULED 2026-09-23 (FILES lead)
 
     @classmethod
     def _text_of(cls, element) -> str:
@@ -1358,14 +1365,28 @@ class SafeDocxLoader:
                 raise _UnrepresentableBody(child.tag)
 
     def _structured_units(self):
-        """The ordered text of each block of this .docx, or None to fall back to
-        flat extraction. Reads word/document.xml body in order (descending into
-        block-level `w:sdt` content controls), then every header and footer part
-        (the same parts docx2txt reads), deduping AlternateContent so a text box is
-        read once. Returns None on any zip/parse problem, when no text-bearing unit
-        is found, OR when the body carries a text-bearing child the walk cannot
-        faithfully represent (`_UnrepresentableBody`) -- so the caller degrades to
-        Docx2txtLoader and no authored text is dropped, never a lossy partial."""
+        """Return `(body_units, aux_units)` -- the ordered text of the BODY blocks
+        and, separately, the header/footer text -- or None to fall back to flat
+        extraction.
+
+        `body_units` is the document-order text of each body-level block (each
+        `w:p`, each table cell, and blocks descended from a block-level `w:sdt`
+        content control). These are the units that receive a `block_index`.
+        `aux_units` is the text of every header and footer part (the same parts
+        docx2txt reads), deduping AlternateContent so a text box is read once.
+        Header/footer text has NO position in the body reading sequence, so it is
+        returned SEPARATELY and stamped with NO locator key by `load()` (ruling
+        2026-09-23): it must never inherit a body block's index.
+
+        Returns None -- so the caller degrades to `Docx2txtLoader` and no authored
+        text is dropped, never a lossy partial -- on any zip/parse problem, when
+        the body carries a text-bearing child the walk cannot faithfully represent
+        (`_UnrepresentableBody`), OR when there is NO body-level block to cite (an
+        empty body, or a document whose only text is in header/footer parts). In
+        that last case the flat path keeps the header/footer text honestly at
+        `locator_kind=none`. NOTE (measured limitation, receipt contract): a
+        no-body document and a fail-safe degradation BOTH report `locator_kind=none`
+        and are not distinguished at the document level on the current wire."""
         try:
             with zipfile.ZipFile(self.filepath) as zin:
                 names = zin.namelist()
@@ -1374,9 +1395,16 @@ class SafeDocxLoader:
                 doc_root = self._deduped_part(zin.read(self._DOC_PART))
                 if doc_root is None:
                     return None
-                units = list(self._body_units(doc_root))
+                body_units = list(self._body_units(doc_root))
+                # No citable body block: degrade to flat so header/footer text is
+                # still kept (locator_kind none), rather than emit only unnamed
+                # units. block_index exists to cite body position; there is none.
+                if not body_units:
+                    return None
                 # Headers then footers, each in stable filename order, so the same
                 # text docx2txt appends is still extracted (never silently dropped).
+                # These are AUX units: emitted WITHOUT a block_index by load().
+                aux_units = []
                 for part_re in (self._HEADER_RE, self._FOOTER_RE):
                     for name in sorted(n for n in names if part_re.match(n)):
                         part_root = self._deduped_part(zin.read(name))
@@ -1384,8 +1412,8 @@ class SafeDocxLoader:
                             continue
                         text = self._text_of(part_root)
                         if text.strip():
-                            units.append(text)
-                return units or None
+                            aux_units.append(text)
+                return body_units, aux_units
         except zipfile.BadZipFile:
             return None  # let the flat fallback raise docx2txt's honest verdict
         except _UnrepresentableBody as e:
@@ -1415,18 +1443,30 @@ class SafeDocxLoader:
         return documents
 
     def load(self) -> List[Document]:
-        """Emit one block-indexed Document per authored unit (heading / paragraph /
-        table cell / header / footer), in document order, each carrying the DOCX
-        per-unit locator (`_DOCX_LOCATOR_KEY` = a 0-based index, contiguous over the
-        text-bearing blocks actually emitted, so a citation can open the block it
-        came from). A text box is read once (the #85 AlternateContent dedupe is
-        preserved). `source` is always the uploaded file. No cmetadata key beyond
-        the locator family is stamped. Falls back to flat extraction (one `none`
-        Document) when the document cannot be structured."""
-        units = self._structured_units()
-        if not units:
+        """Emit one Document per authored unit, in document order.
+
+        BODY units (each paragraph, each table cell, blocks descended from a
+        block-level `w:sdt`) each carry the DOCX per-unit locator
+        (`_DOCX_LOCATOR_KEY` = a 0-based index, CONTIGUOUS over the body blocks
+        actually emitted, so a citation can open the block it came from).
+
+        HEADER/FOOTER units carry NO locator key at all -- the key is ABSENT, not
+        None -- because header/footer text has no position in the body reading
+        sequence and must never inherit a body block's index (ruling 2026-09-23).
+        They surface in the receipt as unnamed unit(s), grouped under the receipt's
+        `None` unit. So a chunk with no `block_index` in a `locator_kind=block`
+        document is a header/footer unit (absent by nature), NOT lost content.
+
+        A text box is read once (the #85 AlternateContent dedupe is preserved).
+        `source` is always the uploaded file. No cmetadata key beyond the locator
+        family is stamped. Falls back to flat extraction (one `locator_kind=none`
+        Document) when the document cannot be structured OR has no body block to
+        cite."""
+        structured = self._structured_units()
+        if not structured:
             return self._flat_load()
-        return [
+        body_units, aux_units = structured
+        docs = [
             Document(
                 page_content=text,
                 metadata={
@@ -1434,8 +1474,14 @@ class SafeDocxLoader:
                     self._DOCX_LOCATOR_KEY: block_index,
                 },
             )
-            for block_index, text in enumerate(units)
+            for block_index, text in enumerate(body_units)
         ]
+        # Header/footer text: emitted WITHOUT the locator key (absent, not None).
+        docs.extend(
+            Document(page_content=text, metadata={"source": self.filepath})
+            for text in aux_units
+        )
+        return docs
 
     def lazy_load(self) -> Iterator[Document]:
         yield from self.load()

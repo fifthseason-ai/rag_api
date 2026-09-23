@@ -11,10 +11,10 @@ This file pins that fidelity against the card's ground-truth shape and proves th
 stamp reaches the STORED chunk, not only the loader Document (the FILES lead's
 "a registered tuple entry that nothing stamps changes nothing" caution).
 
-VALUE/KEY PENDING. The locator_kind vocabulary value and the cmetadata key are the
-FILES lead's decision; nothing here hardcodes them. Every assertion reads
-`SafeDocxLoader._DOCX_LOCATOR_KIND` / `._DOCX_LOCATOR_KEY`, so the ruling is a
-one-token change. No literal of the value appears in this file (including names).
+VALUE/KEY RULED (2026-09-23) `block` / `block_index`; nothing here hardcodes them.
+Every assertion reads `SafeDocxLoader._DOCX_LOCATOR_KIND` / `._DOCX_LOCATOR_KEY`, so
+the loader constant stays the single source of truth. No literal of the value
+appears in this file (including names).
 
 SYNTHETIC. Every fixture is hand-built OOXML generated at test time (docx2txt/ET
 parse hand-rolled XML; LibreOffice would not open it). Synthetic proof establishes
@@ -43,9 +43,12 @@ from app.utils.document_loader import SafeDocxLoader, get_loader
 
 # Reuse #85's synthetic OOXML builders rather than inventing new ones.
 from tests.utils.test_docx_reading_order import DOCX_MIME, _TEXTBOX, _write_docx
+# A synthetic DOCX WITH a header + footer, for the header/footer round-trip negative.
+from tests.utils.test_parser_fitness import make_docx as make_body_header_footer_docx_SYNTHETIC
 
-# Read the family from the loader so the PENDING value/key ruling is a one-token
-# change and no literal of the value is written anywhere in this file.
+# Read the family from the loader (RULED `block`/`block_index`, 2026-09-23) so the
+# loader constant stays the single source and no literal of the value is written
+# anywhere in this file.
 _KEY = SafeDocxLoader._DOCX_LOCATOR_KEY
 _KIND = SafeDocxLoader._DOCX_LOCATOR_KIND
 
@@ -459,3 +462,79 @@ def test_docx_block_locator_round_trips_through_real_pgvector_SYNTHETIC(monkeypa
     # #85 dedupe preserved end to end: the text box is stored exactly once in the DB.
     joined = "\n".join(d.page_content for d in rows)
     assert joined.count(_TB) == 1, f"text box duplicated in Postgres: {joined!r}"
+
+
+@needs_pg
+def test_docx_header_footer_row_has_no_block_index_round_trips_SYNTHETIC(monkeypatch, tmp_path):
+    """NEGATIVE the FILES lead requires (addendum 2026-09-23) on a REAL round-trip: a
+    DOCX chunk that carries NO block_index -- a header/footer unit -- is PRESENT in
+    the Postgres table after /embed and does NOT acquire one; the body chunks carry
+    the 0-based contiguous index.
+
+    WHY BOTH. The positive alone (body blocks carry the stored index) cannot
+    distinguish 'the family is registered' from 'the loader actually stamped only the
+    body units': a register-only implementation that stamped every unit would still
+    pass a positive-only check. Asserting a keyless chunk survives the round-trip
+    WITHOUT gaining a block_index is what proves header/footer stay unindexed on the
+    persisted surface.
+
+    ABLE TO FAIL. If load() reverted to stamping header/footer (the pre-ruling bug),
+    every row would carry an int block_index and the `no_idx` list would be empty,
+    reddening the 'a header/footer chunk without block_index was stored' assertion.
+
+    READ-BACK / LIMIT / EMB: identical discipline to the sibling round-trip test --
+    rows read through the store's own get_documents_by_ids; SYNTHETIC OOXML; offline
+    embeddings. Runs only with RAG_TEST_PG_DSN set; skips cleanly otherwise."""
+    from app.services.vector_store.extended_pg_vector import ExtendedPgVector
+
+    UPLOAD_NAME = "hf.docx"
+    FID = "e1-docx-hf-roundtrip"
+
+    store = _real_store("e1_docx_hf_roundtrip")
+    os.environ["JWT_SECRET"] = "testsecret"
+    if getattr(app.state, "thread_pool", None) is None:
+        app.state.thread_pool = ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(document_routes, "vector_store", store)
+
+    path = tmp_path / UPLOAD_NAME
+    make_body_header_footer_docx_SYNTHETIC(str(path))
+
+    client = TestClient(app)
+    r = client.post(
+        "/embed",
+        data={"file_id": FID, "entity_id": "userA"},
+        files={"file": (UPLOAD_NAME, io.BytesIO(path.read_bytes()), DOCX_MIME)},
+        headers=_hdr(),
+    )
+    assert r.status_code == 200, r.text
+    receipt = r.json()["extraction"]
+
+    rows = ExtendedPgVector.get_documents_by_ids(store, [FID])
+    metas = [dict(d.metadata or {}) for d in rows]
+    assert metas, "no DOCX chunks were read back from Postgres"
+
+    # POSITIVE: body chunks carry an int block_index, 0-based contiguous.
+    body_idx = sorted(m[_KEY] for m in metas if _KEY in m)
+    assert body_idx == list(range(len(body_idx))), (
+        f"body block indices read back are not 0-based contiguous: {body_idx}"
+    )
+    assert len(body_idx) > 1, "expected several body blocks in the table"
+
+    # NEGATIVE: at least one chunk (header/footer) carries NO block_index, did NOT
+    # acquire one on the round-trip, and its text is present.
+    no_idx = [(d, m) for d, m in zip(rows, metas) if _KEY not in m]
+    assert no_idx, (
+        "no header/footer chunk WITHOUT block_index was stored -- either the loader "
+        "re-stamped header/footer (the pre-ruling bug) or the fixture lost its "
+        "header/footer"
+    )
+    hf_text = "\n".join(d.page_content for d, _m in no_idx)
+    assert "HEADER confidential" in hf_text or "FOOTER page one" in hf_text, (
+        f"the keyless chunk(s) do not carry the header/footer text: {hf_text!r}"
+    )
+    for _d, m in no_idx:
+        assert _KEY not in m, f"a header/footer row acquired {_KEY!r}: {m}"
+
+    # The receipt names the family (body blocks present) and the store carries it.
+    assert receipt["locator_kind"] == _KIND, receipt
+    assert _kind_the_store_carries(metas) == _KIND

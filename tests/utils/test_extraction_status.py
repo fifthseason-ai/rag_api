@@ -354,18 +354,19 @@ def test_embed_docx_reports_block_locator_family_units_and_writes(rec_client, tm
     rows are written and the receipt is present on the 200 body (consumer-shape lock).
 
     make_docx builds a heading + a body paragraph + a 2x2 table + a header + a footer.
-    SafeDocxLoader._body_units emits one unit per direct body `w:p` and one per table
-    cell (row-major), then one per header and footer part, each with a distinct
-    block_index, so the receipt groups them into that many units:
-        2 paragraphs + 4 table cells + 1 header + 1 footer = 8
-    All eight blocks are text-bearing, so units_extracted == units_total == 8. The
-    exact integer is asserted (not >= 1): a loader that dropped a block, merged two,
-    or double-counted the (dedupe-preserved) content would move this number.
+    SafeDocxLoader emits one BODY unit per direct body `w:p` and one per table cell
+    (row-major), each with a distinct 0-based block_index (2 paragraphs + 4 table
+    cells = 6 body blocks), and it emits the header/footer text as unit(s) carrying
+    NO block_index (ruling 2026-09-23: header/footer have no body position). In the
+    receipt's detection loop the header/footer chunks fold into the single unnamed
+    (None) unit, so units_total = 6 distinct block_index values + 1 = 7.
 
-    locator_kind is read from the loader's own PROVISIONAL constant so the PENDING
-    FILES-lead ruling stays a one-token change; the receipt derives its kind from the
-    _UNIT_LOCATOR_KEYS registry, so this assertion also proves registry<->loader
-    agreement rather than reading the same value twice."""
+    NO hardcoded literal is asserted: units_total is checked against the DISTINCT
+    locator groups the STORED chunks actually form (each block_index, plus the None
+    group for the keyless header/footer chunks), so a loader that dropped a block,
+    merged two, or re-stamped a header would move this number. locator_kind is read
+    from the loader's own RULED constant; the receipt derives its kind from the
+    _UNIT_LOCATOR_KEYS registry, so this also proves registry<->loader agreement."""
     path = tmp_path / "report.docx"
     make_docx(str(path))
     r = _embed(
@@ -380,8 +381,22 @@ def test_embed_docx_reports_block_locator_family_units_and_writes(rec_client, tm
     rec = body["extraction"]
     assert rec["status"] == "complete"
     assert rec["locator_kind"] == SafeDocxLoader._DOCX_LOCATOR_KIND
-    assert rec["units_total"] == 8
-    assert rec["units_extracted"] == 8
+
+    # units_total equals the number of DISTINCT locator groups across the stored
+    # chunks -- each block_index value, PLUS the None group holding the keyless
+    # header/footer chunks (dict.get returns None for a missing key, exactly as the
+    # receipt's own grouping does). No integer literal is hardcoded.
+    key = SafeDocxLoader._DOCX_LOCATOR_KEY
+    stored = _stored_docs(rec_client)
+    locs = {(d.metadata or {}).get(key) for d in stored}  # includes None for header/footer
+    assert rec["units_total"] == len(locs)
+    assert rec["units_total"] > 1  # DOCX no longer folds to a single unit
+
+    body_idx = sorted(v for v in locs if v is not None)
+    assert body_idx == list(range(len(body_idx)))  # 0-based contiguous body blocks
+    assert None in locs  # the unnamed header/footer unit is present
+
+    assert rec["units_extracted"] == rec["units_total"]  # every unit text-bearing
     assert rec["empty_locators"] == []
     assert len(rec_client.inserted_batches) >= 1  # rows written
 

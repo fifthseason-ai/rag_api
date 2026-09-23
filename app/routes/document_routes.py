@@ -1858,14 +1858,15 @@ _UNIT_LOCATOR_KEYS = (
     ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
     ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
     ("row", "row"),             # CSV: 0-indexed data row (RowCSVLoader / langchain CSVLoader)
-    # DOCX (E1): 0-indexed per-block unit (SafeDocxLoader). APPENDED AT THE END on
+    # DOCX (E1): 0-indexed per-block unit (SafeDocxLoader), RULED by the FILES lead
+    # (PACKET-1-LOCATOR-TUPLE-AGREEMENT-ADDENDUM 2026-09-23). APPENDED AT THE END on
     # purpose -- the detection loop below breaks on the FIRST family present, and a
-    # DOCX chunk carries exactly this one family, so appending never shadows or
-    # inverts another format's answer (agreed with the FILES lead 2026-09-23).
-    # The value + key are PENDING the FILES lead's ruling and MUST equal
+    # DOCX body chunk carries exactly this one family, so appending never shadows or
+    # inverts another format's answer. Header/footer chunks carry NO block_index and
+    # fall to this loop's `none` group. The value + key MUST equal
     # SafeDocxLoader._DOCX_LOCATOR_KIND / ._DOCX_LOCATOR_KEY (pinned equal by
     # tests/utils/test_docx_locator_fidelity.py::test_registry_entry_mirrors_loader_constants).
-    ("block", "block_index"),   # PROVISIONAL — PENDING FILES lead ruling
+    ("block", "block_index"),   # RULED 2026-09-23 (FILES lead)
 )
 
 
