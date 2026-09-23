@@ -1851,13 +1851,16 @@ def _prepare_documents_sync(
 # Per-unit locator metadata keys, in detection precedence. Each loader emits at
 # most ONE of these families (PDF -> `page`, PPTX -> `slide_number`, XLSX
 # elements -> `page_name`), so the precedence only guards a defensive
-# mixed-metadata edge; a format with no per-unit locator (DOCX/MD/TXT/CSV) folds
-# into a single `none` unit.
+# mixed-metadata edge; a format with no per-unit locator (DOCX/TXT) folds
+# into a single `none` unit. ORDER IS PRECEDENCE (the detection loop breaks on
+# the first family present), so new families append AFTER the existing four so no
+# current format's answer changes.
 _UNIT_LOCATOR_KEYS = (
     ("page", "page"),           # PDF: 0-indexed page (SafePyPDFLoader / pypdf)
     ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
     ("sheet", "page_name"),     # XLSX: sheet name (UnstructuredExcelLoader mode="elements")
     ("row", "row"),             # CSV: 0-indexed data row (RowCSVLoader / langchain CSVLoader)
+    ("section", "section_index"),  # Markdown: 0-indexed heading section in doc order (HeadingMarkdownLoader)
 )
 
 

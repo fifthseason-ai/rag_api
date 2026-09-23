@@ -15,7 +15,9 @@ So CSV is asserted **against the module**: whatever `_UNIT_LOCATOR_KEYS` registe
 chunk must carry. That is base-independent and it catches drift in **both** directions — a `row`
 that stops being emitted after being registered, and a `row` that appears without being registered.
 
-MD and TXT carry no locator on either base, so they are asserted directly.
+TXT carries no locator on either base, so it is asserted directly. MD USED to be in that
+set; PACKET-1 E4 registers ("section", "section_index") and gives markdown a per-section
+address, so MD is now asserted the same base-independent way as CSV.
 """
 
 import pytest
@@ -93,11 +95,12 @@ def test_the_marker_survived_so_the_content_really_parsed(markdown_chunks, text_
 # ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("fixture,label", [("markdown_chunks", "MD"), ("text_chunks", "TXT")])
-def test_md_and_txt_carry_no_per_unit_locator(fixture, label, request):
-    """Neither format exposes a page, slide, sheet or row, so a citation into one can name the
+@pytest.mark.parametrize("fixture,label", [("text_chunks", "TXT")])
+def test_txt_carries_no_per_unit_locator(fixture, label, request):
+    """TXT exposes no page, slide, sheet, row or section, so a citation into it can name the
     document and quote the text and nothing more. Emitting a locator here would be inventing a
-    position that does not exist."""
+    position that does not exist. (MD is no longer in this set: PACKET-1 E4 gives markdown a
+    per-section address -- see test_md_carries_section_locator_when_registered below.)"""
     chunks = request.getfixturevalue(fixture)
     offenders = [
         (i, _locator_keys_present(c.metadata))
@@ -108,6 +111,32 @@ def test_md_and_txt_carry_no_per_unit_locator(fixture, label, request):
         "%s must carry no per-unit locator key, but chunks %s did. Registered locator keys: %s"
         % (label, offenders, LOCATOR_KEYS)
     )
+
+
+def test_md_carries_section_locator_when_registered(markdown_chunks):
+    """PACKET-1 E4 registers ("section", "section_index"); on a tree containing it every
+    markdown chunk UNDER A HEADING must carry it, so a citation into that section has a
+    position to open to. Asserted against the module, never a literal, so it catches drift in
+    BOTH directions -- a `section_index` that stops being emitted after being registered, and
+    one that appears without being registered -- exactly like the CSV trap above.
+
+    The fixture has no preamble, so every chunk is a heading section. A preamble chunk (no
+    heading above it) legitimately carries no address; that case is pinned in
+    tests/utils/test_md_heading_locator.py, not here.
+    """
+    registered = "section_index" in LOCATOR_KEYS
+    present = ["section_index" in (c.metadata or {}) for c in markdown_chunks]
+    if registered:
+        assert all(present), (
+            "`section_index` is registered in _UNIT_LOCATOR_KEYS but %d of %d markdown chunks "
+            "do not carry it -- a citation into those sections has no position to open to"
+            % (present.count(False), len(present))
+        )
+    else:
+        assert not any(present), (
+            "markdown chunks carry `section_index` but _UNIT_LOCATOR_KEYS does not register it, "
+            "so the receipt will say locator_kind=none while the chunks say otherwise"
+        )
 
 
 def test_csv_agrees_with_whatever_the_module_registers(csv_chunks):

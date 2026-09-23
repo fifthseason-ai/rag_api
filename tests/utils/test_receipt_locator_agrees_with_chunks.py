@@ -75,9 +75,10 @@ _LOADER_NATIVE_LOCATOR_KEYS = {
     "slide_number": "pptx",  # SlidePowerPointLoader
     "page_name": "xlsx",     # UnstructuredExcelLoader mode="elements"
     "row": "csv",            # RowCSVLoader / langchain CSVLoader (registered by #36)
+    "section_index": "md",   # HeadingMarkdownLoader (registered by PACKET-1 E4)
 }
 # Formats that carry no per-unit locator at all -> must fold to a single `none` unit.
-_NONE_FORMATS = {"docx", "md", "txt"}
+_NONE_FORMATS = {"docx", "txt"}
 
 
 # ---------------------------------------------------------------------------
