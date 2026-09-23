@@ -28,9 +28,11 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 
 from main import app
+from app.routes import document_routes
 from app.routes.document_routes import (
     _UNIT_LOCATOR_KEYS,
     _extraction_receipt,
@@ -46,6 +48,19 @@ from tests.utils.test_docx_reading_order import DOCX_MIME, _TEXTBOX, _write_docx
 # change and no literal of the value is written anywhere in this file.
 _KEY = SafeDocxLoader._DOCX_LOCATOR_KEY
 _KIND = SafeDocxLoader._DOCX_LOCATOR_KIND
+
+# DSN-gated real-Postgres round-trip (see test at the end of this file). Modelled on
+# the existing gated suites (tests/services/test_pgvector_realpg.py,
+# tests/utils/test_parse_is_not_index.py): RAG_TEST_PG_DSN selects the database and
+# the port lives ONLY in that env var, so this file hardcodes no port and stays
+# portable. With no DSN the round-trip test SKIPS cleanly (never fails), so a no-DB
+# run stays deterministic; RAG_TEST_PG_REQUIRED=1 turns the skip into an error so a
+# DB run can prove it actually executed.
+PG_DSN = os.environ.get("RAG_TEST_PG_DSN")
+needs_pg = pytest.mark.skipif(
+    not PG_DSN and not os.environ.get("RAG_TEST_PG_REQUIRED"),
+    reason="RAG_TEST_PG_DSN not set: no pgvector for the DOCX locator round-trip",
+)
 
 # Ground-truth tokens for the card fixture, in AUTHORED order. Distinct tokens so a
 # scrambled or dropped unit is unambiguous.
@@ -289,3 +304,158 @@ def test_the_fixture_actually_builds_the_nine_ground_truth_tokens(tmp_path):
         xml = z.read("word/document.xml").decode("utf-8")
     for token in _AUTHORED:
         assert token in xml, f"fixture no longer emits {token!r}"
+
+
+# ---------------------------------------------------------------------------
+# 6. REAL pgvector round-trip (DSN-gated). The fast tests above prove the stamp
+#    reaches the last IN-PROCESS point (the recording double on aadd_documents).
+#    INTEGRATION requires the stamp be proven on a REAL DB round-trip before the PR:
+#    this drives the real /embed route into a real Postgres+pgvector and reads the
+#    values back OUT of the table through the store's OWN product read path. Runs
+#    only when RAG_TEST_PG_DSN is set; skips cleanly otherwise (adds exactly ONE
+#    skip to a no-DB run). SYNTHETIC fixture only.
+# ---------------------------------------------------------------------------
+
+
+def _real_store(collection):
+    """A vector store bound to the real Postgres named by RAG_TEST_PG_DSN, with the
+    pgvector tables dropped and recreated so counts are deterministic. Mirrors the
+    proven setup in test_parse_is_not_index.py::_real_store (conftest no-ops the
+    pgvector __post_init__ for the session, so it is run explicitly here)."""
+    import psycopg2
+    from app.services.vector_store.factory import get_vector_store
+    from tests.utils.test_empty_entitlement_query_path import _DetEmb
+
+    raw = PG_DSN.replace("postgresql+psycopg2://", "postgresql://")
+    with psycopg2.connect(raw) as c, c.cursor() as cur:
+        cur.execute(
+            "DROP TABLE IF EXISTS langchain_pg_embedding, langchain_pg_collection CASCADE"
+        )
+        c.commit()
+    dsn = PG_DSN.replace("postgresql://", "postgresql+psycopg2://", 1)
+    store = get_vector_store(dsn, _DetEmb(), collection, mode="async")
+    from langchain_community.vectorstores.pgvector import _get_embedding_collection_store
+
+    if store.create_extension:
+        store.create_vector_extension()
+    store.EmbeddingStore, store.CollectionStore = _get_embedding_collection_store(
+        store._embedding_length, use_jsonb=store.use_jsonb
+    )
+    store.create_tables_if_not_exists()
+    store.create_collection()
+    return store
+
+
+@needs_pg
+def test_docx_block_locator_round_trips_through_real_pgvector_SYNTHETIC(monkeypatch, tmp_path):
+    """The DOCX block locator survives a REAL Postgres round-trip: every persisted row,
+    read BACK OUT of the table, carries the family index in 0-based contiguous authored
+    order; the /embed receipt names the family and AGREES with the rows; no foreign
+    locator key rides along; and the uploaded filename is preserved.
+
+    READ-BACK PATH. Rows are read through the store's own `get_documents_by_ids` -- the
+    product read path GET /documents uses -- so the real read boundary is exercised, not
+    a hand-rolled SELECT. Raw SQL (psycopg2) is used ONLY to DROP/reset the tables in
+    setup, never to make an assertion; `cmetadata` comes back from Postgres via the store.
+
+    ABLE TO FAIL. The single targeted mutation that reddens the fast in-process test --
+    deleting the `self._DOCX_LOCATOR_KEY: block_index` stamp line in SafeDocxLoader.load()
+    -- also reddens THIS test: the loader still emits one Document per block, so rows are
+    still stored and read back, but each row's cmetadata carries no `_KEY`, and assertion
+    (1) fires first with a message naming the missing stored value ("the loader stamp did
+    not survive to the Postgres row"). Assertion (2) would fire too (the receipt would say
+    'none', not the family).
+
+    LIMIT. Even with the round-trip proven, this is a SYNTHETIC OOXML fixture; it proves
+    loader->route->pgvector fidelity on a KNOWN shape, not against a real client original
+    (Graph/Box consent still outstanding, A3/A4). Embeddings are the offline `_DetEmb`, so
+    vector *values* are not exercised -- only the metadata/text a citation reads.
+    """
+    from app.services.vector_store.extended_pg_vector import ExtendedPgVector
+
+    UPLOAD_NAME = "card.docx"
+    FID = "e1-docx-roundtrip"
+
+    store = _real_store("e1_docx_roundtrip")
+    os.environ["JWT_SECRET"] = "testsecret"
+    if getattr(app.state, "thread_pool", None) is None:
+        app.state.thread_pool = ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(document_routes, "vector_store", store)
+
+    path = tmp_path / UPLOAD_NAME
+    make_card_docx_SYNTHETIC(str(path))
+
+    client = TestClient(app)
+    r = client.post(
+        "/embed",
+        data={"file_id": FID, "entity_id": "userA"},
+        files={"file": (UPLOAD_NAME, io.BytesIO(path.read_bytes()), DOCX_MIME)},
+        headers=_hdr(),
+    )
+    assert r.status_code == 200, r.text
+    receipt = r.json()["extraction"]
+
+    # Read the rows back OUT of Postgres through the store's own product read path.
+    rows = ExtendedPgVector.get_documents_by_ids(store, [FID])
+    metas = [dict(d.metadata or {}) for d in rows]
+
+    # Precondition: rows really landed and were read back (so nothing below is vacuous).
+    assert metas, "no DOCX chunks were read back from Postgres"
+    assert len(metas) == len(_AUTHORED), (
+        f"expected {len(_AUTHORED)} block-indexed chunks in the table, read back "
+        f"{len(metas)}: {[m.get(_KEY) for m in metas]}"
+    )
+
+    # (1) EXACT per-row locator value, read from the DB, against the AUTHORED order.
+    #     Each row's block index must equal its ground-truth token's position in
+    #     _AUTHORED (0-based, reading order); the set must be 0..N-1 contiguous.
+    seen = {}
+    for d, m in zip(rows, metas):
+        idx = m.get(_KEY)
+        assert isinstance(idx, int), (
+            f"stored chunk carries no int {_KEY!r} (value {idx!r}): the loader stamp did "
+            f"not survive to the Postgres row -- row cmetadata read back: {m}"
+        )
+        token = _which_unit(d.page_content)
+        assert idx == _AUTHORED.index(token), (
+            f"stored block index {idx} != authored position {_AUTHORED.index(token)} for "
+            f"unit {token!r} (rows out of order or misindexed in the table)"
+        )
+        seen[idx] = token
+    assert sorted(seen) == list(range(len(_AUTHORED))), (
+        f"block indices read back are not 0-based contiguous: {sorted(seen)}"
+    )
+
+    # (2) The /embed receipt names the family AND agrees with what the rows carry: the
+    #     receipt must not be able to claim a position the store cannot support.
+    assert receipt["locator_kind"] == _KIND, receipt
+    assert _kind_the_store_carries(metas) == receipt["locator_kind"], (
+        f"receipt says locator_kind={receipt['locator_kind']!r} but the stored rows carry "
+        f"{_kind_the_store_carries(metas)!r} (the F-DOCX1/F-NONE1 disagreement)"
+    )
+
+    # (3) EXCLUSION: a DOCX row carries NO OTHER registered locator key. Assert what is
+    #     EXCLUDED (page / slide_number / page_name / row), not only what is contained.
+    other_keys = [key for _k, key in _UNIT_LOCATOR_KEYS if key != _KEY]
+    for m in metas:
+        foreign = [k for k in other_keys if k in m]
+        assert not foreign, (
+            f"a stored DOCX row carries foreign locator key(s) {foreign}: {m}"
+        )
+
+    # (4) PROVENANCE: the uploaded filename is preserved on every stored row, and the
+    #     server-side `source` path derives from it (no other file's bytes leaked in).
+    #     Through /embed, `source` is the route's unique temp path (loader-set,
+    #     `<stem>_<hex>.docx`); the user-facing uploaded name is the `filename` field.
+    for m in metas:
+        assert m.get("filename") == UPLOAD_NAME, m
+        src = m.get("source")
+        assert (
+            isinstance(src, str)
+            and os.path.basename(src).startswith("card_")
+            and src.endswith(".docx")
+        ), f"source not derived from the uploaded file: {src!r}"
+
+    # #85 dedupe preserved end to end: the text box is stored exactly once in the DB.
+    joined = "\n".join(d.page_content for d in rows)
+    assert joined.count(_TB) == 1, f"text box duplicated in Postgres: {joined!r}"
