@@ -201,7 +201,7 @@ def _top(resp):
 def test_dense_leg_returns_expected_passage_and_version(env, monkeypatch):
     from app.routes import document_routes as dr
     monkeypatch.setattr(dr, "HYBRID_SEARCH_ENABLED", False)  # dense only
-    r = env.client.post(f"/query/{ENT}", json={"query": Q_BRIEF, "k": 5}, headers=_tok())
+    r = env.post(f"/query/{ENT}", json={"query": Q_BRIEF, "k": 5}, headers=_tok())
     assert r.status_code == 200, r.text
     content, ingest, fid, name = _top(r)
     assert content == P_BRIEF, content
@@ -218,7 +218,7 @@ def test_keyword_leg_returns_expected_passage_and_version(env, monkeypatch):
         return []
     monkeypatch.setattr(dr.vector_store, "asimilarity_search_with_score_by_vector", _no_dense)
 
-    r = env.client.post(f"/query/{ENT}", json={"query": KW_BRIEF, "k": 5}, headers=_tok())
+    r = env.post(f"/query/{ENT}", json={"query": KW_BRIEF, "k": 5}, headers=_tok())
     assert r.status_code == 200, r.text
     contents = [h[0]["page_content"] for h in r.json()]
     assert P_BRIEF in contents, ("keyword leg missed the expected passage", contents)
@@ -231,7 +231,7 @@ def test_keyword_leg_returns_expected_passage_and_version(env, monkeypatch):
 def test_fused_returns_expected_passage_and_version(env):
     """Default hybrid (dense + keyword fused by RRF): the expected passage tops the fused
     result and carries the expected version."""
-    r = env.client.post(f"/query/{ENT}", json={"query": Q_BRIEF, "k": 5}, headers=_tok())
+    r = env.post(f"/query/{ENT}", json={"query": Q_BRIEF, "k": 5}, headers=_tok())
     assert r.status_code == 200, r.text
     content, ingest, fid, name = _top(r)
     assert content == P_BRIEF, content
@@ -248,9 +248,9 @@ def test_expected_version_rides_every_leg_identically(env, monkeypatch):
     # dense
     with monkeypatch.context() as m:
         m.setattr(dr, "HYBRID_SEARCH_ENABLED", False)
-        seen["dense"] = _top(env.client.post(f"/query/{ENT}", json={"query": Q_BRIEF, "k": 5},
+        seen["dense"] = _top(env.post(f"/query/{ENT}", json={"query": Q_BRIEF, "k": 5},
                                              headers=_tok()))[1]
     # fused
-    seen["fused"] = _top(env.client.post(f"/query/{ENT}", json={"query": Q_BRIEF, "k": 5},
+    seen["fused"] = _top(env.post(f"/query/{ENT}", json={"query": Q_BRIEF, "k": 5},
                                          headers=_tok()))[1]
     assert set(seen.values()) == {ING_BRIEF}, seen
