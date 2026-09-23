@@ -51,6 +51,7 @@ import os
 
 import jwt
 import psycopg2
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
@@ -181,8 +182,18 @@ def env(monkeypatch):
     monkeypatch.setattr(dr, "HYBRID_SEARCH_ENABLED", True)
     monkeypatch.setattr(dr, "RERANK_ENABLED", False)
 
-    with TestClient(app) as client:
-        yield client
+    # NOT `with TestClient(app)`. Entering the context runs the app lifespan, and
+    # LEAVING it calls app.state.thread_pool.shutdown(wait=True) on the module-level app
+    # shared by the whole test session -- every later test that needs the pool then dies
+    # with "cannot schedule new futures after shutdown". Measured on the sibling suite:
+    # 158 failed / 22 errors in a full run with a real DB, while every per-file run
+    # stayed green, because the poisoning only reaches tests that run AFTER it in the
+    # same process. A per-file green cannot see this class of defect at all.
+    #
+    # Same construction as test_entitlement_fused and test_ids_entitlement_scope.
+    if getattr(app.state, "thread_pool", None) is None:
+        app.state.thread_pool = ThreadPoolExecutor(max_workers=2)
+    yield TestClient(app)
 
 
 def _one_hit(env):
