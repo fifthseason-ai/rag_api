@@ -374,7 +374,11 @@ def test_entity_route_post_filter_keeps_correct_data_byte_identical(env, monkeyp
 
     with_filter = call()
     with monkeypatch.context() as m:
-        m.setattr(dr, "_authorized_only", lambda documents, entity_ids: list(documents))
+        # The TRUE identity: the same object back. `list(documents)` used to be one, but a result
+        # now carries its declared score kind (ScoredHits, F-QUERY-SCORE-KIND-ON-THE-WIRE), and a
+        # rebuilt plain list declares nothing -- so the byte comparison below now ALSO proves the
+        # real filter carries the kind across unchanged.
+        m.setattr(dr, "_authorized_only", lambda documents, entity_ids: documents)
         without_filter = call()
 
     assert with_filter.status_code == 200
