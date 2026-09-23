@@ -1115,6 +1115,13 @@ CELL_RANGE_LOCATOR_KIND = "cell_range"
 
 # Additive optional structural fields carried alongside cell_range (declared in the
 # CONTRACT DELTA for P06-5 §2). Not locator families. Absence means UNKNOWN.
+#
+# BEST-EFFORT: `_detect_header_row` picks the first row with >=2 non-empty, not-all-
+# identical cells. It cannot tell a real column header from a two-column key/value
+# preamble (e.g. row 1 ["Prepared by","John Smith"] above a real header at row 3), so
+# it can stamp a CONFIDENTLY WRONG header/header_row. A consumer must treat these as
+# hints, never authoritative; precision lives in cell_range. Absence is still honest
+# UNKNOWN (the field is omitted, never `header: []`).
 XLSX_HEADER_KEY = "header"          # the detected header row's cell values (list[str])
 XLSX_HEADER_ROW_KEY = "header_row"  # 1-indexed worksheet row number of the header
 

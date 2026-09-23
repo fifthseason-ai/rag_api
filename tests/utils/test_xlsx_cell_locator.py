@@ -252,19 +252,32 @@ def test_SYNTHETIC_empty_sheet_has_no_cell_range_at_the_locator_level(tmp_path):
     assert locators["Data"][CELL_RANGE_LOCATOR_KEY] == "Data!A1:B1"
 
 
-def test_SYNTHETIC_no_emitted_document_carries_a_fabricated_extent(tmp_path):
-    """At the loader-document level: every emitted chunk's cell_range (if any) is a
-    real, well-formed, sheet-qualified extent of a POPULATED sheet -- never a
-    degenerate range and never one belonging to the empty sheet."""
-    path = tmp_path / "with-blank.xlsx"
-    make_SYNTHETIC_populated_plus_empty_workbook(str(path))
+def test_SYNTHETIC_present_cell_range_is_wellformed_and_sheet_qualified(tmp_path):
+    """WELL-FORMEDNESS -- not a no-fabrication claim (condition 5 is pinned at the
+    locator level by the test above, which is proven to redden under the fabricate
+    mutation). Every cell_range PRESENT on an emitted document must be a well-formed
+    A1-notation range qualified to that document's OWN sheet. Exercised against a
+    two-populated-sheet workbook so a cross-sheet mislabel or a malformed range would
+    redden it; `checked >= 2` guarantees the assertion actually runs on both sheets
+    rather than passing vacuously."""
+    import re
+
+    path = tmp_path / "merged.xlsx"
+    make_SYNTHETIC_merged_workbook(str(path))
 
     docs = load_documents(path)
+    pattern = re.compile(r"^.+![A-Z]+\d+:[A-Z]+\d+$")
+    checked = 0
     for d in docs:
         cr = d.metadata.get(CELL_RANGE_LOCATOR_KEY)
-        if cr is not None:
-            assert cr.startswith("Data!"), cr          # never the empty "Blank" sheet
-            assert "!" in cr and ":" in cr             # sheet-qualified, real range
+        if cr is None:
+            continue
+        assert pattern.match(cr), "malformed cell_range %r" % cr
+        assert cr.startswith(str(d.metadata.get("page_name")) + "!"), (
+            "%r is not qualified to its own sheet %r"
+            % (cr, d.metadata.get("page_name")))
+        checked += 1
+    assert checked >= 2, "the fixture must exercise cell_range on both sheets"
 
 
 # ===========================================================================
