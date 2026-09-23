@@ -108,7 +108,9 @@ def _baked_resources(dockerfile_text: str) -> set:
     logical = re.sub(r"\\\r?\n", " ", dockerfile_text)
     found = set()
     for line in logical.splitlines():
-        if "nltk.downloader" not in line:
+        # A Dockerfile comment that MENTIONS the downloader is prose, not a bake (RV-114 N4:
+        # it used to be parsed and failed loudly on its own words).
+        if "nltk.downloader" not in line or line.lstrip().startswith("#"):
             continue
         tokens = shlex.split(line.strip())
         args = tokens[tokens.index("nltk.downloader") + 1:]
@@ -208,6 +210,8 @@ print(json.dumps({"imported": "unstructured.nlp.tokenize" in sys.modules, "found
 @pytest.fixture(scope="module")
 def resources():
     """Fail LOUDLY on a version mismatch. Never skip."""
+    # Recorded FIRST, for the in-process half of the self-check at the end of this fixture.
+    imported_before = "unstructured.nlp.tokenize" in sys.modules
     pinned, actual = _pinned_unstructured(), installed_version("unstructured")
     assert actual == pinned, (
         "installed unstructured==%s but requirements.txt pins %s. This guard derives the "
@@ -266,11 +270,43 @@ def resources():
     # is strictly better for visibility, but it would also move the suite's warning count,
     # and several open cards reconcile their acceptance against that number. Trading a
     # shared signal for a local one is the wrong trade. `pytest -s` shows these, and pytest
-    # shows them automatically on any failure.
+    # shows them automatically on any failure. CI runs WITHOUT -s, so in CI the evidence is the
+    # PASSED line, which by construction means the child ran and decided (RV-114 item 2). The
+    # line below therefore prints the child's MEASURED report, not a constant -- a literal
+    # would only prove the fixture reached the print, which PASSED already says (RV-114 N1).
     print("\n[nltk-guard] pinned/installed unstructured : %s" % actual)
     print("[nltk-guard] requested by the library      : %s" % sorted(found))
-    print("[nltk-guard] tokenizer imported by locating : no (fresh interpreter, decided)")
+    print("[nltk-guard] fresh-interpreter child report : %s" % json.dumps(report, sort_keys=True))
+
+    # SECOND, SOMETIMES-DECIDABLE LAYER (RV-114 N2). The child runs only module scope plus
+    # `_requested_resources`, so an import placed in THIS FIXTURE'S BODY is outside it. The
+    # in-process check covers the whole body, but only when nothing imported the tokenizer
+    # before the fixture started -- a single-file run always, a full run never. Kept rather
+    # than replaced: it catches a placement the child cannot, whenever it can decide at all.
+    if not imported_before:
+        assert "unstructured.nlp.tokenize" not in sys.modules, (
+            "this guard's fixture IMPORTED unstructured.nlp.tokenize (decided in-process: nothing "
+            "had imported it when the fixture started). Its module scope runs the nltk download "
+            "routine unless AUTO_DOWNLOAD_NLTK is false. Never import the module; locate it."
+        )
     return found
+
+
+def test_the_bake_parser_reads_crlf_continuations_and_ignores_comments():
+    """Hermetic, no library needed. CI checkouts and the images are LF (the blobs carry no CR;
+    there is no .gitattributes), so NO CI run ever feeds this parser CRLF -- only a Windows
+    worktree with core.autocrlf=true does. That is the case pinned here, with a continuation
+    split across lines and a comment that mentions the downloader, because a claim that CI
+    already exercised CRLF was made about this file and was wrong."""
+    text = (
+        "# RUN python -m nltk.downloader below  <- prose, not a bake\r\n"
+        "RUN python -m nltk.downloader -d /app/nltk_data \\\r\n"
+        "    punkt_tab averaged_perceptron_tagger_eng\r\n"
+    )
+    assert _baked_resources(text) == {"punkt_tab", "averaged_perceptron_tagger_eng"}
+    assert _baked_resources(text.replace("\r\n", "\n")) == {"punkt_tab", "averaged_perceptron_tagger_eng"}
+    # And the whole-token rule holds on CRLF input: the old names are not satisfied by the new.
+    assert "punkt" not in _baked_resources(text)
 
 
 def test_both_dockerfiles_bake_exactly_what_the_library_requests(resources):
