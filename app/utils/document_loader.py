@@ -592,6 +592,18 @@ def process_documents(documents: List[Document]) -> str:
     return processed_text.strip()
 
 
+#: E2 -- native multi-column reading order + running header/footer de-duplication.
+#: Tunables kept as single named constants so a review changes a decision in one
+#: token. This is a NATIVE-PATH-ONLY pass (SafePyPDFLoader._apply_layout): it runs
+#: strictly upstream of `_with_ocr`, so it only ever sees pypdf native text and
+#: never OCR output, and it rewrites `page_content` ONLY -- `page`, `page_label`,
+#: `total_pages`, `source` and `text_source` are never touched.
+_PDF_LAYOUT_MAX_PAGES = 200          # above this many pages, skip the pass (bounded cost)
+_PDF_COLUMN_GAP_PT = 72.0            # min gap (pt) between run x-starts that separates columns
+_PDF_HEADER_FOOTER_BAND_PT = 72.0    # height (pt) of the top/bottom band a running h/f may sit in
+_PDF_HEADER_FOOTER_MIN_REPEAT = 2    # a band line repeated on >= this many pages is a running h/f
+
+
 class SafePyPDFLoader:
     """
     A wrapper around PyPDFLoader that handles image extraction failures gracefully.
@@ -688,7 +700,11 @@ class SafePyPDFLoader:
             # No image extraction: no fallback needed, stream directly.
             # The read bound is applied BEFORE OCR so a page that will be dropped is never
             # OCR'd -- otherwise the expensive work would happen and then be thrown away.
-            yield from self._with_ocr(self._within_budget(loader.lazy_load()))
+            # The layout pass sits BETWEEN the bounded native producer and OCR, so it only
+            # ever reorders native text and OCR output (produced downstream) is untouched.
+            yield from self._with_ocr(
+                self._apply_layout(self._within_budget(loader.lazy_load()))
+            )
             return
 
         # extract_images=True: must collect eagerly so that a mid-stream
@@ -721,7 +737,7 @@ class SafePyPDFLoader:
             else:
                 # Re-raise if it's a different error
                 raise
-        yield from self._with_ocr(iter(pages))
+        yield from self._with_ocr(self._apply_layout(iter(pages)))
 
     # -- bounded reading of a native PDF (FILES-01) ---------------------------------
     #
@@ -840,6 +856,137 @@ class SafePyPDFLoader:
                     "unknown" if not_included is None else not_included,
                 )
             yield held
+
+    # -- native multi-column reading order + running header/footer dedup (E2) -------
+    #
+    # NATIVE PATH ONLY. This pass runs between the native producer (`_within_budget`
+    # over PyPDFLoader) and `_with_ocr`, so it only ever transforms pypdf native
+    # text. A scanned page arrives here with EMPTY text, is left empty and untouched,
+    # and is OCR'd by `_with_ocr` DOWNSTREAM -- OCR output is produced after this pass
+    # and never reaches it. The pass rewrites `page_content` ONLY; `page`,
+    # `page_label`, `total_pages`, `source` and `text_source` are never touched, and a
+    # page whose reorder would come back empty keeps its original text (so a native
+    # page is never turned empty and never wrongly sent to OCR).
+    #
+    # BOUNDED. Positions are re-read with a second pypdf pass, so above
+    # `_PDF_LAYOUT_MAX_PAGES` pages the whole pass is skipped and pages stream
+    # through byte-unchanged. The cost of the second pass on the native path is a
+    # LIMIT to be measured at runtime (like the extraction-bound overhead was).
+
+    @staticmethod
+    def _run_key(text: str) -> str:
+        """Whitespace-normalised run text, for matching a running header/footer that
+        repeats across pages regardless of incidental spacing."""
+        return " ".join((text or "").split()).strip()
+
+    def _positioned_runs(self, page_index, reader):
+        """One page's text runs as (x, y, text) via a pypdf visitor, plus the page
+        height. Returns (None, None) when positions cannot be read, so the caller
+        leaves pypdf's own order in place (never fatal)."""
+        try:
+            if not isinstance(page_index, int) or not (0 <= page_index < len(reader.pages)):
+                return None, None
+            page = reader.pages[page_index]
+            runs = []
+
+            def visit(text, cm, tm, font_dict, font_size):
+                if text and text.strip():
+                    # tm[4]/tm[5] are the text-space origin. cm is identity for the
+                    # native pages this service reads; rotated/scaled/nested-form
+                    # pages are a documented LIMIT (positions would need cm*tm).
+                    runs.append((float(tm[4]), float(tm[5]), text))
+
+            page.extract_text(visitor_text=visit)
+            return runs, float(page.mediabox.height)
+        except Exception as error:  # noqa: BLE001 - never fatal; keep pypdf's order
+            logger.info(
+                "PDF layout pass could not read positions for page %s of %s: %s",
+                page_index, self.filepath, error,
+            )
+            return None, None
+
+    def _running_header_footer_keys(self, per_page):
+        """Normalised text of runs that sit in the top/bottom band AND repeat on at
+        least `_PDF_HEADER_FOOTER_MIN_REPEAT` pages -- i.e. running headers/footers.
+        Counted once per page, so a line appearing twice on one page is not mistaken
+        for a repeat across pages."""
+        from collections import Counter
+
+        counts = Counter()
+        for runs, height in per_page:
+            if not runs or not height:
+                continue
+            in_band = set()
+            for x, y, text in runs:
+                if y >= height - _PDF_HEADER_FOOTER_BAND_PT or y <= _PDF_HEADER_FOOTER_BAND_PT:
+                    in_band.add(self._run_key(text))
+            for key in in_band:
+                counts[key] += 1
+        return {key for key, n in counts.items() if n >= _PDF_HEADER_FOOTER_MIN_REPEAT}
+
+    @staticmethod
+    def _column_boundaries(kept):
+        """The x-start values at which a new column begins: a gap wider than
+        `_PDF_COLUMN_GAP_PT` between consecutive run x-starts. Empty list == a single
+        column."""
+        xs = sorted({round(x, 1) for x, _y, _t in kept})
+        return [xs[i] for i in range(1, len(xs)) if xs[i] - xs[i - 1] > _PDF_COLUMN_GAP_PT]
+
+    def _columns_text(self, runs, drop_keys):
+        """Column-correct reading order for one page: drop running-header/footer runs,
+        cluster the rest into columns by x-start, read each column top-to-bottom
+        (descending y), columns left-to-right. Returns '' when nothing survives."""
+        kept = [(x, y, t) for (x, y, t) in runs if self._run_key(t) not in drop_keys]
+        if not kept:
+            return ""
+        boundaries = self._column_boundaries(kept)
+
+        def column_of(x):
+            return sum(1 for b in boundaries if x >= b)
+
+        kept.sort(key=lambda r: (column_of(r[0]), -r[1]))
+        return "\n".join(t for _x, _y, t in kept)
+
+    def _apply_layout(self, pages: Iterator[Document]) -> Iterator[Document]:
+        """Rewrite each NATIVE page's text into column reading order with running
+        headers/footers removed. Pages with no native text (scans) pass through
+        untouched for OCR downstream. Bounded by `_PDF_LAYOUT_MAX_PAGES`."""
+        materialized = list(pages)
+        if not materialized or len(materialized) > _PDF_LAYOUT_MAX_PAGES:
+            yield from materialized
+            return
+        try:
+            reader = PdfReader(self.filepath)
+        except Exception as error:  # noqa: BLE001 - never fatal; keep pypdf's order
+            logger.info("PDF layout pass could not open %s: %s", self.filepath, error)
+            yield from materialized
+            return
+        per_page = []
+        for doc in materialized:
+            meta = doc.metadata or {}
+            if (doc.page_content or "").strip():
+                per_page.append(self._positioned_runs(meta.get("page"), reader))
+            else:
+                # Scanned/empty: leave it for OCR, never touch it here.
+                per_page.append((None, None))
+        drop_keys = self._running_header_footer_keys(per_page)
+        for doc, (runs, _height) in zip(materialized, per_page):
+            if runs and self._page_needs_rewrite(runs, drop_keys):
+                new_text = self._columns_text(runs, drop_keys)
+                # Never turn a native page empty (that would wrongly trigger OCR).
+                if new_text.strip():
+                    doc.page_content = new_text
+            yield doc
+
+    def _page_needs_rewrite(self, runs, drop_keys) -> bool:
+        """CONSERVATIVE gate: only rewrite a page that is genuinely MULTI-COLUMN or
+        carries a running header/footer to drop. A single-column page with no running
+        line keeps pypdf's ORIGINAL text byte-for-byte, so the common native PDF is
+        untouched and the pass cannot regress its extraction or spacing."""
+        if any(self._run_key(t) in drop_keys for _x, _y, t in runs):
+            return True
+        kept = [(x, y, t) for (x, y, t) in runs if self._run_key(t) not in drop_keys]
+        return len(self._column_boundaries(kept)) >= 1
 
     # -- local-first OCR (FILES-01, FS-CONTINUE-R3) ---------------------------------
     #
