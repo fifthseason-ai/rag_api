@@ -124,8 +124,12 @@ async def test_rerank_success_declares_rerank_relevance(monkeypatch):
 @pytest.mark.parametrize("path", ["provider_raises", "provider_empty", "disabled"])
 async def test_every_rerank_fallback_keeps_the_candidates_kind(monkeypatch, input_kind, path):
     """A failed rerank returns the CANDIDATES' numbers, so it must declare the candidates' kind.
-    The default region (us-east-1) does not host the model, so `provider_raises` is the path a
-    default deployment takes on every /query."""
+
+    This used to add that the default region does not host the model, making `provider_raises`
+    "the path a default deployment takes on every /query". MEASURED false (RV-118 note 1):
+    cohere.rerank-v3-5:0 SUCCEEDED in us-east-1 on a real build, 2026-09-23T21:47Z. Which path a
+    deployment actually takes is a per-account/region fact to probe, so this suite now claims only
+    what it tests: EVERY fallback keeps the candidates' kind, whichever path is taken."""
     monkeypatch.setattr(reranker, "RERANK_ENABLED", path != "disabled")
 
     def _raise(q, d, n):

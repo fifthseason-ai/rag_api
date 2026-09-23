@@ -222,8 +222,12 @@ RRF_K = int(get_env_variable("RRF_K", "60"))
 # After hybrid retrieval, rerank the candidate pool against the question and keep
 # the best ones. Best-effort: on failure it falls back to the pre-rerank order.
 # AWS credentials/region are reused from the Bedrock setup.
-# NOTE: Cohere Rerank 3.5 is region-specific — us-east-1 does NOT host it; use a
-# supported region such as us-west-2.
+# NOTE: Cohere Rerank 3.5 availability is REGION-SPECIFIC, so probe it rather than assume it.
+# This comment used to assert that us-east-1 does NOT host the model. That is measurably wrong
+# here: cohere.rerank-v3-5:0 SUCCEEDED in us-east-1 on a real 18eca4c build, 2026-09-23T21:47Z
+# (RV-118 note 1). That measurement is ONE account on ONE date, so it does not license the
+# opposite absolute either -- hence "probe", not "us-east-1 works". A wrong guess costs recall,
+# not correctness: if the call fails, rerank degrades to the pre-rerank order.
 RERANK_ENABLED = get_env_variable("RERANK_ENABLED", "True").lower() in (
     "true",
     "1",
