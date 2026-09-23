@@ -483,7 +483,10 @@ def get_loader(
         "application/markdown",
         "application/x-markdown",
     ]:
-        loader = UnstructuredMarkdownLoader(filepath)
+        # PACKET-1 E4: one Document per heading-introduced section, each carrying a
+        # 0-indexed `section_index` address (and a proposed display heading_path). Built
+        # on UnstructuredMarkdownLoader(mode="elements") -- same extractor, no new dep.
+        loader = HeadingMarkdownLoader(filepath)
     elif file_ext == "epub" or file_content_type == "application/epub+zip":
         loader = UnstructuredEPubLoader(filepath)
     elif file_ext in ["doc", "docx"] or file_content_type in [
@@ -2278,6 +2281,104 @@ class SlidePowerPointLoader:
                     "slide_title": title,
                 },
             )
+
+    def load(self) -> List[Document]:
+        return list(self.lazy_load())
+
+
+# ---------------------------------------------------------------------------
+# Markdown heading-hierarchy locators (PACKET-1 E4)
+# ---------------------------------------------------------------------------
+
+#: Durable machine ADDRESS for a markdown section: the 0-indexed position of the
+#: section (the span introduced by a heading) in document order. This is the
+#: locator family registered in app/routes/document_routes.py::_UNIT_LOCATOR_KEYS
+#: as ("section", "section_index"). It names the UNIT (a section), not the format,
+#: and is 0-indexed to match the loader-native majority (`page`, `row`, `block`).
+#: SINGLE SOURCE: rename the address key here and it changes everywhere.
+MD_SECTION_INDEX_KEY = "section_index"
+
+#: PROPOSED, PENDING the Core consuming lane (locator-tuple agreement criterion (d)):
+#: a human-readable heading path for DISPLAY only, e.g. "Setup > Prerequisites".
+#: It is NOT an address and MUST NOT be used to locate or reopen a source -- that is
+#: MD_SECTION_INDEX_KEY's job alone. It is carried behind this one constant and the
+#: single emission site in HeadingMarkdownLoader.lazy_load so that, if Core declines
+#: to consume it, removing it is a one-line change rather than a sweep.
+MD_HEADING_PATH_KEY = "heading_path"
+
+#: Display separator between heading levels in MD_HEADING_PATH_KEY (display-only).
+MD_HEADING_PATH_SEP = " > "
+
+
+class HeadingMarkdownLoader:
+    """Load a Markdown file as one Document per SECTION, carrying a per-section locator.
+
+    A *section* is the span of content introduced by a heading, running until the next
+    heading. Content before the first heading (preamble) is a unit with NO address and
+    NO heading path: its position in the heading hierarchy is UNKNOWN, not "no headings",
+    so no locator is fabricated for it (parity with DOCX header/footer and the XLSX
+    empty-sheet ruling -- unpositioned content gets no position).
+
+    Built on UnstructuredMarkdownLoader(mode="elements") -- the SAME extractor the plain
+    (mode="single") path uses -- so no new dependency is added. The wrapper only regroups
+    the elements into sections and stamps the locator; every non-heading element kind is
+    captured as section content, so no text-bearing element is silently dropped. Each
+    emitted Document carries:
+      * source        -- the uploaded file path (provenance unchanged)
+      * section_index -- 0-indexed section position in document order (the ADDRESS)
+      * heading_path  -- PROPOSED display-only readable path (pending Core; see the
+                         constant above)
+    """
+
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self._temp_filepath = None  # parity with the loader cleanup contract
+
+    def _elements(self) -> List[Document]:
+        return UnstructuredMarkdownLoader(self.filepath, mode="elements").load()
+
+    def lazy_load(self) -> Iterator[Document]:
+        heading_stack: List[list] = []   # active heading path: [[depth, text], ...]
+        section_index = -1               # becomes 0 at the first heading
+        units: List[dict] = []           # sections, in document order
+        preamble: Optional[dict] = None  # pre-first-heading unit, if any element appears
+
+        for el in self._elements():
+            meta = getattr(el, "metadata", None) or {}
+            text = getattr(el, "page_content", None) or ""
+            if meta.get("category") == "Title":
+                depth = meta.get("category_depth")
+                depth = depth if isinstance(depth, int) else 0
+                # A heading of depth D closes every open heading at depth >= D.
+                while heading_stack and heading_stack[-1][0] >= depth:
+                    heading_stack.pop()
+                heading_stack.append([depth, text.strip()])
+                section_index += 1
+                unit_meta = {MD_SECTION_INDEX_KEY: section_index}
+                # SINGLE EMISSION SITE for the PROPOSED, PENDING-Core display field.
+                path = MD_HEADING_PATH_SEP.join(t for _d, t in heading_stack if t)
+                if path:
+                    unit_meta[MD_HEADING_PATH_KEY] = path
+                # The heading text is part of the section content so no text is lost.
+                units.append({"meta": unit_meta, "parts": [text]})
+            elif units:
+                units[-1]["parts"].append(text)
+            else:
+                if preamble is None:
+                    preamble = {"meta": None, "parts": []}
+                preamble["parts"].append(text)
+
+        ordered = ([preamble] if preamble is not None else []) + units
+        for unit in ordered:
+            content = "\n\n".join(p for p in unit["parts"] if p and p.strip()).strip()
+            doc_meta = {"source": self.filepath}
+            if unit["meta"]:
+                doc_meta.update(unit["meta"])
+            # A heading section is always citable (its heading is itself content). A
+            # preamble with no text is nothing to cite -> dropped, never emitted as a
+            # phantom no-locator unit.
+            if content or unit["meta"]:
+                yield Document(page_content=content, metadata=doc_meta)
 
     def load(self) -> List[Document]:
         return list(self.lazy_load())
