@@ -75,9 +75,17 @@ _LOADER_NATIVE_LOCATOR_KEYS = {
     "slide_number": "pptx",  # SlidePowerPointLoader
     "page_name": "xlsx",     # UnstructuredExcelLoader mode="elements"
     "row": "csv",            # RowCSVLoader / langchain CSVLoader (registered by #36)
+    # DOCX per-unit block index (E1): SafeDocxLoader emits one block-indexed unit
+    # per authored block. This key is a DELIBERATE HARDCODED LITERAL and must NOT be
+    # imported from the loader or derived from _UNIT_LOCATOR_KEYS: this anchor is
+    # independent of the module on purpose (see the module docstring) so it can catch
+    # the module being wrong. The value is PROVISIONAL — PENDING the FILES lead's
+    # ruling; when the final DOCX locator key is decided, HAND-UPDATE this literal.
+    "block_index": "docx",   # SafeDocxLoader (E1) -- HARDCODED, hand-update on ruling
 }
 # Formats that carry no per-unit locator at all -> must fold to a single `none` unit.
-_NONE_FORMATS = {"docx", "md", "txt"}
+# DOCX left this set at E1: it now carries the block_index per-unit family above.
+_NONE_FORMATS = {"md", "txt"}
 
 
 # ---------------------------------------------------------------------------

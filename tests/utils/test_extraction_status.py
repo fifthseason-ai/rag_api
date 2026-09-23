@@ -42,6 +42,7 @@ from langchain_core.documents import Document
 from main import app
 from app.routes.document_routes import _extraction_receipt
 from app.services.vector_store.async_pg_vector import AsyncPgVector
+from app.utils.document_loader import SafeDocxLoader
 
 # Reuse the synthetic generators / skip marks already proven in WP-C.
 from tests.utils.test_parser_fitness import (
@@ -346,10 +347,25 @@ def test_embed_all_image_pptx_is_empty_receipt_on_422_no_rows(rec_client, tmp_pa
     assert rec_client.inserted_batches == []  # zero vector writes, unchanged
 
 
-def test_embed_docx_reports_complete_locator_none_and_writes(rec_client, tmp_path):
-    """DOCX has no page/slide/sheet locator today -> locator_kind 'none',
-    units_total 1, status 'complete'; rows are written and the receipt is present
-    on the 200 body (consumer-shape lock)."""
+def test_embed_docx_reports_block_locator_family_units_and_writes(rec_client, tmp_path):
+    """FLIPPED for E1 (was ..._reports_complete_locator_none_and_writes): DOCX now
+    carries the per-unit block locator family, so `/embed` reports
+    locator_kind == the family, one unit per authored block, status 'complete';
+    rows are written and the receipt is present on the 200 body (consumer-shape lock).
+
+    make_docx builds a heading + a body paragraph + a 2x2 table + a header + a footer.
+    SafeDocxLoader._body_units emits one unit per direct body `w:p` and one per table
+    cell (row-major), then one per header and footer part, each with a distinct
+    block_index, so the receipt groups them into that many units:
+        2 paragraphs + 4 table cells + 1 header + 1 footer = 8
+    All eight blocks are text-bearing, so units_extracted == units_total == 8. The
+    exact integer is asserted (not >= 1): a loader that dropped a block, merged two,
+    or double-counted the (dedupe-preserved) content would move this number.
+
+    locator_kind is read from the loader's own PROVISIONAL constant so the PENDING
+    FILES-lead ruling stays a one-token change; the receipt derives its kind from the
+    _UNIT_LOCATOR_KEYS registry, so this assertion also proves registry<->loader
+    agreement rather than reading the same value twice."""
     path = tmp_path / "report.docx"
     make_docx(str(path))
     r = _embed(
@@ -363,9 +379,9 @@ def test_embed_docx_reports_complete_locator_none_and_writes(rec_client, tmp_pat
     assert "extraction" in body  # receipt present on the success body
     rec = body["extraction"]
     assert rec["status"] == "complete"
-    assert rec["locator_kind"] == "none"
-    assert rec["units_total"] == 1
-    assert rec["units_extracted"] == 1
+    assert rec["locator_kind"] == SafeDocxLoader._DOCX_LOCATOR_KIND
+    assert rec["units_total"] == 8
+    assert rec["units_extracted"] == 8
     assert rec["empty_locators"] == []
     assert len(rec_client.inserted_batches) >= 1  # rows written
 
