@@ -1582,8 +1582,8 @@ class SafeDocxLoader:
 # defined ONCE here so the loader stamp and the tests never drift apart.
 #
 # `CELL_RANGE_LOCATOR_KEY` = the cmetadata key each sheet chunk carries; its value is
-#     the sheet-qualified occupied extent (e.g. "Revenue!A1:C5") -- a UNIT-named
-#     precision (a range of cells), never the format.
+#     the sheet-qualified occupied extent (e.g. "Revenue!A1:C5") -- a UNIT-named extent
+#     (the sheet's occupied range), never the format.
 # `CELL_RANGE_LOCATOR_KIND` = the value a `locator_kind` would take IF this were ever
 #     promoted to a `_UNIT_LOCATOR_KEYS` family. It is defined only so a future
 #     promotion has one source of truth; it is NOT used today.
@@ -1591,8 +1591,9 @@ class SafeDocxLoader:
 # OPTION 3 RULING (FILES lead, 2026-09-23, PACKET-1-E3-XLSX-PLACEMENT-RULING): these
 # ship as ADDITIVE, OPTIONAL cmetadata fields and are DELIBERATELY NOT registered in
 # `_UNIT_LOCATOR_KEYS`. XLSX `locator_kind` stays `sheet` -- a stable TYPE TAG naming
-# which family the citable position belongs to; precision lives in the VALUE
-# (`cell_range`), which Core reads directly, never in the tag. Registering `cell_range`
+# which family the citable position belongs to; the finer position lives in the VALUE
+# (`cell_range` -- EXACT but COARSE, the whole sheet's occupied extent; see below), which
+# Core reads directly, never in the tag. Registering `cell_range`
 # is a deliberate future act that must trip CONTROL A in
 # test_receipt_locator_agrees_with_chunks.py; the non-promotion is pinned executably by
 # test_xlsx_cell_locator.py. ABSENCE of `cell_range` means UNKNOWN extent, never
