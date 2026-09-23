@@ -1334,9 +1334,10 @@ class SafeDocxLoader:
         - `w:tbl` -> one unit per cell, row-major, via `_table_units` (which applies
           this SAME descent/fail-safe invariant at the row and cell levels).
         - `w:sdt` -> descend into `w:sdtContent` and process its blocks HERE; a
-          nested `w:sdt` recurses through this same branch; an sdt with no
-          `w:sdtContent` holds no body text (its `w:sdtPr` carries no `w:t`) and is
-          skipped cleanly.
+          nested `w:sdt` recurses through this same branch. An sdt with NO
+          `w:sdtContent` wrapper is skipped ONLY when it is genuinely text-free; if
+          such a control still bears `w:t` text (hand-edited / third-party markup),
+          it raises `_UnrepresentableBody` so the text is not silently dropped.
         - anything else -> a text-free structural tag is skipped; but if it carries
           non-whitespace `w:t` text this walk cannot place, raise
           `_UnrepresentableBody` (Part B fail-safe) so `load()` degrades to the
@@ -1355,7 +1356,14 @@ class SafeDocxLoader:
             elif child.tag == sdt_tag:
                 content = child.find(sdtcontent_tag)
                 if content is None:
-                    continue  # no wrapped body content to place
+                    # A content control with NO sdtContent wrapper: if it still
+                    # bears authored text (hand-edited / third-party markup), fail
+                    # closed to the flat path so that text is not silently dropped
+                    # -- the same invariant the sibling branch enforces. A genuinely
+                    # empty control (no w:t) skips cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
+                    continue
                 yield from cls._block_units(list(content))
             elif cls._has_text(child):
                 # A body/sdtContent child this walk does not handle still bears
@@ -1374,7 +1382,8 @@ class SafeDocxLoader:
         - `w:sdt` -> descend into `w:sdtContent` and process the rows it wraps HERE
           (a repeating-section content control emits `w:tr` as sdt-wrapped children
           of the `w:tbl`; a repeating-section ITEM nests another `w:sdt` per row --
-          handled by recursion). An sdt with no `w:sdtContent` is skipped cleanly.
+          handled by recursion). An sdt with no `w:sdtContent` wrapper is skipped
+          only when text-free; if it bears `w:t` text it raises `_UnrepresentableBody`.
         - table-structural children (`w:tblPr`, `w:tblGrid`) carry no `w:t` and are
           skipped; but ANY other child bearing non-whitespace text (e.g. a stray
           `w:p` directly under `w:tbl`) raises `_UnrepresentableBody` so the whole
@@ -1388,6 +1397,11 @@ class SafeDocxLoader:
             elif child.tag == sdt_tag:
                 content = child.find(sdtcontent_tag)
                 if content is None:
+                    # sdt with no sdtContent wrapper at the ROW level: fail closed if
+                    # it bears text (do not silently drop), else skip a genuinely
+                    # empty control cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
                     continue
                 yield from cls._table_units(list(content))
             elif cls._has_text(child):
@@ -1403,8 +1417,9 @@ class SafeDocxLoader:
           wholesale (see its docstring), so nothing BELOW cell level -- nested
           tables, nested sdt, paragraphs -- can be lost. Empty cells are skipped.
         - `w:sdt` -> descend into `w:sdtContent` and process the cells it wraps HERE
-          (a cell-level content control); nested sdt recurses. No `w:sdtContent` ->
-          skipped cleanly.
+          (a cell-level content control); nested sdt recurses. An sdt with no
+          `w:sdtContent` wrapper is skipped only when text-free; if it bears `w:t`
+          text it raises `_UnrepresentableBody`.
         - row-structural children (`w:trPr`) carry no `w:t` and are skipped; ANY
           other child bearing non-whitespace text raises `_UnrepresentableBody`."""
         tc_tag = "{%s}tc" % cls._W_NS
@@ -1418,6 +1433,11 @@ class SafeDocxLoader:
             elif child.tag == sdt_tag:
                 content = child.find(sdtcontent_tag)
                 if content is None:
+                    # sdt with no sdtContent wrapper at the CELL level: fail closed if
+                    # it bears text (do not silently drop), else skip a genuinely
+                    # empty control cleanly.
+                    if cls._has_text(child):
+                        raise _UnrepresentableBody(child.tag)
                     continue
                 yield from cls._row_units(list(content))
             elif cls._has_text(child):
@@ -1468,7 +1488,14 @@ class SafeDocxLoader:
                     for name in sorted(n for n in names if part_re.match(n)):
                         part_root = self._deduped_part(zin.read(name))
                         if part_root is None:
-                            continue
+                            # A header/footer part present but UNPARSEABLE. Do not
+                            # skip it and report `complete` on the body units: the
+                            # flat reader (docx2txt) reads this same part and raises
+                            # a ParseError, so skipping here would turn that honest
+                            # failure into a fake success. Degrade to the flat path
+                            # (symmetric with the doc_root handling above) so the
+                            # real verdict surfaces. Well-formed parts never hit this.
+                            return None
                         text = self._text_of(part_root)
                         if text.strip():
                             aux_units.append(text)

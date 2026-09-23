@@ -29,6 +29,8 @@ SYNTHETIC: every fixture is hand-built OOXML generated at test time.
 
 import zipfile
 
+import pytest
+
 from app.routes.document_routes import _UNIT_LOCATOR_KEYS, _extraction_receipt
 from app.utils.document_loader import SafeDocxLoader, get_loader
 
@@ -191,3 +193,70 @@ def test_receipt_distinguishes_absent_by_nature_but_not_failsafe_vs_no_body_SYNT
         "locator_kind 'none' -- if this ever differs, the CONTRACT DELTA limitation "
         "changed and the addendum wording needs rereading"
     )
+
+
+def make_body_plus_malformed_header_docx_SYNTHETIC(path):
+    """A DOCX with a WELL-FORMED body (so the structured walk finds body blocks) and
+    a header1.xml that is NOT well-formed XML (an unclosed element). docx2txt reads
+    the same header part and raises a ParseError, so the honest flat verdict is a
+    hard failure -- not a silent `complete` over the dropped header."""
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>'
+        "</Types>"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+        "</Relationships>"
+    )
+    document = (
+        f'<?xml version="1.0"?><w:document xmlns:w="{W_NS}"><w:body>'
+        "<w:p><w:r><w:t>BODYTEXT</w:t></w:r></w:p>"
+        '<w:sectPr><w:headerReference w:type="default" r:id="rIdH" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/></w:sectPr>'
+        "</w:body></w:document>"
+    )
+    # Malformed: the <w:hdr> element is never closed -> ET.ParseError on parse.
+    bad_header = f'<?xml version="1.0"?><w:hdr xmlns:w="{W_NS}"><w:p><w:r><w:t>HDR_SECRET</w:t></w:r></w:p>'
+    drels = (
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rIdH" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>'
+        "</Relationships>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document)
+        z.writestr("word/_rels/document.xml.rels", drels)
+        z.writestr("word/header1.xml", bad_header)
+
+
+def test_malformed_header_part_degrades_to_flat_not_fake_complete_SYNTHETIC(tmp_path):
+    """RED-FIRST for the FOURTH skip-site the loader sweep found: the header/footer
+    `part_root is None` branch in `_structured_units` did a bare `continue`, so an
+    UNPARSEABLE header part was skipped and the body units were returned.
+
+    PRE-FIX (head f551890): `_structured_units` returned `(body_units, [])` and
+    load() reported a `block`/complete document -- turning docx2txt's honest
+    ParseError on that same header part into a fake success. This test FAILS there
+    (structured is not None; load() does not raise). POST-FIX: `_structured_units`
+    returns None and load() degrades to the flat path, where docx2txt raises its
+    real verdict (an honest failure, never a silent complete over a dropped part).
+    Well-formed header/footer parts never hit this path."""
+    path = tmp_path / "bad_hdr.docx"
+    make_body_plus_malformed_header_docx_SYNTHETIC(str(path))
+    loader, known, ext = get_loader("bad_hdr.docx", DOCX_MIME, str(path))
+    assert known is True and ext == "docx"
+
+    # The structured walk does not silently complete over the unparseable header.
+    assert loader._structured_units() is None
+
+    # The honest verdict surfaces on the flat path (docx2txt raises ParseError),
+    # rather than a `complete` receipt that dropped the header's text.
+    with pytest.raises(Exception):
+        loader.load()

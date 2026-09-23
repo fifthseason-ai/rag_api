@@ -84,6 +84,14 @@ def _customxml(inner_blocks):
     )
 
 
+def _sdt_no_content(inner):
+    """A content control with NO `w:sdtContent` wrapper (hand-edited / third-party
+    markup): the payload sits directly under `w:sdt`. `child.find(w:sdtContent)`
+    returns None, so a conformant reader ignores the control's body -- meaning its
+    text would be silently dropped unless the loader fail-safes on it."""
+    return "<w:sdt><w:sdtPr/>" + inner + "</w:sdt>"
+
+
 def _load(tmp_path, name, body):
     path = tmp_path / name
     _write_docx(str(path), body)
@@ -468,3 +476,76 @@ def test_failsafe_fires_on_unhandled_text_bearing_child_inside_a_table_SYNTHETIC
             assert key not in meta, (
                 f"{case}: flat-fallback chunk carries locator key {key!r}: {meta}"
             )
+
+
+# ---------------------------------------------------------------------------
+# 8. A content control that carries text but has NO w:sdtContent wrapper must NOT
+#    be silently dropped by the sdt branch's `continue`. One case per sdt site
+#    (body / table / row). RED-FIRST vs head f551890 (bare continue skipped it).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("case", ["body", "table", "row"])
+def test_wrapperless_sdt_with_text_forces_flat_fallback_SYNTHETIC(tmp_path, case):
+    """RED-FIRST for the bare-`continue` content-loss defect at all three sdt sites.
+
+    An sdt that carries authored text but has NO `w:sdtContent` wrapper
+    (hand-edited / third-party markup -- the untrusted-original case this card's
+    deferral is about) at the body, table (row-level) and row (cell-level) sites.
+
+    PRE-FIX (head f551890): each sdt branch did a bare `continue` when
+    `find(w:sdtContent)` was None, so the fail-safe directly below was never reached
+    and the control's text was silently dropped while the receipt reported complete.
+    This test FAILS there (`_structured_units` is not None; the text is missing).
+    POST-FIX: `_has_text` is checked before the continue, the fail-safe fires, and
+    the whole document degrades to flat -- text preserved, locator_kind none, no
+    partial stamp."""
+    if case == "body":
+        lost = "SDT_NOWRAP_BODY"
+        body = _para("H1_TOP") + _sdt_no_content(_para(lost)) + _para("P_AFTER")
+    elif case == "table":
+        lost = "SDT_NOWRAP_ROW"
+        tr = "<w:tr><w:tc>" + _para(lost) + "</w:tc></w:tr>"
+        table = (
+            "<w:tbl><w:tr><w:tc>" + _para("PLAINCELL") + "</w:tc></w:tr>"
+            + _sdt_no_content(tr) + "</w:tbl>"
+        )
+        body = _para("BODY0") + table
+    else:  # row
+        lost = "SDT_NOWRAP_CELL"
+        tc = "<w:tc>" + _para(lost) + "</w:tc>"
+        row = "<w:tr><w:tc>" + _para("PLAINCELL") + "</w:tc>" + _sdt_no_content(tc) + "</w:tr>"
+        body = _para("BODY0") + "<w:tbl>" + row + "</w:tbl>"
+
+    _path, loader = _load(tmp_path, f"nowrap_{case}.docx", body)
+
+    # The whole walk abandons rather than silently drop the wrapperless control.
+    assert loader._structured_units() is None, (
+        f"{case}: a text-bearing sdt with no sdtContent was not fail-safed"
+    )
+    docs = loader.load()
+    joined = "\n".join(d.page_content for d in docs)
+    # No authored text lost: docx2txt (flat) reads the w:t under the bare sdt.
+    assert lost in joined, f"{case}: wrapperless sdt text dropped on the flat path: {joined!r}"
+    assert _extraction_receipt(docs)["locator_kind"] == "none"
+    for d in docs:
+        meta = d.metadata or {}
+        for _kind, key in _UNIT_LOCATOR_KEYS:
+            assert key not in meta, (
+                f"{case}: flat-fallback chunk carries locator key {key!r}: {meta}"
+            )
+
+
+def test_genuinely_empty_wrapperless_sdt_skips_cleanly_SYNTHETIC(tmp_path):
+    """The fix must NOT over-fire: an sdt with no sdtContent AND no text (a
+    genuinely empty control) is skipped cleanly and the surrounding body still
+    structures normally (locator_kind block), never degrading to flat."""
+    H1, AFTER = "H1_TOP", "P_AFTER"
+    empty_sdt = "<w:sdt><w:sdtPr/></w:sdt>"
+    body = _para(H1) + empty_sdt + _para(AFTER)
+    _path, loader = _load(tmp_path, "empty_nowrap.docx", body)
+
+    docs = loader.load()
+    assert [_which(d.page_content, [H1, AFTER]) for d in docs] == [H1, AFTER]
+    assert [d.metadata[_KEY] for d in docs] == [0, 1]
+    assert _extraction_receipt(docs)["locator_kind"] == _KIND
