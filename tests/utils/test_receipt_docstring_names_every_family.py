@@ -84,19 +84,30 @@ def test_the_comment_above_the_tuple_names_every_family_key_and_no_count():
     the two pins above could not see it, because they read only the receipt docstring. This
     extends the same pin to the comment a maintainer reads first.
 
-    Two checks: every registered METADATA KEY appears in backticks (the comment is about the
-    keys loaders emit, so that is the form it names them in), and the comment states NO count
-    of families -- a count written in prose is precisely the part that went stale."""
+    Three checks: every registered METADATA KEY appears in backticks exactly once (the comment
+    is about the keys loaders emit, so that is the form it names them in); they appear in
+    TUPLE ORDER, because the comment says ORDER IS PRECEDENCE and a reordered list would misstate
+    precedence to its reader (RV-115 N1); and the comment states NO count of families -- a count
+    written in prose is precisely the part that went stale (RV-115 N2 widened the phrasings)."""
     block = _comment_above_the_tuple()
+    positions = []
     for kind, key in _UNIT_LOCATOR_KEYS:
-        assert "`%s`" % key in block, (
-            "the comment above _UNIT_LOCATOR_KEYS does not name the %r family's key `%s`. The "
+        n = block.count("`%s`" % key)
+        assert n == 1, (
+            "the comment above _UNIT_LOCATOR_KEYS names the %r family's key `%s` %d time(s); it "
+            "must name it exactly once (absent = stale; twice = its position is ambiguous). The "
             "tuple decides; update the comment in the same commit that changes the tuple."
-            % (kind, key)
+            % (kind, key, n)
         )
-    count = re.search(
-        r"\b(existing|current|registered) (one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b",
-        block, re.I)
+        positions.append(block.index("`%s`" % key))
+    assert positions == sorted(positions), (
+        "the comment names the family keys in a different order from _UNIT_LOCATOR_KEYS (%r). "
+        "The order IS the detection precedence, so the prose must list them in tuple order."
+        % [key for _p, key in sorted(zip(positions, (k for _kind, k in _UNIT_LOCATOR_KEYS)))]
+    )
+    number = r"(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
+    count = (re.search(r"\b(?:existing|current|registered) %s\b" % number, block, re.I)
+             or re.search(r"\b%s\s+(?:\w+\s+)?famil(?:y|ies)\b" % number, block, re.I))
     assert count is None, (
         "the comment above _UNIT_LOCATOR_KEYS states a family count (%r). Counts in prose go "
         "stale the moment a family is appended -- that is how this comment went wrong the "
