@@ -23,6 +23,10 @@ position in document order, so INSERTING or REMOVING a preceding section shifts 
 section's index. That is inherent to positional addressing and consistent with the DOCX
 `block_index` family; a rename in place (this suite's property 3) does not shift it.
 
+LIMIT (empty headings): an ATX `#` with no text (or `## `) is not emitted as a `Title` by
+unstructured, so its body gets NO address and folds into the preceding unit. Content is
+preserved, but a titleless heading is not citable.
+
 INDEPENDENT ANCHOR: the expected wire keys `section_index` / `heading_path` are hardcoded
 here on purpose -- the same deliberate independence the receipt-agreement anchor uses -- so
 this suite pins the CONTRACT the loader must satisfy, not whatever the module happens to say.
@@ -200,14 +204,16 @@ def test_address_is_a_machine_value_never_display_text(tmp_path):
 
 
 def test_duplicate_headings_resolve_through_the_address(tmp_path):
+    # The fixture has two sections with the SAME heading text "Overview" (pinned by
+    # test_fixture_is_nested_and_has_a_duplicate_heading). This test stays purely about the
+    # ADDRESS: no assertion here reads heading_path, so removing that PROPOSED display field
+    # can never redden an address-named test. (The path side is asserted in
+    # test_proposed_heading_path_matches_the_hierarchy.)
     docs = _load_sections(_write(tmp_path, _synthetic_md()))
     first = _section_of(docs, _MARK[0])   # H1 Overview
     dup = _section_of(docs, _MARK[3])     # H2 Overview -- SAME heading text
 
-    # Same heading text ...
-    assert first.metadata.get(_PATH_KEY, "").endswith("Overview")
-    assert dup.metadata.get(_PATH_KEY, "").endswith("Overview")
-    # ... but DIFFERENT addresses ...
+    # DIFFERENT addresses ...
     assert first.metadata.get(_ADDRESS_KEY) != dup.metadata.get(_ADDRESS_KEY)
     # ... and each address resolves to its OWN content, not the other's.
     assert _MARK[0] in first.page_content and _MARK[3] not in first.page_content
@@ -257,6 +263,15 @@ def test_proposed_heading_path_matches_the_hierarchy(tmp_path):
         assert sec.metadata.get(_PATH_KEY) == expected, (
             "section %d display path %r != expected %r"
             % (idx, sec.metadata.get(_PATH_KEY), expected))
+    # The two DUPLICATE-heading sections both display a path ENDING in the same text
+    # "Overview" yet the paths differ by their parent -- the display side of the property
+    # whose ADDRESS side lives in test_duplicate_headings_resolve_through_the_address. Kept
+    # here (not there) so a decline of this PROPOSED field never reddens an address test.
+    first = _section_of(docs, _MARK[0])   # H1 Overview
+    dup = _section_of(docs, _MARK[3])     # H2 Overview -- SAME heading text
+    assert first.metadata.get(_PATH_KEY, "").endswith("Overview")
+    assert dup.metadata.get(_PATH_KEY, "").endswith("Overview")
+    assert first.metadata.get(_PATH_KEY) != dup.metadata.get(_PATH_KEY)
 
 
 # ---------------------------------------------------------------------------

@@ -371,7 +371,9 @@ def test_embed_docx_reports_complete_locator_none_and_writes(rec_client, tmp_pat
 
 
 def test_embed_markdown_reports_complete(rec_client, tmp_path):
-    """A markdown file extracts to text -> complete, locator none."""
+    """A markdown file extracts to text -> complete. (Since PACKET-1 E4 markdown carries a
+    per-section `section` locator; this test asserts only the complete-status/units contract,
+    not the locator family -- see tests/utils/test_md_heading_locator.py for the locator.)"""
     path = tmp_path / "note.md"
     make_markdown(str(path))
     r = _embed(rec_client, "note.md", path.read_bytes(), "text/markdown")
