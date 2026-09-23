@@ -299,13 +299,22 @@ def test_a_successful_rerank_declares_relevance_and_the_numbers_are_the_provider
     assert (kind, direction) == ("rerank_relevance", "higher_is_better"), (kind, direction)
     assert given, "the provider was never called: not the rerank path"
     assert {t: s for t, s in hits} == {t: given[t] for t, _s in hits}, (hits, given)
+    # RV-118 note 1: the label and the numbers can both be right while the list is served in the
+    # wrong ORDER; a relevance must also be a relevance.
+    scores = [s for _t, s in hits]
+    assert scores == sorted(scores, reverse=True), "declared higher_is_better, served %r" % scores
+    assert all(0.0 <= s <= 1.0 for s in scores), "rerank_relevance outside [0, 1]: %r" % scores
 
 
 @needs_pg
 @pytest.mark.parametrize("route", sorted(_ROUTES))
 def test_a_failed_rerank_declares_the_fallbacks_kind_and_its_numbers(astore, monkeypatch, route):
-    """The default region (us-east-1) does not host the model, so on a default deployment this is
-    the path EVERY /query takes. The numbers are the pre-rerank RRF numbers; so is the kind."""
+    """A rerank provider that fails (credentials, region, an outage) falls back to the pre-rerank
+    list: the numbers are the pre-rerank RRF numbers, so is the kind, and so is the ORDER.
+
+    (The config comment says the default region us-east-1 does not host the model. MEASURED
+    2026-09-23T21:47Z on a real 18eca4c build: cohere.rerank-v3-5:0 SUCCEEDED in us-east-1. So
+    this fallback is not the default path; the success path is -- see the test above.)"""
     from app.config import RRF_K
     from app.routes import document_routes as dr
     from app.services import reranker
@@ -325,3 +334,7 @@ def test_a_failed_rerank_declares_the_fallbacks_kind_and_its_numbers(astore, mon
     assert (kind, direction) == ("rrf", "higher_is_better"), (kind, direction)
     for text, score in hits:
         assert math.isclose(score, expected[text], rel_tol=0, abs_tol=1e-6), (text, score, expected[text])
+    scores = [s for _t, s in hits]
+    assert scores == sorted(scores, reverse=True), (
+        "declared higher_is_better, but the fallback served %r (RV-118 M6: right label, right "
+        "numbers, worst-first order)" % scores)
