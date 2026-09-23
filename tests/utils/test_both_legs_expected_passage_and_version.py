@@ -166,6 +166,18 @@ def env(monkeypatch):
     monkeypatch.setattr(dr, "HYBRID_SEARCH_ENABLED", True)
     monkeypatch.setattr(dr, "RERANK_ENABLED", False)
 
+    # TestClient uses a fresh loop per request: close the asyncpg keyword pool after each
+    # keyword call so it is rebuilt on the request's own loop (mirror F-ENTITLEMENT-FUSED;
+    # otherwise the stale pool errors and leaks connections that deadlock a later DROP).
+    real_kw = dr.keyword_search
+
+    async def _kw(*a, **k):
+        try:
+            return await real_kw(*a, **k)
+        finally:
+            await PSQLDatabase.close_pool()
+    monkeypatch.setattr(dr, "keyword_search", _kw)
+
     import main
     if getattr(main.app.state, "thread_pool", None) is None:
         main.app.state.thread_pool = ThreadPoolExecutor(max_workers=2)

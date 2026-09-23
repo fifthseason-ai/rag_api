@@ -120,6 +120,7 @@ def _real_store(monkeypatch, collection):
 
 
 def _client(monkeypatch, store):
+    from app.services.database import PSQLDatabase
     os.environ["JWT_SECRET"] = _SECRET
     if getattr(app.state, "thread_pool", None) is None:
         app.state.thread_pool = ThreadPoolExecutor(max_workers=2)
@@ -127,6 +128,18 @@ def _client(monkeypatch, store):
     monkeypatch.setattr("app.config.vector_store", store, raising=False)
     monkeypatch.setattr(document_routes, "HYBRID_SEARCH_ENABLED", True)
     monkeypatch.setattr(document_routes, "RERANK_ENABLED", False)
+
+    # TestClient uses a fresh loop per request: close the asyncpg keyword pool after each
+    # keyword call so it rebuilds on the request's own loop (mirror F-ENTITLEMENT-FUSED),
+    # else the stale pool errors and leaks connections that deadlock a later DROP.
+    real_kw = document_routes.keyword_search
+
+    async def _kw(*a, **k):
+        try:
+            return await real_kw(*a, **k)
+        finally:
+            await PSQLDatabase.close_pool()
+    monkeypatch.setattr(document_routes, "keyword_search", _kw)
     return TestClient(app)
 
 

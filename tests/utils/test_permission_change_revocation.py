@@ -184,6 +184,20 @@ def env(monkeypatch):
         return real_embed(text)
     monkeypatch.setattr(astore.embedding_function, "embed_query", _counting_embed)
 
+    # TestClient runs each request on a FRESH event loop, so an asyncpg keyword pool bound
+    # to a previous request's loop is stale and must not be reused. Mirror F-ENTITLEMENT-
+    # FUSED: close the pool after every keyword call so each request rebuilds it on its own
+    # loop. Without this the pool errors and leaks connections that deadlock the next file's
+    # DROP TABLE (measured 2026-09-23).
+    real_kw = dr.keyword_search
+
+    async def _kw(*a, **k):
+        try:
+            return await real_kw(*a, **k)
+        finally:
+            await PSQLDatabase.close_pool()
+    monkeypatch.setattr(dr, "keyword_search", _kw)
+
     import main
     if getattr(main.app.state, "thread_pool", None) is None:
         main.app.state.thread_pool = ThreadPoolExecutor(max_workers=2)
