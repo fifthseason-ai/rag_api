@@ -1850,12 +1850,20 @@ def _prepare_documents_sync(
 
 
 # Per-unit locator metadata keys, in detection precedence. Each loader emits at
-# most ONE of these families (PDF -> `page`, PPTX -> `slide_number`, XLSX
-# elements -> `page_name`), so the precedence only guards a defensive
-# mixed-metadata edge; a format with no per-unit locator (DOCX/TXT) folds
-# into a single `none` unit. ORDER IS PRECEDENCE (the detection loop breaks on
-# the first family present), so new families append AFTER the existing four so no
-# current format's answer changes.
+# most ONE of these families -- PDF `page`, PPTX `slide_number`, XLSX elements
+# `page_name`, CSV `row`, Markdown `section_index`, DOCX body `block_index` -- so
+# the precedence only guards a defensive mixed-metadata edge. A chunk with none of
+# them folds into a single `none` unit. That is the RULE; the cases are examples,
+# not a list to keep complete: every format whose loader emits none of these keys
+# (document_loader.py get_loader -- e.g. TXT and the other TextLoader formats, RST,
+# XML, EPUB, legacy .ppt), a DOCX header/footer unit, and a DOCX whose structured
+# walk fell back to the fail-safe path (SafeDocxLoader; the receipt cannot yet tell
+# that last case apart -- card F-DEGRADED-EXTRACTION-SIGNAL). ORDER IS PRECEDENCE
+# (the detection loop breaks on the first family present), so a new family APPENDS
+# AT THE END and no current format's answer changes. No count of families is
+# written here on purpose: the count this comment used to carry went stale the moment
+# more families were appended. tests/utils/test_receipt_docstring_names_every_family.py
+# pins this comment to the tuple -- every key, in tuple order, and no count.
 _UNIT_LOCATOR_KEYS = (
     ("page", "page"),           # PDF: 0-indexed page (SafePyPDFLoader / pypdf)
     ("slide", "slide_number"),  # PPTX: 1-indexed true slide index (SlidePowerPointLoader)
