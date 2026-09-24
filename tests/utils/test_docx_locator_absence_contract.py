@@ -15,14 +15,15 @@ proof rather than an assumption:
       could not represent and degraded to the flat path; the whole document reports
       locator_kind="none" and no chunk carries block_index.
 
-MEASURED COLLISION (stated, not resolved here): a document that legitimately has NO
-body blocks (only header/footer, or an empty body) ALSO degrades to
-locator_kind="none". So at the document level, locator_kind="none" does NOT by
-itself separate a fail-safe degradation from a document that simply had no body
-blocks. Fully distinguishing them would require a new receipt signal (a dedicated
-`degraded`/structured-walk flag). Adding a field to the receipt is a FILES producer
-decision, with Core as the consumer that would read it; it is OUT OF E1 SCOPE and no
-such key is added here. The FILES addendum records this limitation.
+THE COLLISION, AND HOW IT IS NOW RESOLVED: a document that legitimately has NO body
+blocks (only header/footer, or an empty body) ALSO reports locator_kind="none". So
+locator_kind alone does NOT separate a fail-safe degradation from a document that simply
+had no body blocks -- measured and pinned here as a limitation at #90 (E1). CARD-P2-01 S1
+(CARD-DEGRADED-EXTRACTION-SIGNAL) added the dedicated signal: the degraded read carries
+`extraction.degraded` on the receipt and `extraction_degraded` on every chunk; the
+no-body read carries neither. locator_kind still reads "none" for both -- truthfully,
+neither has a per-unit locator -- and `degraded` says which one FAILED to have one.
+Recorded in P06-5 contract addendum 3.
 
 SYNTHETIC: every fixture is hand-built OOXML generated at test time.
 """
@@ -41,6 +42,10 @@ from tests.utils.test_parser_fitness import make_docx  # body + header + footer
 
 _KEY = SafeDocxLoader._DOCX_LOCATOR_KEY
 _KIND = SafeDocxLoader._DOCX_LOCATOR_KIND
+#: The WIRE name of the chunk-level degraded stamp (P06-5 addendum 3). A literal on purpose:
+#: it is the contract, so renaming the loader constant must redden this file, and a red-first
+#: run against a tree without the signal fails on an ASSERTION, not on an ImportError.
+_DEGRADED_KEY = "extraction_degraded"
 
 
 def make_header_footer_only_docx_SYNTHETIC(path):
@@ -136,22 +141,26 @@ def test_header_footer_units_carry_no_block_index_SYNTHETIC(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_receipt_distinguishes_absent_by_nature_but_not_failsafe_vs_no_body_SYNTHETIC(tmp_path):
-    """MEASURED locator-absence contract (addendum 2026-09-23). Three documents,
-    read at the loader->receipt boundary:
+def test_receipt_distinguishes_absent_by_nature_failsafe_and_no_body_SYNTHETIC(tmp_path):
+    """The locator-absence contract, NO LONGER a limitation (CARD-DEGRADED-EXTRACTION-SIGNAL,
+    CARD-P2-01 S1). Three documents, read at the loader->receipt boundary:
 
     (1) body + header/footer  -> locator_kind 'block'; body chunks carry a 0-based
         contiguous block_index; the header/footer chunk carries NO block_index.
         => absent-BY-NATURE is distinguishable inside a 'block' document.
     (2) fail-safe degradation (an unrepresentable w:customXml body child) ->
-        locator_kind 'none'.
-    (3) header/footer ONLY, no body block -> locator_kind 'none'.
+        locator_kind 'none' AND `degraded.reason == 'docx_block_unrepresentable'`,
+        status forced to 'partial'.
+    (3) header/footer ONLY, no body block -> locator_kind 'none' and NO `degraded` key.
 
-    => COLLISION: (2) and (3) report the SAME document-level locator_kind 'none', so
-    the receipt does NOT distinguish a fail-safe degradation from a document that
-    simply had no body blocks. This pins the limitation the CONTRACT DELTA states;
-    separating them needs a new receipt signal (a FILES producer decision, Core the
-    consumer), out of E1 scope."""
+    RED-FIRST: this test was `..._but_not_failsafe_vs_no_body_SYNTHETIC` (#90), which PINNED
+    the collision -- (2) and (3) identical at the document level. On main `afd44b9` the
+    assertions on r2['degraded'] fail with KeyError (no such key exists). The distinction
+    lives in `degraded`, NOT in `locator_kind`: both still read 'none', because both
+    genuinely have no per-unit locator; what differs is WHY.
+
+    THE NEGATIVE IS BINDING: (3) must carry no degraded signal. An alarm that fires on the
+    ordinary no-structure case teaches readers to ignore it -- the same defect one level along."""
     # (1) body + header/footer
     p1 = tmp_path / "body_hf.docx"
     make_docx(str(p1))
@@ -163,6 +172,7 @@ def test_receipt_distinguishes_absent_by_nature_but_not_failsafe_vs_no_body_SYNT
     assert r1["locator_kind"] == _KIND
     assert [d.metadata[_KEY] for d in keyed] == list(range(len(keyed))) and len(keyed) > 1
     assert unkeyed, "the absent-by-nature case needs a header/footer chunk present"
+    assert "degraded" not in r1, f"a structured read must carry no degraded signal: {r1}"
 
     # (2) fail-safe degradation
     body2 = _para("H1") + _customxml(_para("LOSTX")) + _para("AFT")
@@ -185,14 +195,26 @@ def test_receipt_distinguishes_absent_by_nature_but_not_failsafe_vs_no_body_SYNT
     joined3 = "\n".join(d.page_content for d in docs3)
     assert "HEADER confidential" in joined3 or "FOOTER page one" in joined3
 
-    # The distinction that IS on the wire...
-    assert r1["locator_kind"] == _KIND != "none"
-    # ...and the COLLISION that is NOT: fail-safe and no-body are indistinguishable.
-    assert r2["locator_kind"] == r3["locator_kind"] == "none", (
-        "fail-safe and no-body documents must be measured as reporting the same "
-        "locator_kind 'none' -- if this ever differs, the CONTRACT DELTA limitation "
-        "changed and the addendum wording needs rereading"
-    )
+    # Both still read locator_kind 'none' -- neither has a per-unit locator ...
+    assert r2["locator_kind"] == r3["locator_kind"] == "none"
+    # ... and the receipt now says WHY for the one that degraded.
+    assert r2["degraded"] == {
+        "reason": "docx_block_unrepresentable",
+        "scope": "document",
+        "lost": "unit_locators",
+        "units_affected": r2["units_total"],
+    }, r2
+    assert r2["status"] == "partial", (
+        "a degraded read must never read `complete` on the field consumers gate on: %r" % r2)
+    # THE NEGATIVE: the legitimately body-less document carries NO degraded signal at all --
+    # absent, not None, not {} -- and its status is not downgraded by one.
+    assert "degraded" not in r3, (
+        "the no-body document carries a degraded signal: the alarm fires on the normal case. %r" % r3)
+    assert r3["status"] == "complete", r3
+    # The chunk-level stamp mirrors the receipt: on every degraded Document, on no other.
+    assert all((d.metadata or {}).get(_DEGRADED_KEY) == "docx_block_unrepresentable"
+               for d in docs2)
+    assert not any(_DEGRADED_KEY in (d.metadata or {}) for d in docs1 + docs3)
 
 
 def make_body_plus_malformed_header_docx_SYNTHETIC(path):

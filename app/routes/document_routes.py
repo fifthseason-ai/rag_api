@@ -97,6 +97,7 @@ from app.utils.document_loader import (
     process_documents,
     cleanup_temp_encoding_file,
     DocumentVerdictError,
+    DEGRADED_KEY,
 )
 from app.utils.extraction_budget import (
     ATTEMPTED_KEY,
@@ -176,8 +177,7 @@ async def save_upload_file_async(file: UploadFile, temp_file_path: str) -> None:
         # KI-02 SP-01.13 -- a save failure is OUR storage (our temp directory), so it is a service fault:
         # 503, no str(e), no temp path. describe_failure logs the exception and traceback under a
         # reference the caller is given. The path is still in the log line above for the operator.
-        status_code, message = describe_failure(e, getattr(file, "filename", None))
-        raise HTTPException(status_code=status_code, detail=message)
+        raise failure_http_exception(e, getattr(file, "filename", None))
 
 
 def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
@@ -193,8 +193,7 @@ def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
             traceback.format_exc(),
         )
         # KI-02 SP-01.13 -- see save_upload_file_async.
-        status_code, message = describe_failure(e, getattr(file, "filename", None))
-        raise HTTPException(status_code=status_code, detail=message)
+        raise failure_http_exception(e, getattr(file, "filename", None))
 
 
 def validate_file_path(base_dir: str, file_path: str) -> Optional[str]:
@@ -475,11 +474,72 @@ def client_safe_error(exc: BaseException, context: str, status_code: int = 500) 
             "An internal error occurred processing this request. "
             f"Quote reference {reference} to an operator."
         ),
+        # CARD-P2-01 S1 D: the reference as a field, so a consumer never regexes the sentence.
+        headers={HEADER_ERROR_REFERENCE: reference},
     )
+
+
+#: Machine-readable failure typing on the FAILED paths (CARD-P2-01 S1, part D). `detail` stays a
+#: plain string there on purpose (Core interpolates it into a toast -- see `describe_failure`), so the
+#: typed half rides RESPONSE HEADERS, additively; no status code changes.
+#:   X-Failure-Attribution  the SAME token this module already logs as `[attribution=...]`, so the
+#:                          log and the wire share one vocabulary (see `FAILURE_ATTRIBUTIONS`)
+#:   X-Error-Reference      the reference quoted in the sentence, without parsing the sentence
+HEADER_FAILURE_ATTRIBUTION = "X-Failure-Attribution"
+HEADER_ERROR_REFERENCE = "X-Error-Reference"
+
+#: Every attribution token the failure paths can send. What each lets a consumer decide WITHOUT
+#: reading prose:
+#:   service                            503 -- ours, transient: retry
+#:   undetermined                       400 -- cause not established: do not blame the file, do not loop
+#:   service:pandoc_not_installed       400 -- ours, permanent until an operator installs pandoc
+#:   service:libreoffice_not_installed  400 -- ours, permanent until an operator acts; re-saving as
+#:                                      .docx/.xlsx/.pptx works today
+#:   content:name_too_long              400 -- the uploader's file NAME: rename and retry
+#:   request:invalid_path               400 -- the upload path (file name or entity id) was refused
+#:                                      before any work (path validation): fix the request
+#: A new token APPENDS here; renaming one silently breaks a consumer that branches on it.
+FAILURE_ATTRIBUTIONS = (
+    "service",
+    "undetermined",
+    "service:pandoc_not_installed",
+    "service:libreoffice_not_installed",
+    "content:name_too_long",
+    "request:invalid_path",
+)
+
+
+def _failure_headers(attribution: str, reference: Optional[str] = None) -> dict:
+    headers = {HEADER_FAILURE_ATTRIBUTION: attribution}
+    if reference:
+        headers[HEADER_ERROR_REFERENCE] = reference
+    return headers
 
 
 def describe_failure(error: BaseException, filename: str) -> tuple:
     """Turn a non-verdict failure into `(status_code, caller_message)` and log the real detail.
+
+    Kept for callers that need only the pair. Routes raise `failure_http_exception`, which carries the
+    same answer plus the typed headers.
+    """
+    status_code, message, _attribution, _reference = _attribute_failure(error, filename)
+    return status_code, message
+
+
+def failure_http_exception(error: BaseException, filename: str) -> HTTPException:
+    """The HTTPException every intake failure path raises: `describe_failure`'s status and sentence,
+    plus `X-Failure-Attribution` and `X-Error-Reference` so a consumer can branch on
+    retry / operator / rename / unknown without parsing the sentence (CARD-P2-01 S1, part D)."""
+    status_code, message, attribution, reference = _attribute_failure(error, filename)
+    return HTTPException(
+        status_code=status_code,
+        detail=message,
+        headers=_failure_headers(attribution, reference),
+    )
+
+
+def _attribute_failure(error: BaseException, filename: str) -> tuple:
+    """`(status_code, caller_message, attribution, reference)` for a non-verdict failure; logs it.
 
     The caller gets a sentence and a reference. The operator gets the exception, its type and the
     traceback under that same reference. Withholding internals is only acceptable because the reference
@@ -489,7 +549,9 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
     `detail` straight into the user's toast (`crud.js:341`), so an object renders there as
     `[object Object]` — a live defect this lane found and recorded. The machine-readable half is the
     STATUS CODE, which every consumer already reads; the human half is the sentence. Neither needs the
-    other to be fixed first.
+    other to be fixed first. WITHIN one status (four different 400s), the typed half is the
+    `attribution` token returned here, which `failure_http_exception` puts on the wire as
+    `X-Failure-Attribution` -- the same token the log line carries, so there is one vocabulary.
     """
     reference = uuid.uuid4().hex[:12]
     name = filename or "the uploaded file"
@@ -508,6 +570,8 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
         return (
             status.HTTP_400_BAD_REQUEST,
             f"{ERROR_MESSAGES.PANDOC_NOT_INSTALLED} Reference: {reference}.",
+            "service:pandoc_not_installed",
+            reference,
         )
     if _is_libreoffice_missing(error):
         # Same repair as pandoc's, for the same reason: permanent until an operator acts, so it
@@ -535,6 +599,8 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
             f"which is not installed on this server. Re-saving it in the current format "
             f"(.docx, .xlsx, .pptx) will work today; installing LibreOffice is the operator fix. "
             f"Retrying this upload unchanged will not help. Reference: {reference}.",
+            "service:libreoffice_not_installed",
+            reference,
         )
     if _is_name_too_long(error):
         # SP-01.15 -- we know exactly what is wrong here, so say it instead of "cause not established".
@@ -551,6 +617,8 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
             status.HTTP_400_BAD_REQUEST,
             f"'{name}' could not be saved because the file name is too long. Shorten it and upload "
             f"again. Reference: {reference}.",
+            "content:name_too_long",
+            reference,
         )
     service = is_service_fault(error)
     if service:
@@ -574,7 +642,7 @@ def describe_failure(error: BaseException, filename: str) -> tuple:
         error,
         traceback.format_exc(),
     )
-    return status_code, message
+    return status_code, message, ("service" if service else "undetermined"), reference
 
 
 async def load_file_content(
@@ -687,8 +755,7 @@ async def load_file_content(
         # KI-02 SP-01.10 — anything that is not a terminal verdict about the FILE. The uploader is never
         # told their file is bad on the strength of an exception we have not classified, and never
         # receives `str(error)`.
-        status_code, message = describe_failure(error, filename)
-        raise HTTPException(status_code=status_code, detail=message) from error
+        raise failure_http_exception(error, filename) from error
     finally:
         # Clean up temporary UTF-8 file if it was created for encoding conversion
         if loader is not None:
@@ -1281,14 +1348,46 @@ def _authorized_only(documents, entity_ids):
     )
 
 
+#: The key the stored-link backfill MOVES a refused `link` into
+#: (C:/fswt/.coord/FILES-DEV/CARD-F-EMBED-LINK-BACKFILL-2026-09-24T113102Z.md, MUTATION:
+#: `(cmetadata - 'link') || jsonb_build_object('quarantined_link', ..., 'quarantined_reason', ...,
+#: 'quarantined_at', ...)`). Its PRESENCE is the quarantine marker -- the same predicate the card's
+#: own idempotency guard uses (`NOT (cmetadata ? 'quarantined_link')`). Read here, never written:
+#: rag_api invents no second marker.
+QUARANTINED_LINK_KEY = "quarantined_link"
+
+LINK_STATE_PRESENT = "present"
+LINK_STATE_QUARANTINED = "quarantined"
+LINK_STATE_NONE = "none"
+
+
+def _link_state(metadata: dict) -> str:
+    """'quarantined' | 'present' | 'none' for one stored chunk (CARD-P2-01 S1, part C).
+
+    Before this, a consumer could not tell "this source never had a link" from "its link was
+    quarantined by the backfill": both simply lack `link`. QUARANTINED WINS over a `link` that
+    is somehow also present (not producible by the card's SQL, which removes `link` in the same
+    statement): a row under quarantine is never reported as carrying a usable link. An empty
+    `link` is `none` -- the write path never stores one (`_prepare_documents_sync`), and the
+    backfill's dry-run treats '' as absent too.
+    """
+    if QUARANTINED_LINK_KEY in metadata:
+        return LINK_STATE_QUARANTINED
+    if metadata.get("link"):
+        return LINK_STATE_PRESENT
+    return LINK_STATE_NONE
+
+
 def _on_the_wire(documents) -> list:
     """The `[document, score]` pairs a query route returns, each document declaring what the
-    score means (`score_kind`, `score_direction`; P06-5 contract addendum 2).
+    score means (`score_kind`, `score_direction`; P06-5 contract addendum 2) and whether its
+    citation link is present, quarantined or absent (`link_state`; CARD-P2-01 S1).
 
     The ONE place every query route builds its response, so the three routes cannot disagree.
-    The pair shape and the number are unchanged; the two fields are additive and top-level on
-    the document, never inside `metadata`. An undeclared list (built outside the pipeline)
-    goes out as null/null: UNKNOWN, stated rather than guessed.
+    The pair shape and the number are unchanged; the fields are additive and top-level on
+    the document, never inside `metadata` -- `metadata` goes out exactly as stored. An
+    undeclared list (built outside the pipeline) goes out as null/null: UNKNOWN, stated rather
+    than guessed.
     """
     kind = kind_of(documents)
     direction = DIRECTION.get(kind) if kind else None
@@ -1301,6 +1400,7 @@ def _on_the_wire(documents) -> list:
                 type=getattr(doc, "type", None),
                 score_kind=kind,
                 score_direction=direction,
+                link_state=_link_state(getattr(doc, "metadata", None) or {}),
             ),
             score,
         )
@@ -1921,8 +2021,9 @@ def _prepare_documents_sync(
 # not a list to keep complete: every format whose loader emits none of these keys
 # (document_loader.py get_loader -- e.g. TXT and the other TextLoader formats, RST,
 # XML, EPUB, legacy .ppt), a DOCX header/footer unit, and a DOCX whose structured
-# walk fell back to the fail-safe path (SafeDocxLoader; the receipt cannot yet tell
-# that last case apart -- card F-DEGRADED-EXTRACTION-SIGNAL). ORDER IS PRECEDENCE
+# walk fell back to the fail-safe path (SafeDocxLoader). That last case is told apart
+# by `extraction.degraded` (DEGRADED_KEY on the chunk), NOT by the locator family --
+# card F-DEGRADED-EXTRACTION-SIGNAL, CARD-P2-01 S1. ORDER IS PRECEDENCE
 # (the detection loop breaks on the first family present), so a new family APPENDS
 # AT THE END and no current format's answer changes. No count of families is
 # written here on purpose: the count this comment used to carry went stale the moment
@@ -2034,7 +2135,9 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       so a document with pages that still need a better reader can
                       never read as `complete` on the field consumers already check --
                       including when every page yielded some text the engine does not
-                      vouch for. Nonempty text is not success.
+                      vouch for. Nonempty text is not success. Likewise forced when
+                      `extraction_bound`, `degraded`, or an incomplete `coverage.image_ocr`
+                      is present: nothing short, stopped or degraded reads `complete`.
       locator_kind:   'page' | 'slide' | 'sheet' | 'row' | 'section' | 'block' | 'none'
                       One member per family in `_UNIT_LOCATOR_KEYS`, in that order, plus
                       'none'; a test pins this line against the tuple because it went
@@ -2083,6 +2186,17 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
                       opened have no locators, so they cannot appear in
                       `empty_locators` — this block is the only place their absence is
                       visible.
+      degraded:       PRESENT ONLY when the loader degraded the read (CARD-DEGRADED-
+                      EXTRACTION-SIGNAL; today: the DOCX structured-walk fail-safe) —
+                      {reason: 'docx_block_unrepresentable' | 'docx_structure_unreadable',
+                       scope: 'document',
+                       lost: 'unit_locators',
+                       units_affected: int}
+                      ABSENT means nothing degraded, never "unknown". It is what tells a
+                      degraded `none` apart from a document that legitimately has no
+                      addressable units (which carries NO block). `status` is forced to
+                      `partial` whenever this is present. The same reason rides every
+                      stored chunk as cmetadata `extraction_degraded`.
       text_sources:   Per-page provenance grouped by producer —
                       {'native': [...], 'ocr': [...], 'none': [...]} — so a citation
                       can say WHICH pages came from the text layer and which from OCR.
@@ -2130,8 +2244,14 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     #: Set when a configured read bound stopped the extraction early (FILES-01). Absent means the
     #: whole document was read -- never "we did not check".
     extraction_stop: Optional[dict] = None
+    #: Degradation reasons the loader stamped (`DEGRADED_KEY`), in first-seen document order,
+    #: each once. Empty means nothing degraded -- the loader stamps ONLY a degraded read.
+    degraded_reasons: list = []
     for d in docs:
         meta = getattr(d, "metadata", None) or {}
+        degraded_reason = meta.get(DEGRADED_KEY)
+        if degraded_reason is not None and degraded_reason not in degraded_reasons:
+            degraded_reasons.append(degraded_reason)
         loc = meta.get(meta_key) if meta_key is not None else None
         if loc not in units:
             units[loc] = {
@@ -2330,6 +2450,34 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
             # are different claims.
             "pages_not_included": extraction_stop["pages_not_included"],
         }
+        if receipt["status"] == "complete":
+            receipt["status"] = "partial"
+
+    # --- a DEGRADED read is never a COMPLETE one (CARD-DEGRADED-EXTRACTION-SIGNAL) -----
+    #
+    # `locator_kind: "none"` means two different things -- "nothing to address" and "we
+    # failed to address it" -- and this block is the only place the second is stated. The
+    # loader stamps `DEGRADED_KEY` ONLY on a degraded read (the DOCX fail-safe), so a
+    # document that legitimately has no addressable units carries NO block: absent means
+    # "nothing degraded", never "unknown". `scope: "document"` because the fallback folds
+    # the whole document into the unnamed unit, so EVERY unit of this receipt lost its
+    # per-unit locator; `units_affected` counts them. No `locators` list: the degradation
+    # is precisely that there are none to name, and an empty list would read as "measured,
+    # none affected". Text is kept (the fail-safe never drops text); what is lost is where
+    # each passage sits. `status` is forced to `partial` for the same reason the escalation
+    # and bound rules force it: `complete` would misstate what can be cited on the exact
+    # field consumers gate on. `empty` is left alone (the 422 path).
+    if degraded_reasons:
+        receipt["degraded"] = {
+            "reason": degraded_reasons[0],
+            "scope": "document",
+            "lost": "unit_locators",
+            "units_affected": units_total,
+        }
+        if len(degraded_reasons) > 1:
+            # Not reachable from any loader today (one loader, one reason per read). Kept so
+            # a second reason is never silently dropped if one ever is.
+            receipt["degraded"]["reasons"] = list(degraded_reasons)
         if receipt["status"] == "complete":
             receipt["status"] = "partial"
 
@@ -3099,8 +3247,7 @@ async def embed_local_file(
             str(e),
             traceback.format_exc(),
         )
-        status_code, message = describe_failure(e, document.filename)
-        raise HTTPException(status_code=status_code, detail=message) from e
+        raise failure_http_exception(e, document.filename) from e
 
 
 async def _summarize_within_timeout(loop, executor, llm_instance, grouped):
@@ -3195,6 +3342,8 @@ async def embed_file(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
+            # Typed (CARD-P2-01 S1 D): a refused upload PATH, before any work -- fix the request.
+            headers=_failure_headers("request:invalid_path"),
         )
 
     # Entitlement (D-KSPT-1): embedding writes under the resolved entity; that
@@ -3292,8 +3441,7 @@ async def embed_file(
         # errors are not OSError subclasses, so until module-based detection existed this comment
         # described an intention the code did not implement. The raw exception stays in the log.
         response_status = False
-        status_code, response_message = describe_failure(e, getattr(file, "filename", None))
-        raise HTTPException(status_code=status_code, detail=response_message)
+        raise failure_http_exception(e, getattr(file, "filename", None))
     finally:
         await cleanup_temp_file_async(validated_file_path)
 
@@ -3376,6 +3524,8 @@ async def embed_file_upload(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
+            # Typed (CARD-P2-01 S1 D): a refused upload PATH, before any work -- fix the request.
+            headers=_failure_headers("request:invalid_path"),
         )
 
     # Entitlement (D-KSPT-1): write under the resolved entity, which must be
@@ -3431,8 +3581,7 @@ async def embed_file_upload(
     except Exception as e:
         # KI-02 SP-01.10 — see `describe_failure`. Attribution by status code, sentence to the caller,
         # exception and traceback to the log under a shared reference.
-        status_code, message = describe_failure(e, uploaded_file.filename)
-        raise HTTPException(status_code=status_code, detail=message)
+        raise failure_http_exception(e, uploaded_file.filename)
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
 
@@ -3523,6 +3672,8 @@ async def extract_text_from_file(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
+            # Typed (CARD-P2-01 S1 D): a refused upload PATH, before any work -- fix the request.
+            headers=_failure_headers("request:invalid_path"),
         )
 
     # Entitlement (D-KSPT-1): /text only extracts and returns text from the
@@ -3549,6 +3700,12 @@ async def extract_text_from_file(
             "file_id": file_id,
             "filename": file.filename,
             "known_type": known_type,
+            # CARD-P2-01 S1 (additive): the SAME extraction receipt the embed routes return, so a
+            # /text caller can tell complete / partial / empty / degraded from a TYPED field instead
+            # of inferring it from the text. Before this, an empty or partial extraction here was a
+            # 200 whose only signal was the string itself. /text stores nothing and never refused an
+            # empty read, so it still does not: `status: "empty"` rides a 200 on this route.
+            "extraction": _extraction_receipt(data),
         }
 
     except HTTPException as http_exc:
@@ -3585,8 +3742,7 @@ async def extract_text_from_file(
             str(e),
             traceback.format_exc(),
         )
-        status_code, message = describe_failure(e, file.filename)
-        raise HTTPException(status_code=status_code, detail=message) from e
+        raise failure_http_exception(e, file.filename) from e
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
 
@@ -3765,5 +3921,4 @@ async def summarize_entity_files(
         # internal identifier where the sentence says "filename" -- which would have told a user to
         # "shorten the file name" of something that is not a name they chose. `describe_failure`
         # falls back to "the uploaded file": vaguer, but not wrong.
-        status_code, message = describe_failure(e, None)
-        raise HTTPException(status_code=status_code, detail=message) from e
+        raise failure_http_exception(e, None) from e

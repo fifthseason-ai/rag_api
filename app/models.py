@@ -67,6 +67,16 @@ class QueryDocument(BaseModel):
     score_kind: Optional[str] = None
     score_direction: Optional[str] = None
 
+    #: Whether this chunk carries a stored citation link, a QUARANTINED one, or none (CARD-P2-01 S1 C):
+    #: 'present' | 'quarantined' | 'none'. Top-level for the same reason as `score_kind`: it
+    #: DESCRIBES the stored metadata, it is not stored data, so `metadata` stays exactly what was
+    #: stored. Derived from the marker the stored-link backfill writes
+    #: (CARD-F-EMBED-LINK-BACKFILL, MUTATION: `link` MOVED to `quarantined_link`); see
+    #: `document_routes._link_state`. `None` (sent as null) only on a document built outside the
+    #: shaping seam -- UNKNOWN, never "no link". 'present' says a link is STORED, not that it is
+    #: governed: Core's consumer-side governed-URL gate stays load-bearing.
+    link_state: Optional[str] = None
+
 
 #: What `/query` returns: a list of (document, score) pairs. The pair is a two-element JSON array,
 #: not an object -- that is the existing wire and this does not change it. The score is NOT always
