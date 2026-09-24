@@ -29,22 +29,41 @@ def _candidates(*texts):
 
 
 def test_the_real_rerank_client_cannot_be_built():
-    """THE GUARD. If this ever passes silently, the suite can bill the account."""
+    """THE GUARD, tested through the REAL entry path (RV-128 F1), not the patched name.
+
+    An earlier version called `reranker._get_client()` directly. That only proved the guard
+    patched the name IT patched -- if `_get_client` were renamed and `_rerank_sync` updated to
+    call the new name, this stayed green while the renamed client went out (the guard's
+    raising=True now also reds a rename at setup, but a control must not depend on that). So
+    drive `_rerank_sync`, the function that actually builds and uses the client: with the guard
+    active it must not reach a live client."""
     with pytest.raises(RuntimeError) as excinfo:
-        reranker._get_client()
+        reranker._rerank_sync("q", ["a document"], 1)
     assert "blocked" in str(excinfo.value), excinfo.value
 
 
-async def test_an_unstubbed_rerank_degrades_instead_of_calling_out(monkeypatch):
+async def test_an_unstubbed_rerank_degrades_instead_of_calling_out(monkeypatch, caplog):
     """THE HAZARD SCENARIO: rerank enabled, nothing stubbed -- exactly what test_main.py
     and test_entitlement_routes.py do. It must fall back to the pre-rerank order rather
-    than open a socket, and it must not raise into the route."""
+    than open a socket.
+
+    RV-128 F2: asserting only the fallback ORDER is not enough -- a rerank that ACTUALLY
+    called out and then failed for some other reason would also fall back in order, so this
+    stayed green with the guard OFF. Assert the guard's own "blocked" warning fired, which
+    distinguishes 'blocked before any call' from 'called out, then degraded'."""
+    import logging
+
     monkeypatch.setattr(reranker, "RERANK_ENABLED", True)
     candidates = _candidates("a", "b", "c")
 
-    out = await reranker.rerank("q", candidates, top_n=2)
+    with caplog.at_level(logging.WARNING):
+        out = await reranker.rerank("q", candidates, top_n=2)
 
     assert [doc.page_content for doc, _score in out] == ["a", "b"], out
+    assert any("blocked" in rec.getMessage() for rec in caplog.records), (
+        "the fallback did not come from the guard -- rerank may have reached the provider "
+        "and degraded for another reason: %r" % [r.getMessage() for r in caplog.records]
+    )
 
 
 async def test_a_stubbed_rerank_still_produces_reranked_output(monkeypatch):
