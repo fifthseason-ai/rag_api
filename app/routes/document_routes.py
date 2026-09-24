@@ -9,6 +9,7 @@ import aiofiles
 import aiofiles.os
 from shutil import copyfileobj
 from typing import Awaitable, Callable, List, Iterable, Optional, TYPE_CHECKING
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from fastapi import (
@@ -2411,6 +2412,71 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
     return receipt
 
 
+#: Schemes a caller-supplied `link` may use. HTTPS only, deliberately.
+_ALLOWED_LINK_SCHEMES = ("https",)
+
+
+def _reject_ungoverned_link(link: Optional[str], file_id: str) -> None:
+    """Refuse a caller-supplied `link` that is not an https URL (F-EMBED-LINK-VALIDATE).
+
+    `link` arrives on POST /embed as a form field and used to be stamped VERBATIM into chunk
+    cmetadata, which Core opens from a citation. The producer promised nothing about it, so
+    an entitled caller could put `javascript:`, `data:`, `http:` or any host in front of a
+    reader's browser. That is the producer half of CORE-CITATION-GOVERNED-LINK; Core keeps
+    its own consumer gate, permanently, because this cannot clean rows already written.
+
+    SAFE BY MEASUREMENT, not by assumption (STEP 1, 2026-09-23): Core's only sender is the
+    connector sync loop (`fileSyncListener.js:517`), which always sends the source system's
+    own https item URL -- SharePoint/OneDrive Graph `webUrl`, Box `shared_link.url`. Organic
+    uploads send no link at all. So https-only refuses nothing legitimate today.
+
+    ABSENT IS NOT A REFUSAL. Organic uploads omit `link`, and that path must stay exactly as
+    it was -- this returns immediately for None/"".
+
+    The HOST allowlist is deliberately NOT here. It needs a deployment config
+    (`RAG_GOVERNED_LINK_HOSTS`, proposed: hostname-only match, exact host or dot-prefixed
+    suffix, unset = scheme-only) whose VALUE is the operator's, and the connector hosts it
+    must admit are per-tenant for Box. Scheme-only is what is provably safe today; shipping
+    a half-guessed host rule would be worse than shipping none.
+
+    TYPED REFUSAL, never a silent drop (Rule 28): a caller that sends a bad link learns why,
+    so Core's callers can surface it under the D1/D7 STATUS-field rule rather than discover a
+    missing citation link much later. The shape mirrors this module's existing refusal
+    (`_assert_extractable_content`): a human `message` plus a machine-readable key.
+
+    The rejected value is NOT echoed back -- only its scheme. A `javascript:` payload
+    reflected into an error body is just the same problem wearing a different hat.
+    """
+    if not link:
+        return
+    scheme = (urlparse(link).scheme or "").lower()
+    if scheme in _ALLOWED_LINK_SCHEMES:
+        return
+    # RV-130 N4: `scheme` is reflected in the response and the log. urlparse already
+    # constrains it to URL-scheme characters (letter then letters/digits/+.-), so it cannot
+    # carry markup -- but its LENGTH is caller-chosen, so cap what we echo. A real scheme is a
+    # handful of chars; anything past 32 is not a scheme we need to name back verbatim.
+    reported_scheme = scheme[:32] if scheme else None
+    logger.warning(
+        "[embed_file] refused a link whose scheme is not allowed [file_id=%s][scheme=%r]",
+        file_id, reported_scheme,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={
+            "message": (
+                "The 'link' supplied for this file is not an https URL, so nothing was "
+                "stored. Send the source document's https URL, or omit 'link'."
+            ),
+            "link": {
+                "reason": "link_scheme_not_allowed",
+                "scheme": reported_scheme,
+                "allowed_schemes": list(_ALLOWED_LINK_SCHEMES),
+            },
+        },
+    )
+
+
 def _assert_extractable_content(
     data: Iterable[Document], filename: Optional[str]
 ) -> dict:
@@ -3118,6 +3184,10 @@ async def embed_file(
         "[embed_file] request [file_id=%s][filename=%s][user_id=%s][owner_type=%s][origin_type=%s][subscription_id=%s]",
         file_id, file.filename, user_id, document_owner_type, document_origin_type, subscription_id,
     )
+    # Before ANY work: a link we would refuse must not cost an upload, an extraction or an
+    # embedding first. Refusing here also means nothing is written that we would then have
+    # to unpick.
+    _reject_ungoverned_link(link, file_id)
     validated_file_path = _make_unique_temp_path(user_id, file.filename)
 
     if validated_file_path is None:
