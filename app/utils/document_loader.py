@@ -1582,8 +1582,8 @@ class SafeDocxLoader:
 # defined ONCE here so the loader stamp and the tests never drift apart.
 #
 # `CELL_RANGE_LOCATOR_KEY` = the cmetadata key each sheet chunk carries; its value is
-#     the sheet-qualified occupied extent (e.g. "Revenue!A1:C5") -- a UNIT-named
-#     precision (a range of cells), never the format.
+#     the sheet-qualified occupied extent (e.g. "Revenue!A1:C5") -- a UNIT-named extent
+#     (the sheet's occupied range), never the format.
 # `CELL_RANGE_LOCATOR_KIND` = the value a `locator_kind` would take IF this were ever
 #     promoted to a `_UNIT_LOCATOR_KEYS` family. It is defined only so a future
 #     promotion has one source of truth; it is NOT used today.
@@ -1591,8 +1591,9 @@ class SafeDocxLoader:
 # OPTION 3 RULING (FILES lead, 2026-09-23, PACKET-1-E3-XLSX-PLACEMENT-RULING): these
 # ship as ADDITIVE, OPTIONAL cmetadata fields and are DELIBERATELY NOT registered in
 # `_UNIT_LOCATOR_KEYS`. XLSX `locator_kind` stays `sheet` -- a stable TYPE TAG naming
-# which family the citable position belongs to; precision lives in the VALUE
-# (`cell_range`), which Core reads directly, never in the tag. Registering `cell_range`
+# which family the citable position belongs to; the finer position lives in the VALUE
+# (`cell_range` -- EXACT but COARSE, the whole sheet's occupied extent; see below), which
+# Core reads directly, never in the tag. Registering `cell_range`
 # is a deliberate future act that must trip CONTROL A in
 # test_receipt_locator_agrees_with_chunks.py; the non-promotion is pinned executably by
 # test_xlsx_cell_locator.py. ABSENCE of `cell_range` means UNKNOWN extent, never
@@ -1607,8 +1608,15 @@ CELL_RANGE_LOCATOR_KIND = "cell_range"
 # identical cells. It cannot tell a real column header from a two-column key/value
 # preamble (e.g. row 1 ["Prepared by","John Smith"] above a real header at row 3), so
 # it can stamp a CONFIDENTLY WRONG header/header_row. A consumer must treat these as
-# hints, never authoritative; precision lives in cell_range. Absence is still honest
-# UNKNOWN (the field is omitted, never `header: []`).
+# hints, never authoritative. `cell_range` is EXACT (computed, never guessed) but COARSE:
+# it is the whole sheet's occupied extent (see SheetExcelLoader._sheet_locators and the
+# per-element stamping below), NOT the cells a chunk cites -- label it "whole sheet", never
+# "the cited range". (Corrected 2026-09-23: this line used to say "precision lives in
+# cell_range", which read as cited-cell precision; CORE quoted it and caught the gap.)
+# Absence is still honest UNKNOWN (the field is omitted, never `header: []`).
+# The header hint shows each cell AS DISPLAYED where the workbook says how: a date cell
+# formatted year-only (`yyyy`) reads as its year, matching the text; the full date is kept
+# in `date_values` (Richard decision 4, 2026-09-23: preserve the date, display the year).
 XLSX_HEADER_KEY = "header"          # the detected header row's cell values (list[str])
 XLSX_HEADER_ROW_KEY = "header_row"  # 1-indexed worksheet row number of the header
 
@@ -2082,6 +2090,18 @@ class SheetExcelLoader:
                         r_idx = row[0].row  # real coordinate (non read_only)
                         values = [c.value for c in row]
                         if r_idx <= self._HEADER_SEARCH_ROWS:
+                            # The HINT shows what the cell DISPLAYS: a year-only-formatted date
+                            # is its year, exactly as the year pass renders it in the text (same
+                            # predicate as _year_only_copy). Extent detection below still reads
+                            # the raw value; the full date stays in `date_values`.
+                            values = [
+                                c.value.year
+                                if getattr(c, "is_date", False)
+                                and hasattr(c.value, "year")
+                                and self._is_year_only_format(c.number_format)
+                                else c.value
+                                for c in row
+                            ]
                             header_buf.append((r_idx, values))
                         for cell in row:
                             if cell.value is None or str(cell.value).strip() == "":

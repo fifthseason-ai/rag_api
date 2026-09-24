@@ -3,8 +3,12 @@
 Card E3, OPTION 3 (FILES-lead ruling PACKET-1-E3-XLSX-PLACEMENT-RULING-20260923T042623Z):
 `cell_range`, `header` and `header_row` ship as ADDITIVE, OPTIONAL cmetadata fields and
 are DELIBERATELY NOT registered in `_UNIT_LOCATOR_KEYS`. XLSX `locator_kind` stays
-`"sheet"` -- a stable TYPE TAG; precision lives in the VALUE (`cell_range`), which Core
-reads directly. This suite pins that non-promotion executably.
+`"sheet"` -- a stable TYPE TAG; the finer position lives in the VALUE (`cell_range`),
+which Core reads directly. `cell_range` is EXACT (computed, never guessed) but COARSE:
+it names the WHOLE SHEET's occupied extent, not the cells a chunk cites -- say "whole
+sheet", never "the cited range". (Corrected 2026-09-23 with document_loader.py:1610:
+this line used to read "precision lives in cell_range", which CORE quoted as cited-cell
+precision.) This suite pins that non-promotion executably.
 
 MEASURED base: origin/main 5816e133. SheetExcelLoader emits one Document per sheet
 (pinned by test_xlsx_year_cells.sheet_text `len(docs)==1`); row-per-Document splitting is
