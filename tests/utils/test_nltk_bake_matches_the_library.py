@@ -53,7 +53,11 @@ tests/test_build_provenance.py, for the same reason.
 """
 import ast
 import importlib.util
+import json
+import os
 import re
+import shlex
+import subprocess
 import sys
 from importlib.metadata import version as installed_version
 from pathlib import Path
@@ -83,6 +87,47 @@ needs_the_workflow = pytest.mark.skipif(
 #: agree with itself and catch nothing. Bump it only after deciding what to do about the
 #: new resource, which is the decision this number exists to force.
 EXPECTED_RESOURCE_COUNT = 2
+
+#: `nltk.downloader` options that take a VALUE, so the value is not read as a resource name.
+_DOWNLOADER_OPTS_WITH_VALUE = {"-d", "--dir", "-u", "--url"}
+
+
+def _baked_resources(dockerfile_text: str) -> set:
+    """The resource names a Dockerfile passes to `nltk.downloader`, as WHOLE TOKENS.
+
+    Token-exact on purpose (RV-105 N1). The first version asked `res in " ".join(bake_lines)`
+    -- substring containment -- and nltk's previous names are exact PREFIXES of the current
+    ones (`punkt` in `punkt_tab`, `averaged_perceptron_tagger` in `..._eng`). So a downgrade
+    or reverse rename, where the library asks for the OLD names and the image bakes only the
+    new ones, passed in both shipped-image jobs while the image lacked what the library
+    fetches (measured by the reviewer as case C6: 1 passed, 3 skipped).
+
+    Backslash continuations are joined first, so a bake split over several lines is read
+    whole; anything after a shell operator ends the downloader's argument list.
+    """
+    logical = re.sub(r"\\\r?\n", " ", dockerfile_text)
+    found = set()
+    for line in logical.splitlines():
+        # A Dockerfile comment that MENTIONS the downloader is prose, not a bake (RV-114 N4:
+        # it used to be parsed and failed loudly on its own words).
+        if "nltk.downloader" not in line or line.lstrip().startswith("#"):
+            continue
+        tokens = shlex.split(line.strip())
+        args = tokens[tokens.index("nltk.downloader") + 1:]
+        skip = False
+        for tok in args:
+            if skip:
+                skip = False
+                continue
+            if tok in ("&&", "||", ";", "|"):
+                break
+            if tok in _DOWNLOADER_OPTS_WITH_VALUE:
+                skip = True
+                continue
+            if tok.startswith("-"):
+                continue
+            found.add(tok)
+    return found
 
 
 def _pinned_unstructured() -> str:
@@ -147,9 +192,26 @@ def _requested_resources() -> set:
     return found
 
 
+#: Run by the fixture in a FRESH interpreter: load THIS file by path (argv[1]), call its own
+#: `_requested_resources`, and report whether that imported the tokenizer module. Loading the
+#: file imports only the stdlib and pytest -- nothing here imports `unstructured` at module
+#: scope -- so the child's `sys.modules` starts clean and the answer is decidable every time.
+_SELF_CHECK_CHILD = r"""
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("_nltk_guard_under_test", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+assert "unstructured.nlp.tokenize" not in sys.modules, "imported before the guard ran"
+found = mod._requested_resources()
+print(json.dumps({"imported": "unstructured.nlp.tokenize" in sys.modules, "found": sorted(found)}))
+"""
+
+
 @pytest.fixture(scope="module")
 def resources():
     """Fail LOUDLY on a version mismatch. Never skip."""
+    # Recorded FIRST, for the in-process half of the self-check at the end of this fixture.
+    imported_before = "unstructured.nlp.tokenize" in sys.modules
     pinned, actual = _pinned_unstructured(), installed_version("unstructured")
     assert actual == pinned, (
         "installed unstructured==%s but requirements.txt pins %s. This guard derives the "
@@ -159,19 +221,35 @@ def resources():
         "card exists to remove." % (actual, pinned)
     )
 
-    # SELF-CHECK: the guard must not import the module it reads. Decidable only when nothing
-    # earlier in the session imported it (a full run may have, through any loader test); a
-    # single-file run always decides it, and the printed line below says which happened.
-    imported_before = "unstructured.nlp.tokenize" in sys.modules
+    # SELF-CHECK: the guard must not import the module it reads -- decided in a FRESH
+    # INTERPRETER (RV-105 N2). The first version checked `sys.modules` in-process, which is
+    # only decidable when nothing earlier in the session imported the tokenizer; in a full
+    # run any markdown loader test has, so in every CI job it printed "not decidable" and
+    # decided nothing. The child loads THIS file and calls THIS `_requested_resources` --
+    # the guard's own code, not a copy -- with AUTO_DOWNLOAD_NLTK=false so that, if the
+    # regression it looks for ever returns, the child cannot reach nltk.org while proving it.
+    child = subprocess.run(
+        [sys.executable, "-c", _SELF_CHECK_CHILD, str(Path(__file__).resolve())],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "AUTO_DOWNLOAD_NLTK": "false"},
+    )
+    assert child.returncode == 0, (
+        "the fresh-interpreter self-check did not run (exit %d); a check that cannot run "
+        "must not read as a pass.\nstdout: %s\nstderr: %s"
+        % (child.returncode, child.stdout[-800:], child.stderr[-800:]))
+    report = json.loads(child.stdout.strip().splitlines()[-1])
+    assert report["imported"] is False, (
+        "this guard IMPORTED unstructured.nlp.tokenize while locating it (decided in a fresh "
+        "interpreter). Its module scope runs the nltk download routine unless "
+        "AUTO_DOWNLOAD_NLTK is false, so the guard that exists to keep nltk.org out of the "
+        "runtime would itself reach it wherever a resource is missing. Locate the file with "
+        "importlib.util.find_spec; never import the module."
+    )
     found = _requested_resources()
-    if not imported_before:
-        assert "unstructured.nlp.tokenize" not in sys.modules, (
-            "this guard IMPORTED unstructured.nlp.tokenize while locating it. Its module scope "
-            "runs the nltk download routine unless AUTO_DOWNLOAD_NLTK is false, so the guard "
-            "that exists to keep nltk.org out of the runtime would itself reach it wherever a "
-            "resource is missing. Locate the file with importlib.util.find_spec; never import "
-            "the module."
-        )
+    assert set(report["found"]) == found, (
+        "the fresh interpreter parsed %r but this session parsed %r from the same installed "
+        "file -- the guard's parse depends on session state, so neither result can be trusted."
+        % (sorted(report["found"]), sorted(found)))
     assert len(found) == EXPECTED_RESOURCE_COUNT, (
         "parsed %d resource name(s) out of unstructured/nlp/tokenize.py, expected exactly "
         "%d: %r.\n"
@@ -192,27 +270,64 @@ def resources():
     # is strictly better for visibility, but it would also move the suite's warning count,
     # and several open cards reconcile their acceptance against that number. Trading a
     # shared signal for a local one is the wrong trade. `pytest -s` shows these, and pytest
-    # shows them automatically on any failure.
+    # shows them automatically on any failure. CI runs WITHOUT -s, so in CI the evidence is the
+    # PASSED line, which by construction means the child ran and decided (RV-114 item 2). The
+    # line below therefore prints the child's MEASURED report, not a constant -- a literal
+    # would only prove the fixture reached the print, which PASSED already says (RV-114 N1).
     print("\n[nltk-guard] pinned/installed unstructured : %s" % actual)
     print("[nltk-guard] requested by the library      : %s" % sorted(found))
-    print("[nltk-guard] tokenizer module imported here : %s"
-          % ("not decidable -- imported earlier in the session" if imported_before else "no"))
+    print("[nltk-guard] fresh-interpreter child report : %s" % json.dumps(report, sort_keys=True))
+
+    # SECOND, SOMETIMES-DECIDABLE LAYER (RV-114 N2). The child runs only module scope plus
+    # `_requested_resources`, so an import placed in THIS FIXTURE'S BODY is outside it. The
+    # in-process check covers the whole body, but only when nothing imported the tokenizer
+    # before the fixture started -- a single-file run always, a full run never. Kept rather
+    # than replaced: it catches a placement the child cannot, whenever it can decide at all.
+    if not imported_before:
+        assert "unstructured.nlp.tokenize" not in sys.modules, (
+            "this guard's fixture IMPORTED unstructured.nlp.tokenize (decided in-process: nothing "
+            "had imported it when the fixture started). Its module scope runs the nltk download "
+            "routine unless AUTO_DOWNLOAD_NLTK is false. Never import the module; locate it."
+        )
     return found
+
+
+def test_the_bake_parser_reads_crlf_continuations_and_ignores_comments():
+    """Hermetic, no library needed. CI checkouts and the images are LF (the blobs carry no CR;
+    there is no .gitattributes), so NO CI run ever feeds this parser CRLF -- only a Windows
+    worktree with core.autocrlf=true does. That is the case pinned here, with a continuation
+    split across lines and a comment that mentions the downloader, because a claim that CI
+    already exercised CRLF was made about this file and was wrong."""
+    text = (
+        "# RUN python -m nltk.downloader below  <- prose, not a bake\r\n"
+        "RUN python -m nltk.downloader -d /app/nltk_data \\\r\n"
+        "    punkt_tab averaged_perceptron_tagger_eng\r\n"
+    )
+    assert _baked_resources(text) == {"punkt_tab", "averaged_perceptron_tagger_eng"}
+    assert _baked_resources(text.replace("\r\n", "\n")) == {"punkt_tab", "averaged_perceptron_tagger_eng"}
+    # And the whole-token rule holds on CRLF input: the old names are not satisfied by the new.
+    assert "punkt" not in _baked_resources(text)
 
 
 def test_both_dockerfiles_bake_exactly_what_the_library_requests(resources):
     """The bake is what production runs: deploy/push.sh builds Dockerfile.lite."""
     for name in DOCKERFILES:
-        text = (REPO / name).read_text(encoding="utf-8")
-        bake = [l for l in text.splitlines() if "nltk.downloader" in l]
-        assert bake, "%s has no nltk.downloader line at all" % name
-        baked = " ".join(bake)
-        for res in sorted(resources):
-            assert res in baked, (
-                "%s does not bake %r, which unstructured==%s asks for at runtime. An "
-                "un-baked resource is fetched from nltk.org on the first ingest -- the "
-                "exact runtime dependency #87 removed. Bake line: %s"
-                % (name, res, installed_version("unstructured"), baked.strip()))
+        baked = _baked_resources((REPO / name).read_text(encoding="utf-8"))
+        assert baked, "%s has no nltk.downloader resource at all" % name
+        print("[nltk-guard] %-15s bakes            : %s" % (name, sorted(baked)))
+        missing = resources - baked
+        assert not missing, (
+            "%s does not bake %r, which unstructured==%s asks for at runtime (compared as "
+            "WHOLE tokens: a baked 'punkt_tab' does not satisfy a request for 'punkt'). An "
+            "un-baked resource is fetched from nltk.org on the first ingest -- the exact "
+            "runtime dependency #87 removed. Baked: %r"
+            % (name, sorted(missing), installed_version("unstructured"), sorted(baked)))
+        extra = baked - resources
+        assert not extra, (
+            "%s bakes %r, which unstructured==%s does NOT ask for. Harmless at runtime, but it "
+            "is how the stale half of a rename survives unnoticed; this test's name promises "
+            "EXACTLY what the library requests. Remove it, or if it is baked on purpose for "
+            "another library, say so here." % (name, sorted(extra), installed_version("unstructured")))
 
 
 @pytest.mark.skipif(
@@ -251,11 +366,15 @@ def test_the_ci_prefetch_and_cache_key_name_the_same_resources(resources):
 
     key = re.search(r'key:\s*\$\{\{\s*runner\.os\s*\}\}-nltk-(\S+)', text)
     assert key, "no NLTK cache key found in the workflow"
-    for res in sorted(resources):
-        assert res in key.group(1), (
-            "the NLTK cache key %r does not name %r. The key is what makes a rename "
-            "invalidate the cache; without it a stale cache is restored over a corrected "
-            "prefetch and the run passes for the wrong reason." % (key.group(1), res))
+    # Token-exact (RV-105 N1): resource names use underscores, the key joins them with '-',
+    # and a trailing `vN` is the manual cache-bust suffix. Substring containment accepted
+    # 'punkt' inside 'punkt_tab' -- the prefix relation a reverse rename would exploit.
+    named = {t for t in key.group(1).split("-") if not re.fullmatch(r"v\d+", t)}
+    assert named == resources, (
+        "the NLTK cache key %r names %r but unstructured==%s requests %r (compared as whole "
+        "tokens). The key is what makes a rename invalidate the cache; without it a stale "
+        "cache is restored over a corrected prefetch and the run passes for the wrong reason."
+        % (key.group(1), sorted(named), installed_version("unstructured"), sorted(resources)))
 
 
 @needs_the_workflow
