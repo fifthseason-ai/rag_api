@@ -97,7 +97,7 @@ def test_the_marker_survived_so_the_content_really_parsed(markdown_chunks, text_
 
 @pytest.mark.parametrize("fixture,label", [("text_chunks", "TXT")])
 def test_txt_carries_no_per_unit_locator(fixture, label, request):
-    """TXT exposes no page, slide, sheet, row or section, so a citation into it can name the
+    """TXT exposes no page, slide, sheet, row, section or block, so a citation into it can name the
     document and quote the text and nothing more. Emitting a locator here would be inventing a
     position that does not exist. (MD is no longer in this set: PACKET-1 E4 gives markdown a
     per-section address -- see test_md_carries_section_locator_when_registered below.)"""
