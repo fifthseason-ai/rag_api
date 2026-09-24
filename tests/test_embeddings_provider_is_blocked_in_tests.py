@@ -1,4 +1,4 @@
-"""The test suite cannot reach the real EMBEDDINGS provider -- on either path.
+"""The test suite cannot reach the real EMBEDDINGS provider -- on either path, on every live holder.
 
 N1 (2026-09-24), the embeddings twin of tests/test_rerank_provider_is_blocked_in_tests.py.
 MEASURED: conftest sets EMBEDDINGS_PROVIDER=openai plus a dummy key, so app.config builds a LIVE
@@ -14,24 +14,32 @@ patched to record and refuse, so "no attempt" is asserted at the OS boundary, no
 is the in-suite, permanent stand-in for `--network none` (the reviewer reproduces under a real
 --network none as well; the spy records at getaddrinfo, which fires even when DNS is dead).
 
+LIVE RESOLUTION, everywhere: tests/test_batch_processing.py reloads app.config in-process and
+restores only the env var, so after it app.config.vector_store is a NEW object (new real inner
+client) while document_routes keeps the OLD one, and app.config's EmbeddingsProvider is a NEW
+enum class. So nothing here binds a config object at import: every test reads `app.config` at
+call time, and the guard walks every live holder at setup. Test 6 pins that gap (measured in CI
+run 36001855369, where a guard bound at import left the rebuilt object reachable).
+
 The Redis probe: CachingEmbeddings consults the cache BEFORE the provider, and that probe is itself
-a socket attempt (to REDIS_HOST). These tests stub the cache to a no-op so the spy isolates the
-PROVIDER path exactly -- the property under test is "the provider is unreachable", and a Redis
-probe must neither mask a provider attempt nor be mistaken for one.
+a socket attempt (to REDIS_HOST). These tests stub the cache on EVERY live holder so the spy
+isolates the PROVIDER path exactly -- a Redis probe must neither mask nor mimic a provider attempt.
 
 Controls:
-  * remove the guard's setattr in conftest      -> tests 1 and 2 red (spy records an attempt)
+  * remove the guard's setattr in conftest      -> tests 1, 2 and 6 red (spy records an attempt)
   * test 3 is the PERMANENT deliberate-regression: with the guard bypassed for one test, a real
     client DOES attempt the network -- so the guard is what stands between the suite and a socket.
 """
 import socket
 from contextlib import contextmanager
+from importlib import reload
 
 import pytest
 
-from app.config import EMBEDDINGS_MODEL, EmbeddingsProvider, init_embeddings, vector_store
+import app.config as cfg
 from app.routes import document_routes
 from app.services.cache import CachingEmbeddings
+from tests.conftest import _guard_every_live_embeddings_provider, _live_caching_embeddings
 
 
 class _NoCache:
@@ -66,10 +74,13 @@ def _socket_spy():
 
 @pytest.fixture
 def _no_redis_probe(monkeypatch):
-    ef = vector_store.embedding_function
-    assert isinstance(ef, CachingEmbeddings), type(ef)
-    monkeypatch.setattr(ef, "_cache", _NoCache())
-    return ef
+    """Stub the cache on EVERY live CachingEmbeddings (routes' copy and app.config's may differ
+    after a reload), and return the live app.config one."""
+    live = _live_caching_embeddings()
+    assert live, "no live CachingEmbeddings found -- the guard has nothing to stand on"
+    for ce in live:
+        monkeypatch.setattr(ce, "_cache", _NoCache())
+    return cfg.vector_store.embedding_function
 
 
 def test_the_query_path_is_blocked_before_any_socket(_no_redis_probe):
@@ -87,26 +98,27 @@ def test_the_ingestion_path_is_blocked_before_any_socket(_no_redis_probe):
     drives). Same guard, same outcome: its own message, NO socket."""
     with _socket_spy() as attempts:
         with pytest.raises(RuntimeError) as excinfo:
-            vector_store.embedding_function.embed_documents(["chunk one", "chunk two"])
+            cfg.vector_store.embedding_function.embed_documents(["chunk one", "chunk two"])
     assert "blocked" in str(excinfo.value), excinfo.value
     assert attempts == [], "the ingestion path reached the network: %r" % attempts
 
 
 def test_deliberate_regression_an_unblocked_real_client_attempts_the_network(_no_redis_probe, monkeypatch):
     """THE REGRESSION, kept permanently: bypass the guard for THIS test by putting a REAL provider
-    client (built through the real init_embeddings path, not a hand-made stub) back as the inner
+    client -- built through the real init_embeddings path with the provider and model app.config
+    itself resolved (read live, so a prior reload cannot hand us a stale enum) -- back as the inner
     client, then drive the same path under the spy. It MUST attempt the network. This proves the
-    two tests above are not green by accident: the guard is the only thing between the suite and
-    a socket. (The spy refuses the attempt, so nothing leaves the host and nothing is billed.)"""
-    real_client = init_embeddings(EmbeddingsProvider.OPENAI, EMBEDDINGS_MODEL)
+    tests above are not green by accident: the guard is the only thing between the suite and a
+    socket. (The spy refuses the attempt, so nothing leaves the host and nothing is billed.)"""
+    real_client = cfg.init_embeddings(cfg.EMBEDDINGS_PROVIDER, cfg.EMBEDDINGS_MODEL)
     monkeypatch.setattr(_no_redis_probe, "_embeddings", real_client)
 
     with _socket_spy() as attempts:
         with pytest.raises(Exception):
-            vector_store.embedding_function.embed_query("what is in the deck")
+            cfg.vector_store.embedding_function.embed_query("what is in the deck")
 
     assert attempts, "an unblocked real client made NO network attempt -- the spy or the client is not real"
-    assert any(kind == "getaddrinfo" or kind == "connect" for kind, *_ in attempts), attempts
+    assert any(kind in ("getaddrinfo", "connect") for kind, *_ in attempts), attempts
 
 
 def test_a_test_that_stubs_embedding_function_is_unaffected(monkeypatch):
@@ -117,7 +129,7 @@ def test_a_test_that_stubs_embedding_function_is_unaffected(monkeypatch):
         def embed_query(self, text):
             return [0.1, 0.2, 0.3]
 
-    monkeypatch.setattr(vector_store, "embedding_function", _Stub())
+    monkeypatch.setattr(document_routes.vector_store, "embedding_function", _Stub())
     with _socket_spy() as attempts:
         out = document_routes.get_cached_query_embedding("q")
     assert out == [0.1, 0.2, 0.3], out
@@ -129,3 +141,27 @@ def test_the_guard_pins_the_inner_attribute_name():
     attribute ERRORS at setup instead of silently un-guarding. Name the contract here so the
     failure is readable: this is the attribute the guard relies on."""
     assert hasattr(CachingEmbeddings(object(), _NoCache()), "_embeddings")
+
+
+def test_the_guard_covers_a_vector_store_rebuilt_by_a_config_reload(monkeypatch):
+    """THE MEASURED GAP (CI run 36001855369 on 275c263). test_batch_processing reloads app.config
+    and restores only the env var, so app.config.vector_store becomes a NEW object with a NEW real
+    inner client; a guard bound to the import-time object left it reachable for the rest of the
+    session. Reproduce the reload, confirm the fresh object really is unguarded (so this cannot pass
+    vacuously), re-run the guard exactly as every test's setup does, and prove the NEW live object
+    is blocked with zero socket attempts."""
+    old = cfg.vector_store
+    reload(cfg)
+    assert cfg.vector_store is not old, "reload did not rebuild vector_store -- nothing to test"
+    fresh_inner = cfg.vector_store.embedding_function._embeddings
+    assert type(fresh_inner).__name__ != "_BlockedProviderEmbeddings", "fresh object was already guarded?"
+
+    _guard_every_live_embeddings_provider(monkeypatch)          # == the next test's setup
+    for ce in _live_caching_embeddings():
+        monkeypatch.setattr(ce, "_cache", _NoCache())
+
+    with _socket_spy() as attempts:
+        with pytest.raises(RuntimeError) as excinfo:
+            cfg.vector_store.embedding_function.embed_query("q")
+    assert "blocked" in str(excinfo.value), excinfo.value
+    assert attempts == [], "the REBUILT vector_store reached the network: %r" % attempts

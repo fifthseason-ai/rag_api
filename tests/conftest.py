@@ -135,12 +135,17 @@ def _block_the_real_rerank_provider(monkeypatch):
 # get_cached_query_embedding or aadd_documents never reach the inner client and are untouched;
 # a test that genuinely needs embedding output must say so by stubbing at that level.
 #
-# Ordering: this conftest fixture runs BEFORE a module-local autouse fixture (e.g. test_main's
-# override_vector_store), so it sees the real CachingEmbeddings. If a test has already swapped in
-# its own stub (not a CachingEmbeddings) there is no provider to block and we skip -- a stub
-# cannot open a socket. raising=True keeps the rename hazard loud: if CachingEmbeddings ever
-# renames `_embeddings`, setup ERRORS instead of silently leaving the real client reachable.
-from app.config import vector_store as _vector_store  # noqa: E402
+# EVERY LIVE HOLDER, resolved at SETUP time -- not one object bound when this file imported.
+# MEASURED (CI run 36001855369 on 275c263): tests/test_batch_processing.py reloads app.config
+# in-process and restores only the env var, so from then on app.config.vector_store is a NEW
+# object carrying a NEW, real inner client, while document_routes still holds the OLD one. A guard
+# that patched only the import-time object left the new one reachable for the rest of the session.
+# So this walks the holders that can name a CachingEmbeddings -- app.config.vector_store,
+# app.config.embeddings, document_routes.vector_store -- as they are NOW, and blocks each.
+# raising=True keeps the rename hazard loud: if CachingEmbeddings ever renames `_embeddings`,
+# setup ERRORS instead of silently leaving a real client reachable. A holder that is already a
+# foreign stub (not a CachingEmbeddings) has no provider to block and is skipped.
+import app.config as _app_config  # noqa: E402
 from app.services.cache import CachingEmbeddings as _CachingEmbeddings  # noqa: E402
 
 
@@ -156,8 +161,26 @@ class _BlockedProviderEmbeddings:
     embed_documents = _blocked
 
 
+def _live_caching_embeddings():
+    """Every CachingEmbeddings instance a test could reach right now, deduplicated."""
+    candidates = [
+        getattr(getattr(_app_config, "vector_store", None), "embedding_function", None),
+        getattr(_app_config, "embeddings", None),
+        getattr(getattr(_document_routes, "vector_store", None), "embedding_function", None),
+    ]
+    seen, out = set(), []
+    for c in candidates:
+        if isinstance(c, _CachingEmbeddings) and id(c) not in seen:
+            seen.add(id(c))
+            out.append(c)
+    return out
+
+
+def _guard_every_live_embeddings_provider(monkeypatch):
+    for ce in _live_caching_embeddings():
+        monkeypatch.setattr(ce, "_embeddings", _BlockedProviderEmbeddings(), raising=True)
+
+
 @pytest.fixture(autouse=True)
 def _block_the_real_embeddings_provider(monkeypatch):
-    ef = _vector_store.embedding_function
-    if isinstance(ef, _CachingEmbeddings):
-        monkeypatch.setattr(ef, "_embeddings", _BlockedProviderEmbeddings(), raising=True)
+    _guard_every_live_embeddings_provider(monkeypatch)
