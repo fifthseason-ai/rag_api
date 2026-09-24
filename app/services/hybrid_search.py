@@ -91,13 +91,19 @@ async def keyword_search(
     params.append(k)
     limit_idx = len(params)
 
+    # `uuid ASC` makes the order TOTAL. `score DESC` alone is a PARTIAL order: ts_rank_cd
+    # ties are common (short chunks, a single matching term) and Postgres may return tied
+    # rows in any order -- measurably so under a parallel plan. Because LIMIT is applied in
+    # SQL, a tie at the k-boundary decides WHICH rows come back at all, so no caller-side
+    # sort can repair it: "ask twice, get the same answer" has to be won here. `uuid` is the
+    # table's primary key -- unique and never null -- so it is a safe final key.
     sql = f"""
         SELECT document,
                cmetadata,
                ts_rank_cd(document_tsv, to_tsquery($1::regconfig, $2)) AS score
         FROM langchain_pg_embedding
         WHERE {' AND '.join(where_clauses)}
-        ORDER BY score DESC
+        ORDER BY score DESC, uuid ASC
         LIMIT ${limit_idx}
     """
 

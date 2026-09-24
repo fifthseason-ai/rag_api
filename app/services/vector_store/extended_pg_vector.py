@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict
 from typing import Optional, Any, Dict, List, Union
 from sqlalchemy import event
-from sqlalchemy import delete, func
+from sqlalchemy import asc, delete, func
 from sqlalchemy.orm import Session
 from sqlalchemy.engine import Connection, Engine
 from langchain_core.documents import Document
@@ -43,6 +43,69 @@ class ExtendedPgVector(PGVector):
         bind = getattr(self, "_bind", None)
         if Connection is not None and isinstance(bind, Connection):
             bind.close()
+
+    def _query_collection(
+        self,
+        embedding: List[float],
+        k: int = 4,
+        filter: Optional[Dict[str, str]] = None,
+    ) -> List[Any]:
+        """Query the collection under a TOTAL order: distance, then row uuid.
+
+        MIRRORS ``PGVector._query_collection`` from langchain_community **0.4.1** (the
+        pinned version) and changes exactly one thing: the ``order_by`` gains
+        ``EmbeddingStore.uuid`` as a final key. Upstream orders by ``distance`` ALONE,
+        which is a PARTIAL order -- equal distances are common (duplicate or near-duplicate
+        chunks) and Postgres may return tied rows in any order, measurably so under a
+        parallel plan. Because ``LIMIT k`` is applied IN SQL, a tie at the k-boundary
+        decides which rows are returned at all, so sorting in Python afterwards cannot
+        repair it: the caller never sees the rows that lost the tie.
+
+        Overriding means copying upstream's body, which is a maintenance cost taken
+        deliberately: there is no hook to append an ``order_by``. The tie-order suite guards
+        this three ways: the uuid key is pinned; this method's existence is pinned (catches a
+        delete/rename); the PUBLIC ``similarity_search_with_score_by_vector`` is asserted to
+        flow through here (catches an upstream re-route); and the ``langchain_community``
+        version is pinned (a bump reds, forcing a re-read of upstream's body this override
+        copied). It is NOT true, as an earlier version of this docstring claimed, that "a
+        langchain upgrade fails the suite" on its own -- RV-122 measured upgrades that leave
+        the identity pin green; the public-path and version pins are what close that gap.
+
+        ``uuid`` is the embedding table's primary key -- unique and never null -- so it is
+        a safe final key: it never changes which rows tie, only which tied row wins.
+        """
+        with Session(self._bind) as session:
+            collection = self.get_collection(session)
+            if not collection:
+                raise ValueError("Collection not found")
+
+            filter_by = [self.EmbeddingStore.collection_id == collection.uuid]
+            if filter:
+                if self.use_jsonb:
+                    filter_clauses = self._create_filter_clause(filter)
+                    if filter_clauses is not None:
+                        filter_by.append(filter_clauses)
+                else:
+                    # Old way of doing things
+                    filter_clauses = self._create_filter_clause_json_deprecated(filter)
+                    filter_by.extend(filter_clauses)
+
+            results: List[Any] = (
+                session.query(
+                    self.EmbeddingStore,
+                    self.distance_strategy(embedding).label("distance"),
+                )
+                .filter(*filter_by)
+                .order_by(asc("distance"), asc(self.EmbeddingStore.uuid))
+                .join(
+                    self.CollectionStore,
+                    self.EmbeddingStore.collection_id == self.CollectionStore.uuid,
+                )
+                .limit(k)
+                .all()
+            )
+
+        return results
 
     @staticmethod
     def _sanitize_parameters_for_logging(

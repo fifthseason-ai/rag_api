@@ -158,7 +158,7 @@ def test_document_still_carries_id_and_type(one_hit_client, label):
         assert key in doc, "%s: the model dropped %r from the document: %s" % (label, key, sorted(doc))
 
 
-def test_all_three_routes_return_the_identical_non_empty_body(one_hit_client, monkeypatch):
+def test_all_three_routes_return_the_identical_non_empty_body(monkeypatch):
     """Source-of-truth equality: three consumers of ONE producer (`_retrieve_documents`) must put
     the SAME bytes on the wire for the same hit. A fresh client per route (the fixture is
     function-scoped) so state cannot leak between them.

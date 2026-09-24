@@ -56,6 +56,12 @@ def _rerank_sync(query: str, documents: List[str], top_n: int) -> list:
             "type": "BEDROCK_RERANKING_MODEL",
             "bedrockRerankingConfiguration": {
                 "modelConfiguration": {"modelArn": model_arn},
+                # KNOWN LIMIT (RV-122 F2): asking for only top_n lets the PROVIDER resolve a
+                # relevance tie at the k-boundary before our own sort runs, so the returned SET
+                # is not deterministic on ties -- the same k-boundary problem the SQL legs have,
+                # one layer out. Closing it means requesting the whole pool and cutting locally;
+                # its cost is unmeasured and unmeasurable under the paid-call hold. See
+                # tests/utils/test_query_tie_order_total.py "KNOWN LIMIT 2".
                 "numberOfResults": top_n,
             },
         },
@@ -92,11 +98,20 @@ async def rerank(
         logger.warning("[rerank] failed; using pre-rerank order: %s", exc)
         return ScoredHits(candidates[:top_n], kind)
 
-    reranked = [
-        (candidates[r["index"]][0], float(r.get("relevanceScore", 0.0)))
+    # TOTAL order, not the provider's. Nothing documents that equal relevanceScores come
+    # back in a stable sequence, so two identical requests could interleave tied hits
+    # differently -- and RV-118 flagged the same thing independently: this function never
+    # sorted, it inherited whatever order Bedrock returned, which is INFERRED best-first,
+    # not verified. Sort explicitly: relevance DESC, then the candidate's own position in
+    # the pool, which is unique and (with the retrieval legs below now totally ordered)
+    # itself deterministic.
+    _scored = [
+        (r["index"], candidates[r["index"]][0], float(r.get("relevanceScore", 0.0)))
         for r in results
         if 0 <= r.get("index", -1) < len(candidates)
     ]
+    _scored.sort(key=lambda t: (-t[2], t[0]))
+    reranked = [(doc, score) for _idx, doc, score in _scored]
     if not reranked:
         return ScoredHits(candidates[:top_n], kind)
 
