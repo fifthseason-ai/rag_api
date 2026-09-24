@@ -25,17 +25,23 @@ Controls:
   * restore `ORDER BY score DESC` (no uuid) in hybrid_search     -> the keyword test reds
   * remove the explicit sort in reranker.rerank                  -> the rerank tie test reds
   * DELETE or RENAME our `_query_collection`                     -> the override-identity test reds
+  * re-route the PUBLIC search off our override                  -> the public-path test reds
+  * bump `langchain_community` off the pinned version            -> the version-pin test reds
 
-KNOWN LIMIT 1 -- what the override-identity pin does NOT do (RV-122 F1, measured by the
-reviewer). An earlier version of this docstring said the pin makes "a langchain upgrade"
-fail loudly. It does not: it catches DELETION or RENAME only. The reviewer simulated two
-realistic upgrades -- upstream changing `_query_collection`'s body, and upstream routing
-the public search through a DIFFERENT internal method -- and all five tests here stayed
-GREEN. In the second case our override would simply stop being called and the order would
-revert to upstream's partial one, silently. The real fix (follow-on): drive the dense test
-through the PUBLIC `similarity_search_with_score_by_vector` and pin the upstream version or
-a source hash. Until then the identity pin is a tripwire for the easy case, not upgrade
-safety.
+UPGRADE SAFETY (was KNOWN LIMIT 1; RV-122 F1). The override-identity pin alone catches only
+DELETION or RENAME. The reviewer measured two realistic upgrades that left it green: upstream
+changing `_query_collection`'s body, and upstream routing the public search through a DIFFERENT
+internal method (which would strand our override uncalled and silently restore the partial
+order). Those two gaps are now closed from the other direction:
+  * `test_the_public_search_path_still_flows_through_our_total_order` drives the PUBLIC
+    `similarity_search_with_score_by_vector` and asserts it reaches our ordered code -- reds on
+    a re-route;
+  * `test_langchain_community_is_the_pinned_version` reds on a version bump, forcing a human to
+    re-read upstream's body and re-confirm the copy.
+The residual is honest and small: within one pinned version, an upstream body we have not
+re-read cannot change under us (the pin would have moved), and a re-route reds. A source hash
+would be tighter than a version string but re-reads noisily across identical reinstalls; the
+version pin plus the public-path test is the proportionate guard.
 
 KNOWN LIMIT 2 -- the provider decides a tie we never see (RV-122 F2). `reranker._rerank_sync`
 asks Bedrock for `numberOfResults: top_n` (reranker.py:59), so when relevance ties at the
@@ -143,6 +149,46 @@ def test_the_dense_override_is_ours_not_langchains():
     from langchain_community.vectorstores.pgvector import PGVector
 
     assert ExtendedPgVector._query_collection is not PGVector._query_collection
+
+
+def test_the_public_search_path_still_flows_through_our_total_order(monkeypatch):
+    """RV-122 F1, the gap the identity pin cannot see: `similarity_search_with_score_by_vector`
+    is what the app actually calls. Pin that it reaches OUR ordered `_query_collection`. If a
+    langchain upgrade re-routes the public method through a different internal one, our override
+    is stranded and the order silently reverts -- and THIS reds, where the identity pin stays
+    green. It asserts the call REACHES our code, not what the SQL says."""
+    recorder = _RecordingSession()
+    store = _store_without_a_database(monkeypatch, recorder)
+    # _results_to_docs_and_scores runs after _query_collection; stub it so we exercise only
+    # the routing, not row shaping.
+    monkeypatch.setattr(
+        ExtendedPgVector, "_results_to_docs_and_scores", lambda self, results: results,
+        raising=False,
+    )
+
+    store.similarity_search_with_score_by_vector([0.1, 0.2, 0.3, 0.4], k=3)
+
+    assert recorder.order_by_args is not None, (
+        "the public search did not reach our ordered _query_collection -- upstream may have "
+        "re-routed it (RV-122 F1)"
+    )
+    rendered = [str(c) for c in recorder.order_by_args]
+    assert len(rendered) == 2 and "uuid" in rendered[1], rendered
+
+
+def test_langchain_community_is_the_pinned_version():
+    """RV-122 F1, the other half: our override copies upstream's `_query_collection` body, so
+    an upstream body change is invisible to the tests above. Pin the version this override was
+    verified against; a bump reds HERE, forcing a human to re-read upstream and re-confirm the
+    copy (and move this pin forward) rather than discovering a partial order in production.
+    A version string, not a source hash, on purpose: it is stable across reinstalls of the same
+    release and names exactly what a reader must go check."""
+    import langchain_community
+
+    assert langchain_community.__version__ == "0.4.1", (
+        "langchain_community moved from the version ExtendedPgVector._query_collection was "
+        "copied from; re-read upstream _query_collection, re-confirm the override, bump this pin"
+    )
 
 
 # --- keyword leg -----------------------------------------------------------------------

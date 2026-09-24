@@ -56,6 +56,12 @@ def _rerank_sync(query: str, documents: List[str], top_n: int) -> list:
             "type": "BEDROCK_RERANKING_MODEL",
             "bedrockRerankingConfiguration": {
                 "modelConfiguration": {"modelArn": model_arn},
+                # KNOWN LIMIT (RV-122 F2): asking for only top_n lets the PROVIDER resolve a
+                # relevance tie at the k-boundary before our own sort runs, so the returned SET
+                # is not deterministic on ties -- the same k-boundary problem the SQL legs have,
+                # one layer out. Closing it means requesting the whole pool and cutting locally;
+                # its cost is unmeasured and unmeasurable under the paid-call hold. See
+                # tests/utils/test_query_tie_order_total.py "KNOWN LIMIT 2".
                 "numberOfResults": top_n,
             },
         },
