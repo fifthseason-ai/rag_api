@@ -76,3 +76,15 @@ older CI result against a newer commit: a run that dies in seconds is a non-star
 
 **A test that cannot fail is not evidence.** Mutate the source, confirm the test reddens, restore.
 If a mutation cannot reach the format or branch it targets, it proves nothing about that case.
+
+## Platform constitution — preflight before editing
+
+The Fifth Season Platform Constitution and Governance v2.0 (36 rules, canonical primitives, required controls, change workflow) is the decision hierarchy for platform work. Canonical repository copy: [`docs/governance/PLATFORM-CONSTITUTION-AND-GOVERNANCE.md`](https://github.com/fifthseason-ai/fifthseason.ai-core/blob/release/richard-vibe/docs/governance/PLATFORM-CONSTITUTION-AND-GOVERNANCE.md) in fifthseason.ai-core (`release/richard-vibe`). Program-control record copy: fifthseason-program-control `docs/governance/` (constitutional reconciliation index over `DECISIONS.md` §A; constitution provenance copy at `docs/governance/sources/constitution-v2.0-as-received-2026-09-19.md`). Tracking register: the INTEGRATION governance register in program-control.
+
+Before editing: name the user outcome, the affected rule IDs, the canonical primitive and owner, consumers/contracts, and tenant/access/mobile/Antonio/export/upstream effects (Constitution §5.3 / §6.2). If the requested outcome conflicts with a rule, pause, explain the conflict plainly, and recommend a compliant path.
+
+Its own standing: Richard-approved direction that must be reconciled with the canonical program-control record before it is sole authority; later explicit rulings take precedence; the rule ledger remains the program-control DECISIONS record.
+
+Reference implementation for MCP connector entitlement, platform-owned data scope and typed refusal: core PR #518 (Aaron, merged 2026-09-23) — Rules 1, 2, 27, 30, 34; its self-named gaps are tracked in the register.
+
+Files owns extraction and retrieval — Rule 3; Rule 31 knowledge lifecycle.
