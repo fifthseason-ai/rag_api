@@ -82,7 +82,7 @@ async def rerank(
     rerank is `rerank_relevance`; EVERY fallback keeps the candidates' own kind, because
     those numbers are still the candidates' numbers. A slice is a plain list, so each
     fallback re-wraps it -- otherwise the kind would silently fall off on exactly the
-    paths (a failed Bedrock call, the default region) where it matters most."""
+    paths (a failed Bedrock call, or rerank turned off) where it matters most."""
     kind = kind_of(candidates)
     if not candidates:
         return ScoredHits([], kind)

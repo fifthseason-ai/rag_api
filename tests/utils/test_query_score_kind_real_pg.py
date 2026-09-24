@@ -325,9 +325,11 @@ def test_a_failed_rerank_declares_the_fallbacks_kind_and_its_numbers(astore, mon
     """A rerank provider that fails (credentials, region, an outage) falls back to the pre-rerank
     list: the numbers are the pre-rerank RRF numbers, so is the kind, and so is the ORDER.
 
-    (The config comment says the default region us-east-1 does not host the model. MEASURED
-    2026-09-23T21:47Z on a real 18eca4c build: cohere.rerank-v3-5:0 SUCCEEDED in us-east-1. So
-    this fallback is not the default path; the success path is -- see the test above.)"""
+    (A single MEASUREMENT 2026-09-23T21:47Z on an 18eca4c build found cohere.rerank-v3-5:0
+    available in us-east-1, so this fallback is NOT forced by the default region. Model
+    availability is region- and account-specific -- neither "the default region fails" nor
+    "the default region succeeds" holds as an absolute; probe, do not assert either. This test
+    pins the fallback BEHAVIOUR when rerank is down, not which region triggers it.)"""
     from app.config import RRF_K
     from app.routes import document_routes as dr
     from app.services import reranker

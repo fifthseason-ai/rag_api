@@ -210,3 +210,42 @@ def test_the_reported_scheme_is_length_capped(monkeypatch):
     reported = r.json()["detail"]["link"]["scheme"]
     assert len(reported) <= 32, len(reported)
     assert long_scheme.startswith(reported), reported
+
+
+def test_the_refusal_is_logged_exactly_once_naming_the_scheme(caplog):
+    """RV-130 D1: the never-echo test above proves the VALUE is absent from the log, but it
+    stays green even if the log line is DELETED -- an empty log trivially contains no payload.
+    This is its positive complement: a refusal MUST emit exactly one warning that names the
+    (bounded) scheme. Captured at DEBUG so no level change can hide it. Delete the
+    logger.warning in _reject_ungoverned_link and THIS reds, where the never-echo test cannot."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        r = _embed(link="javascript:alert(1)")
+
+    assert r.status_code == 422, r.text
+    refusals = [rec for rec in caplog.records
+                if "refused a link whose scheme is not allowed" in rec.getMessage()]
+    assert len(refusals) == 1, [rec.getMessage() for rec in caplog.records]
+    assert "javascript" in refusals[0].getMessage(), refusals[0].getMessage()
+    assert refusals[0].levelno == logging.WARNING, refusals[0].levelname
+
+
+def test_the_logged_scheme_is_length_capped_too(caplog):
+    """RV-130 D2: N4 caps the scheme in the RESPONSE; the SAME value is reflected into the LOG,
+    so it must be capped there too. If the log ever formatted the raw `scheme` instead of
+    `reported_scheme`, the response test would stay green while an operator's log took the
+    caller's 200-char string. Assert the logged scheme is exactly the 32-char cap, not longer."""
+    import logging
+
+    long_scheme = "a" * 200
+    with caplog.at_level(logging.DEBUG):
+        r = _embed(link=long_scheme + "://x")
+
+    assert r.status_code == 422, r.text
+    refusals = [rec for rec in caplog.records
+                if "refused a link whose scheme is not allowed" in rec.getMessage()]
+    assert len(refusals) == 1, [rec.getMessage() for rec in caplog.records]
+    msg = refusals[0].getMessage()
+    assert ("a" * 32) in msg, msg           # the cap is present in the log
+    assert ("a" * 33) not in msg, msg       # and not one char more -- the log used reported_scheme
