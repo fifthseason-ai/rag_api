@@ -122,3 +122,69 @@ def _block_the_real_rerank_provider(monkeypatch):
     # the guard, and a control that also referenced the old name, would stay green while the
     # renamed real client went out. A rename now fails every test loudly, which is the signal.
     monkeypatch.setattr(_reranker, "_get_client", _blocked, raising=True)
+
+
+# -- PAID-CALL HAZARD, the EMBEDDINGS twin of the rerank guard above (N1, 2026-09-24) -------
+# MEASURED: this conftest sets EMBEDDINGS_PROVIDER=openai plus a dummy key, so app.config builds
+# a LIVE CachingEmbeddings(OpenAIEmbeddings(dummy)) at import. RedisCache swallows every error, so
+# a test with no Redis is a cache MISS, and on a miss BOTH paths reach the real provider:
+#   * embed_query      -- document_routes.get_cached_query_embedding -> cache/embeddings.py:54
+#   * embed_documents  -- ingestion (aadd_documents)                 -> cache/embeddings.py:72
+# With a dummy key the call is rejected (no inference, unbilled), but a suite that only stays
+# free because the key is wrong is one real .env away from spending money -- the RV-128 standard:
+# a test suite must not be ABLE to reach a paid provider at all.
+#
+# Placement, same reasoning as the rerank guard: block the INNER provider client (the step that
+# would open a socket), NOT `vector_store.embedding_function`. Tests that stub embedding_function,
+# get_cached_query_embedding or aadd_documents never reach the inner client and are untouched;
+# a test that genuinely needs embedding output must say so by stubbing at that level.
+#
+# EVERY LIVE HOLDER, resolved at SETUP time -- not one object bound when this file imported.
+# MEASURED (CI run 36001855369 on 275c263): tests/test_batch_processing.py reloads app.config
+# in-process and restores only the env var, so from then on app.config.vector_store is a NEW
+# object carrying a NEW, real inner client, while document_routes still holds the OLD one. A guard
+# that patched only the import-time object left the new one reachable for the rest of the session.
+# So this walks the holders that can name a CachingEmbeddings -- app.config.vector_store,
+# app.config.embeddings, document_routes.vector_store -- as they are NOW, and blocks each.
+# raising=True keeps the rename hazard loud: if CachingEmbeddings ever renames `_embeddings`,
+# setup ERRORS instead of silently leaving a real client reachable. A holder that is already a
+# foreign stub (not a CachingEmbeddings) has no provider to block and is skipped.
+import app.config as _app_config  # noqa: E402
+from app.services.cache import CachingEmbeddings as _CachingEmbeddings  # noqa: E402
+
+
+class _BlockedProviderEmbeddings:
+    def _blocked(self, *_args, **_kwargs):
+        raise RuntimeError(
+            "hermetic tests: the real embeddings provider is blocked. Stub "
+            "vector_store.embedding_function (or get_cached_query_embedding / aadd_documents) "
+            "if this test needs embedding output."
+        )
+
+    embed_query = _blocked
+    embed_documents = _blocked
+
+
+def _live_caching_embeddings():
+    """Every CachingEmbeddings instance a test could reach right now, deduplicated."""
+    candidates = [
+        getattr(getattr(_app_config, "vector_store", None), "embedding_function", None),
+        getattr(_app_config, "embeddings", None),
+        getattr(getattr(_document_routes, "vector_store", None), "embedding_function", None),
+    ]
+    seen, out = set(), []
+    for c in candidates:
+        if isinstance(c, _CachingEmbeddings) and id(c) not in seen:
+            seen.add(id(c))
+            out.append(c)
+    return out
+
+
+def _guard_every_live_embeddings_provider(monkeypatch):
+    for ce in _live_caching_embeddings():
+        monkeypatch.setattr(ce, "_embeddings", _BlockedProviderEmbeddings(), raising=True)
+
+
+@pytest.fixture(autouse=True)
+def _block_the_real_embeddings_provider(monkeypatch):
+    _guard_every_live_embeddings_provider(monkeypatch)

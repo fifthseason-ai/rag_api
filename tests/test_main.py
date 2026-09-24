@@ -116,7 +116,7 @@ def override_vector_store(monkeypatch):
         def embed_query(self, query):
             return [0.1, 0.2, 0.3]
 
-    vector_store.embedding_function = DummyEmbedding()
+    monkeypatch.setattr(vector_store, "embedding_function", DummyEmbedding())
 
     # Override similarity search to return a tuple (Document, score).
     def dummy_similarity_search_with_score_by_vector(self, embedding, k, filter):
