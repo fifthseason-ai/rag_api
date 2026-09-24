@@ -680,6 +680,7 @@ def test_C_same_question_twice_ten_times_and_after_a_fresh_store_engine_and_clie
         assert r1.content == r0.content, f"{leg}: the second identical request diverged"
         for i in range(10):                                 # asked ten more times
             ri = call(client)
+            assert ri.status_code == 200, (leg, f"repeat {i + 3}", ri.text)
             assert ri.content == r0.content, f"{leg}: repeat {i + 3} diverged"
 
     # A new store object, new engine and connections, new TestClient; the old engine is
@@ -721,4 +722,6 @@ def test_C_a_k_smaller_than_the_scope_cuts_to_the_same_result_every_time_SYNTHET
         if path == "dense" or leg == "file":
             assert hits == full[:small_k], (leg, "the k-cut is not the head of the complete ranking")
         for i in range(11):
-            assert call(small_k).content == r0.content, f"{leg} k={small_k}: repeat {i + 2} diverged"
+            ri = call(small_k)
+            assert ri.status_code == 200, (leg, f"k={small_k} repeat {i + 2}", ri.text)
+            assert ri.content == r0.content, f"{leg} k={small_k}: repeat {i + 2} diverged"
