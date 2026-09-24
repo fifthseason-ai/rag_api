@@ -2374,9 +2374,14 @@ def _reject_ungoverned_link(link: Optional[str], file_id: str) -> None:
     scheme = (urlparse(link).scheme or "").lower()
     if scheme in _ALLOWED_LINK_SCHEMES:
         return
+    # RV-130 N4: `scheme` is reflected in the response and the log. urlparse already
+    # constrains it to URL-scheme characters (letter then letters/digits/+.-), so it cannot
+    # carry markup -- but its LENGTH is caller-chosen, so cap what we echo. A real scheme is a
+    # handful of chars; anything past 32 is not a scheme we need to name back verbatim.
+    reported_scheme = scheme[:32] if scheme else None
     logger.warning(
         "[embed_file] refused a link whose scheme is not allowed [file_id=%s][scheme=%r]",
-        file_id, scheme,
+        file_id, reported_scheme,
     )
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -2387,7 +2392,7 @@ def _reject_ungoverned_link(link: Optional[str], file_id: str) -> None:
             ),
             "link": {
                 "reason": "link_scheme_not_allowed",
-                "scheme": scheme or None,
+                "scheme": reported_scheme,
                 "allowed_schemes": list(_ALLOWED_LINK_SCHEMES),
             },
         },

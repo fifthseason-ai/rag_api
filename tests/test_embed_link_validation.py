@@ -162,3 +162,51 @@ def test_an_empty_link_is_treated_as_absent_not_as_a_bad_scheme():
     reject callers who always send the field and sometimes have nothing to put in it."""
     r = _embed(link="")
     assert r.status_code == 200, r.text
+
+
+# --- RV-130 follow-on notes ------------------------------------------------------------
+
+
+def test_the_refused_value_is_never_echoed_into_the_log(caplog):
+    """RV-130 N1: the never-echo rule must hold in the LOGS too, not only the response.
+    An operator reading warnings must not be handed the payload either. The log records the
+    scheme (bounded), never the value."""
+    import logging
+
+    payload = "javascript:alert('log-canary-4b2e')"
+    with caplog.at_level(logging.WARNING):
+        r = _embed(link=payload)
+
+    assert r.status_code == 422, r.text
+    joined = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "log-canary-4b2e" not in joined, joined
+    assert "alert(" not in joined, joined
+
+
+def test_a_refused_link_reaches_no_upload_extraction_or_store(monkeypatch):
+    """RV-130 N2: pin the PLACEMENT. The refusal is at the route boundary, so a bad link must
+    cost no work -- no temp file written, no loader run, no store write. A spy on each proves
+    it; moving the check after extraction would red this even while the 422 still returns."""
+    import app.routes.document_routes as dr
+
+    calls = []
+    monkeypatch.setattr(dr, "_make_unique_temp_path",
+                        lambda *a, **k: calls.append("temp") or "/tmp/should-not-be-used")
+    monkeypatch.setattr(dr, "get_loader",
+                        lambda *a, **k: calls.append("loader") or (_ for _ in ()).throw(AssertionError("loader ran")))
+
+    r = _embed(link="javascript:alert(1)")
+
+    assert r.status_code == 422, r.text
+    assert calls == [], "a refused link did work before refusing: %r" % calls
+
+
+def test_the_reported_scheme_is_length_capped(monkeypatch):
+    """RV-130 N4: `scheme` is caller-influenced text reflected back; cap its length. urlparse
+    already limits it to scheme characters, so this guards length only."""
+    long_scheme = "a" * 200
+    r = _embed(link=long_scheme + "://x")
+    assert r.status_code == 422, r.text
+    reported = r.json()["detail"]["link"]["scheme"]
+    assert len(reported) <= 32, len(reported)
+    assert long_scheme.startswith(reported), reported
