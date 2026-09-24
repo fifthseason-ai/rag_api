@@ -117,7 +117,11 @@ def _block_the_real_rerank_provider(monkeypatch):
             "Stub app.services.reranker._rerank_sync if this test needs rerank output."
         )
 
-    monkeypatch.setattr(_reranker, "_get_client", _blocked, raising=False)
+    # raising=True on purpose (RV-128 F1): if `_get_client` is ever renamed, this setattr
+    # must ERROR at fixture setup rather than silently patch a name nothing calls -- otherwise
+    # the guard, and a control that also referenced the old name, would stay green while the
+    # renamed real client went out. A rename now fails every test loudly, which is the signal.
+    monkeypatch.setattr(_reranker, "_get_client", _blocked, raising=True)
 
 
 # -- PAID-CALL HAZARD, the EMBEDDINGS twin of the rerank guard above (N1, 2026-09-24) -------

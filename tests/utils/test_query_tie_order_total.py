@@ -38,13 +38,17 @@ order). Those two gaps are now closed from the other direction:
     a re-route;
   * `test_langchain_community_is_the_pinned_version` reds on a version bump, forcing a human to
     re-read upstream's body and re-confirm the copy.
-The residual is honest and small: within one pinned version, an upstream body we have not
-re-read cannot change under us (the pin would have moved), and a re-route reds. A source hash
-would be tighter than a version string but re-reads noisily across identical reinstalls; the
-version pin plus the public-path test is the proportionate guard.
+The residual is honest and NAMED (RV-132): the version pin assumes one version string maps to
+one body. That holds for an immutable PyPI release, but NOT for a PATCHED or VENDORED install that
+keeps "0.4.1" while carrying a different `_query_collection` -- it changes the body without moving
+the pin, and nothing here catches it. That case threatens copied-body FIDELITY, not tie order: the
+public path still reaches our override, so the order stays total; only our copy could drift from a
+locally-patched upstream. A source hash would catch it but re-reads noisily across identical
+reinstalls; the version pin plus the public-path test is the proportionate guard for the ordinary
+upgrade path, with the patched/vendored-install case stated rather than covered.
 
 KNOWN LIMIT 2 -- the provider decides a tie we never see (RV-122 F2). `reranker._rerank_sync`
-asks Bedrock for `numberOfResults: top_n` (reranker.py:59), so when relevance ties at the
+asks Bedrock for `numberOfResults: top_n` (reranker.py:65), so when relevance ties at the
 k-boundary the PROVIDER chooses which candidates come back before our sort runs. The sort
 below makes the returned set totally ordered; it cannot make the SET deterministic. This is
 the same k-boundary argument this file makes about SQL `LIMIT`, applied one layer out, and
@@ -122,6 +126,15 @@ def _store_without_a_database(monkeypatch, recorder):
         raising=False,
     )
     monkeypatch.setattr(epv, "Session", lambda bind: recorder)
+    # RV-132 F1: our override uses epv.Session, but the UPSTREAM _query_collection body
+    # references langchain_community...pgvector.Session. If an upgrade re-routes the public
+    # search through the upstream body (the re-route the public-path test guards), that body
+    # would hit the REAL Session and raise an opaque sqlalchemy ArgumentError -- a failure that
+    # reads as a broken test, not as "the order reverted to single-key". Patch the upstream
+    # module's Session too so a re-routed body records its (reverted) order and the public-path
+    # test reds with its OWN assertion. Inert on the happy path: our override uses epv.Session.
+    import langchain_community.vectorstores.pgvector as _lcpg
+    monkeypatch.setattr(_lcpg, "Session", lambda bind: recorder, raising=False)
     return store
 
 
@@ -142,7 +155,7 @@ def test_dense_leg_orders_by_distance_then_row_uuid(monkeypatch):
 def test_the_dense_override_is_ours_not_langchains():
     """Catches DELETION or RENAME of our override -- and only that.
 
-    It does NOT make a langchain upgrade fail loudly; see KNOWN LIMIT 1 in the module
+    It does NOT make a langchain upgrade fail loudly; see UPGRADE SAFETY in the module
     docstring. RV-122 measured two realistic upgrades that leave this green, including
     upstream routing the public search through a different internal method, which would
     strand our override uncalled and silently restore the partial order."""
