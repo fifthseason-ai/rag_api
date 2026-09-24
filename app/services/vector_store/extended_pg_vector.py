@@ -62,10 +62,14 @@ class ExtendedPgVector(PGVector):
         repair it: the caller never sees the rows that lost the tie.
 
         Overriding means copying upstream's body, which is a maintenance cost taken
-        deliberately: there is no hook to append an ``order_by``. The tie-order suite pins
-        both the uuid key AND this override's identity, so if a langchain upgrade changes
-        this method out from under us the suite fails rather than silently returning to a
-        partial order.
+        deliberately: there is no hook to append an ``order_by``. The tie-order suite guards
+        this three ways: the uuid key is pinned; this method's existence is pinned (catches a
+        delete/rename); the PUBLIC ``similarity_search_with_score_by_vector`` is asserted to
+        flow through here (catches an upstream re-route); and the ``langchain_community``
+        version is pinned (a bump reds, forcing a re-read of upstream's body this override
+        copied). It is NOT true, as an earlier version of this docstring claimed, that "a
+        langchain upgrade fails the suite" on its own -- RV-122 measured upgrades that leave
+        the identity pin green; the public-path and version pins are what close that gap.
 
         ``uuid`` is the embedding table's primary key -- unique and never null -- so it is
         a safe final key: it never changes which rows tie, only which tied row wins.
