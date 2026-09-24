@@ -59,9 +59,19 @@ class QueryDocument(BaseModel):
     page_content: str
     type: Optional[str] = None
 
+    #: What the pair's score MEANS, and which way is better (`app/services/score_kind.py`;
+    #: P06-5 contract addendum 2). Top-level, never inside `metadata`: metadata is the chunk's
+    #: stored data, which consumers forward and persist; this describes the RESPONSE. `None`
+    #: (sent as null) is UNKNOWN -- a result built outside the declaring pipeline -- and must be
+    #: marked by the consumer, never guessed from the value's range.
+    score_kind: Optional[str] = None
+    score_direction: Optional[str] = None
 
-#: What `/query` returns: a list of (document, similarity score) pairs. The pair is a two-element
-#: JSON array, not an object -- that is the existing wire and this does not change it.
+
+#: What `/query` returns: a list of (document, score) pairs. The pair is a two-element JSON array,
+#: not an object -- that is the existing wire and this does not change it. The score is NOT always
+#: a similarity: a dense pgvector search returns a cosine DISTANCE (lower is better) and the other
+#: modes return higher-is-better numbers. The document's `score_kind` / `score_direction` say which.
 QueryHit = Tuple[QueryDocument, float]
 
 

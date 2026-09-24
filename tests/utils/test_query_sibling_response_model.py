@@ -158,22 +158,29 @@ def test_document_still_carries_id_and_type(one_hit_client, label):
         assert key in doc, "%s: the model dropped %r from the document: %s" % (label, key, sorted(doc))
 
 
-def test_all_three_routes_return_the_identical_non_empty_body(one_hit_client, monkeypatch):
+def test_all_three_routes_return_the_identical_non_empty_body(monkeypatch):
     """Source-of-truth equality: three consumers of ONE producer (`_retrieve_documents`) must put
     the SAME bytes on the wire for the same hit. A fresh client per route (the fixture is
-    function-scoped) so state cannot leak between them."""
+    function-scoped) so state cannot leak between them.
+
+    The hit carries a DECLARED score kind (F-QUERY-SCORE-KIND-ON-THE-WIRE; RV-118 note 2): with a
+    plain-list stub every route sends score_kind null and the comparison could not see a route
+    that dropped or changed the kind. Declared, the equality below also proves all three routes
+    put the same kind on the wire -- and the last assert proves the kind is IN the compared bytes."""
+    from app.services.score_kind import RRF, ScoredHits
     bodies = {}
     for label in ROUTES:
-        client = one_hit_client if label == "/query" else \
-            _install(monkeypatch, [(Document(page_content="the passage",
-                                              metadata={**{"file_id": "f1", "user_id": "userA",
-                                                            "tenant_id": "tenantA"}, **UNMODELLED}), 0.25)])
+        client = _install(monkeypatch, ScoredHits(
+            [(Document(page_content="the passage",
+                       metadata={**{"file_id": "f1", "user_id": "userA", "tenant_id": "tenantA"},
+                                 **UNMODELLED}), 0.25)], RRF))
         bodies[label] = _post(client, label).content
     distinct = set(bodies.values())
     assert len(distinct) == 1, (
         "the sibling routes disagree on the non-empty wire: %s" %
         {k: v.decode("utf-8", "replace") for k, v in bodies.items()}
     )
+    assert b'"score_kind":"rrf"' in distinct.pop(), "the declared kind never reached the compared bytes"
 
 
 # --- The empty result: all three routes now AGREE on [] 200 -----------------------------------

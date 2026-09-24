@@ -20,6 +20,7 @@ from app.config import (
     RERANK_MODEL,
     logger,
 )
+from app.services.score_kind import RERANK_RELEVANCE, ScoredHits, kind_of
 
 _client = None
 
@@ -55,6 +56,12 @@ def _rerank_sync(query: str, documents: List[str], top_n: int) -> list:
             "type": "BEDROCK_RERANKING_MODEL",
             "bedrockRerankingConfiguration": {
                 "modelConfiguration": {"modelArn": model_arn},
+                # KNOWN LIMIT (RV-122 F2): asking for only top_n lets the PROVIDER resolve a
+                # relevance tie at the k-boundary before our own sort runs, so the returned SET
+                # is not deterministic on ties -- the same k-boundary problem the SQL legs have,
+                # one layer out. Closing it means requesting the whole pool and cutting locally;
+                # its cost is unmeasured and unmeasurable under the paid-call hold. See
+                # tests/utils/test_query_tie_order_total.py "KNOWN LIMIT 2".
                 "numberOfResults": top_n,
             },
         },
@@ -69,31 +76,47 @@ async def rerank(
 ) -> List[Tuple[Document, float]]:
     """Rerank (Document, score) candidates, returning the top_n as
     (Document, relevance_score). Falls back to candidates[:top_n] on any failure
-    or when disabled."""
+    or when disabled.
+
+    The result declares what its scores mean (`app.services.score_kind`): a successful
+    rerank is `rerank_relevance`; EVERY fallback keeps the candidates' own kind, because
+    those numbers are still the candidates' numbers. A slice is a plain list, so each
+    fallback re-wraps it -- otherwise the kind would silently fall off on exactly the
+    paths (a failed Bedrock call, the default region) where it matters most."""
+    kind = kind_of(candidates)
     if not candidates:
-        return []
+        return ScoredHits([], kind)
 
     top_n = max(1, min(top_n, len(candidates)))
     if not RERANK_ENABLED:
-        return candidates[:top_n]
+        return ScoredHits(candidates[:top_n], kind)
 
     documents = [doc.page_content for doc, _score in candidates]
     try:
         results = await asyncio.to_thread(_rerank_sync, query, documents, top_n)
     except Exception as exc:
         logger.warning("[rerank] failed; using pre-rerank order: %s", exc)
-        return candidates[:top_n]
+        return ScoredHits(candidates[:top_n], kind)
 
-    reranked = [
-        (candidates[r["index"]][0], float(r.get("relevanceScore", 0.0)))
+    # TOTAL order, not the provider's. Nothing documents that equal relevanceScores come
+    # back in a stable sequence, so two identical requests could interleave tied hits
+    # differently -- and RV-118 flagged the same thing independently: this function never
+    # sorted, it inherited whatever order Bedrock returned, which is INFERRED best-first,
+    # not verified. Sort explicitly: relevance DESC, then the candidate's own position in
+    # the pool, which is unique and (with the retrieval legs below now totally ordered)
+    # itself deterministic.
+    _scored = [
+        (r["index"], candidates[r["index"]][0], float(r.get("relevanceScore", 0.0)))
         for r in results
         if 0 <= r.get("index", -1) < len(candidates)
     ]
+    _scored.sort(key=lambda t: (-t[2], t[0]))
+    reranked = [(doc, score) for _idx, doc, score in _scored]
     if not reranked:
-        return candidates[:top_n]
+        return ScoredHits(candidates[:top_n], kind)
 
     logger.info(
         "[rerank] cohere via bedrock (%s) | %d candidates -> top %d",
         RERANK_MODEL, len(candidates), len(reranked),
     )
-    return reranked
+    return ScoredHits(reranked, RERANK_RELEVANCE)
