@@ -11,10 +11,16 @@ INDEPENDENTLY of the code under test:
   * rerank_relevance -- the numbers the (faked, deterministic) provider returned.
 
 So a declaration that says one kind while the pipeline produced another reddens, and so does a
-kind that is right while the numbers came from somewhere else. The two fallbacks a DEFAULT
-deployment actually takes are pinned too: hybrid configured but the keyword arm failing (a DB
-without `document_tsv`) must declare `cosine_distance`; rerank enabled but the provider failing
-(the default region does not host the model) must declare the fallback's `rrf`.
+kind that is right while the numbers came from somewhere else. Two REACHABLE fallbacks are
+pinned too: hybrid configured but the keyword arm failing (a DB without `document_tsv`) must
+declare `cosine_distance`; rerank enabled but the provider failing must declare the fallback's
+`rrf`.
+
+RV-118 note 1: this paragraph used to call those "the two fallbacks a DEFAULT deployment
+actually takes", on the premise that the default region does not host the rerank model. That
+premise is MEASURED FALSE -- cohere.rerank-v3-5:0 SUCCEEDED in us-east-1 on a real 18eca4c
+build, 2026-09-23T21:47Z. Which fallback a given deployment takes is an account/region fact to
+probe, so the suite claims only that each fallback declares correctly WHEN taken.
 
 Needs a Postgres with pgvector. RAG_TEST_PG_DSN selects it (CI provides a service);
 RAG_TEST_PG_REQUIRED=1 turns "no DSN" from a skip into an error so these provably ran.
@@ -300,10 +306,17 @@ def test_a_successful_rerank_declares_relevance_and_the_numbers_are_the_provider
     assert given, "the provider was never called: not the rerank path"
     assert {t: s for t, s in hits} == {t: given[t] for t, _s in hits}, (hits, given)
     # RV-118 note 1: the label and the numbers can both be right while the list is served in the
-    # wrong ORDER; a relevance must also be a relevance.
+    # wrong ORDER. The ORDER assert is the one that bites the producer -- it reds if the route
+    # serves a higher_is_better list in any other order.
+    #
+    # RV-118 note 2, correcting this block's own claim: the RANGE assert does NOT test the
+    # producer. These scores come from `_provider` above -- our fake -- and the producer passes
+    # provider numbers through without clamping, so the range can only fail if THIS FIXTURE
+    # stops emitting relevances. It is kept as a fixture sanity check, not as evidence about
+    # rag_api, and the earlier "order AND range in both" phrasing overstated it.
     scores = [s for _t, s in hits]
     assert scores == sorted(scores, reverse=True), "declared higher_is_better, served %r" % scores
-    assert all(0.0 <= s <= 1.0 for s in scores), "rerank_relevance outside [0, 1]: %r" % scores
+    assert all(0.0 <= s <= 1.0 for s in scores), "fixture no longer emits relevances: %r" % scores
 
 
 @needs_pg
