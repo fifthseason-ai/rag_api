@@ -476,3 +476,165 @@ def test_when_the_allowlist_is_unset_the_authority_guard_adds_no_new_rejections(
 def test_the_authority_guard_symbol_exists():
     """RENAME-LOUD PIN. Names the helper the guard relies on so a rename surfaces here."""
     assert hasattr(dr, "_reject_malformed_authority")
+
+
+# ===========================================================================
+# RV-197 RE-REVIEW residual + notes (SECURITY): control-char separator bypass, value-shape leak's
+# sibling on the authority side, non-ASCII/punycode, and typed 422 for unparseable authorities.
+# ===========================================================================
+
+EXACT_ALLOW = ("contoso.sharepoint.com",)
+
+
+def _no_work_spy(monkeypatch):
+    """Spy that proves a refused link reaches no temp file, no loader and hence no store write --
+    the 'nothing stored on refusal' contract. Returns the calls list (must stay empty)."""
+    calls = []
+    monkeypatch.setattr(dr, "_make_unique_temp_path",
+                        lambda *a, **k: calls.append("temp") or "/tmp/should-not-be-used")
+    monkeypatch.setattr(dr, "get_loader",
+                        lambda *a, **k: calls.append("loader") or (_ for _ in ()).throw(AssertionError("loader ran")))
+    return calls
+
+
+# --- BLOCKING: control char inside the "://" separator (T16-T19, T36) ----------------------
+
+#: A tab/LF/CR placed inside `://` makes the OLD `_raw_authority` (link.find("://")) return '' while
+#: Python's urlsplit strips the control char and reads the ALLOWED host -> admitted 200 and STORED
+#: raw; WHATWG (browser/Core new URL) reads evil.com. RED-FIRST at 1c8e690 (200 stored) under SP.
+RESIDUAL_SEPARATOR_CASES = {
+    "T16_tab_in_sep": "https:/\t/evil.com\\@contoso.sharepoint.com/x",
+    "T17_tab_before_slashes": "https:\t//evil.com\\@contoso.sharepoint.com/x",
+    "T18_lf_in_sep": "https:/\n/evil.com\\@contoso.sharepoint.com/x",
+    "T19_cr_in_sep_dot": "https:/\r/evil.com\\.contoso.sharepoint.com/x",
+    "T36_tab_in_sep_plus_later_scheme": "https:/\t/evil.com\\@contoso.sharepoint.com/x?next=https://ok.example/",
+}
+
+
+@pytest.mark.parametrize("allow", [F2_ALLOW, EXACT_ALLOW], ids=["SP_dotprefix", "EXACT"])
+@pytest.mark.parametrize("case", list(RESIDUAL_SEPARATOR_CASES), ids=list(RESIDUAL_SEPARATOR_CASES))
+def test_a_control_char_in_the_separator_is_refused_and_not_stored(monkeypatch, allow, case):
+    """THE RV-197 RESIDUAL. Under both allowlist shapes the separator-trick links must be REFUSED
+    (422 malformed) and nothing stored. RED-FIRST at 1c8e690: SP admits all five (200 stored);
+    EXACT admits T16/T17/T18/T36 (200 stored) and refuses T19 on host (still red because the reason
+    was link_host_not_allowed, not malformed)."""
+    _set_allowlist(monkeypatch, allow)
+    calls = _no_work_spy(monkeypatch)
+    r = _embed(link=RESIDUAL_SEPARATOR_CASES[case])
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["link"]["reason"] == MALFORMED, r.text
+    assert calls == [], "a bypass link did work before refusing (would have been stored): %r" % calls
+
+
+def test_a_control_char_anywhere_in_the_link_is_refused(monkeypatch):
+    """Isolates defence (a): a control char in the PATH (authority == netloc, so defence (b) passes)
+    must still be refused. RED-FIRST at 1c8e690 (tab stripped -> allowed host -> 200)."""
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    r = _embed(link="https://contoso.sharepoint.com/pa\tth")
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["link"]["reason"] == MALFORMED, r.text
+
+
+def test_raw_authority_must_equal_parsed_netloc(monkeypatch):
+    """Isolates defence (b) at unit level: when `_raw_authority(link)` differs from `parsed.netloc`
+    (and no control char is present) the guard refuses `authority_mismatch`, so the per-char scan and
+    the downstream host match can never read different strings."""
+    import types
+
+    link = "https://different.host/x"                       # _raw_authority -> 'different.host'
+    parsed = types.SimpleNamespace(netloc="contoso.sharepoint.com", hostname="contoso.sharepoint.com")
+    with pytest.raises(Exception) as ei:
+        dr._reject_malformed_authority(link, parsed, "f-b")
+    detail = getattr(ei.value, "detail", {})
+    assert detail.get("link", {}).get("reason") == MALFORMED, detail
+
+
+# --- N8: %-only and whitespace-only cases with NO "@" (isolate MF2d / MF2e) ----------------
+
+@pytest.mark.parametrize("bad_link,kind_hint", [
+    ("https://evil.com%2e.contoso.sharepoint.com/x", "percent"),   # no '@' -> isolates the % branch
+    ("https://evil.com .contoso.sharepoint.com/x", "whitespace"),  # no '@' -> isolates the whitespace branch
+])
+def test_percent_and_whitespace_branches_are_independently_refused(monkeypatch, bad_link, kind_hint):
+    """N8: the pre-existing %/whitespace cases also contained '@', so the userinfo branch refused
+    them and the %/whitespace branches had no isolating test (MF2d/MF2e survived). These @-free
+    cases refuse via their own branch."""
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    r = _embed(link=bad_link)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["link"]["reason"] == MALFORMED, r.text
+
+
+# --- N4: non-ASCII / punycode authority (T05 invalid punycode, T20 fullwidth, T06 Cyrillic) ----
+
+@pytest.mark.parametrize("bad_link,label", [
+    ("https://xn--invalidpunycodexyz.sharepoint.com/x", "T05_punycode"),
+    ("https://evil.com＼.contoso.sharepoint.com/x", "T20_fullwidth_backslash"),
+    ("https://cоntoso.sharepoint.com/x", "T06_cyrillic"),
+])
+def test_a_non_ascii_or_punycode_authority_is_refused(monkeypatch, bad_link, label):
+    """N4. The governed-host list is ASCII, and stdlib IDNA admits invalid punycode WHATWG rejects.
+    CHOSEN POLICY (conservative tightening the RV-197 receipt permits for T06/T21/T29): refuse any
+    non-ASCII authority and any `xn--` punycode label. T05 and T20 MUST become refused; T06 is
+    refused by the same consistent policy. RED-FIRST at 1c8e690 (all 200 under SP)."""
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    r = _embed(link=bad_link)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["link"]["reason"] == MALFORMED, r.text
+
+
+# --- N5: an unparseable authority is a typed 422, not an untyped 500 -----------------------
+
+@pytest.mark.parametrize("bad_link,label", [
+    ("https://contoso.sharepoint.com＠evil.com/x", "T10_fullwidth_at"),
+    ("https://[contoso.sharepoint.com]/x", "T14_bad_ipv6"),
+    ("https://evil.com／@contoso.sharepoint.com/x", "T22_fullwidth_slash"),
+])
+def test_an_unparseable_authority_is_a_typed_422_not_a_500(monkeypatch, bad_link, label):
+    """N5. urlparse raises ValueError on an NFKC-unsafe / bad-IPv6 authority; at 1c8e690 the route
+    answered an untyped 500. It must be a typed 422 link_malformed_authority (Rule 28), nothing
+    stored, no echo. RED-FIRST at 1c8e690 (500)."""
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    calls = _no_work_spy(monkeypatch)
+    r = _embed(link=bad_link)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["link"]["reason"] == MALFORMED, r.text
+    assert calls == [], calls
+
+
+# --- N6: restore the malformed-authority LOG never-echo assertion --------------------------
+
+def test_the_malformed_authority_refusal_never_echoes_the_raw_link_into_the_log(monkeypatch, caplog):
+    """N6: the dropped `logcanary-user` caplog check had no repo replacement, so no permanent test
+    covered the malformed-authority LOG path. Restore it: the refusal logs exactly one warning that
+    names the bounded `kind` and NONE of the raw link (userinfo/path/token)."""
+    import logging
+
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    payload = "https://mlog-canary-user:mlog-canary-tok@evil.com\\@contoso.sharepoint.com/mlog-canary-path"
+    with caplog.at_level(logging.DEBUG):
+        r = _embed(link=payload)
+
+    assert r.status_code == 422, r.text
+    joined = " ".join(rec.getMessage() for rec in caplog.records)
+    for canary in ("mlog-canary-user", "mlog-canary-tok", "mlog-canary-path"):
+        assert canary not in joined, joined
+    refusals = [rec for rec in caplog.records
+                if "refused a link whose authority is malformed" in rec.getMessage()]
+    assert len(refusals) == 1, [rec.getMessage() for rec in caplog.records]
+    assert refusals[0].levelno == logging.WARNING, refusals[0].levelname
+
+
+# --- no-regression: legitimate allowed links still pass after all the new checks -----------
+
+@pytest.mark.parametrize("good_link", [
+    "https://contoso.sharepoint.com/sites/x/Shared%20Documents/Deck.pptx",
+    "https://a.contoso.sharepoint.com/docs/Report.pdf",
+    "https://contoso.sharepoint.com:8443/sites/x/Deck.pptx",
+])
+def test_legitimate_links_still_pass_after_the_hardening(monkeypatch, good_link):
+    """The added control-char / authority-mismatch / non-ASCII / punycode checks must not refuse a
+    clean ASCII allowed link (a %-encoded space in the PATH, a subdomain, or a bare port)."""
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    r = _embed(link=good_link)
+    assert r.status_code == 200, r.text

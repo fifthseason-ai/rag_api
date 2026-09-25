@@ -205,6 +205,10 @@ def test_redacted_metadata_unit_fails_closed_but_passes_the_canonical_object():
 def test_query_fails_closed_on_a_non_canonical_marker(monkeypatch, shape):
     """RED-FIRST. The same fail-open shapes leaked on /query too (RV-183 PASSTHRU probe). After the
     fix the query seam redacts them, so no raw fragment reaches the wire."""
+    _query_shape_no_leak(monkeypatch, shape)
+
+
+def _query_shape_no_leak(monkeypatch, shape):
     from app.routes import document_routes as dr
     from main import app
 
@@ -223,3 +227,63 @@ def test_query_fails_closed_on_a_non_canonical_marker(monkeypatch, shape):
         assert marker not in r.text, r.text
     ql = r.json()[0][0]["metadata"]["quarantined_link"]
     assert isinstance(ql, dict) and set(ql) == CANONICAL_KEYS, ql
+    return r
+
+
+# ---------------------------------------------------------------------------
+# RV-197 re-review N1/N7: the redactor must be fail-closed on VALUES, not just the key set.
+# ---------------------------------------------------------------------------
+
+#: N1: canonical KEYS but VALUES holding the raw URL. The key-set-only check served this verbatim on
+#: all 4 routes (RV-197 receipt "canonical keys whose VALUES hold the raw URL: LEAKED"). RED at 1c8e690.
+CANON_KEYS_RAW_VALUES = {
+    "file_id": FILE_A, "user_id": ENT_A, "tenant_id": TENANT_A,
+    "quarantined_link": {"scheme": RAW_URL, "host": RAW_URL,
+                         "refusal_reason": RAW_URL, "sha256": RAW_URL},
+}
+#: N7 / MF1c: canonical keys PLUS an extra key holding raw. Redacted at head (key set not EXACTLY
+#: canonical); kills the `==`->`>=` (superset passes) mutation that would serve the extra key verbatim.
+CANON_KEYS_PLUS_EXTRA = {
+    "file_id": FILE_A, "user_id": ENT_A, "tenant_id": TENANT_A,
+    "quarantined_link": {"scheme": "http", "host": "h.example",
+                         "refusal_reason": "link_scheme_not_allowed", "sha256": "0" * 64,
+                         "raw": RAW_URL},
+}
+
+
+@pytest.mark.parametrize("shape", [CANON_KEYS_RAW_VALUES, CANON_KEYS_PLUS_EXTRA],
+                         ids=["raw_values", "extra_key"])
+def test_get_documents_fails_closed_on_canonical_keys_with_bad_values(env, shape):
+    """RED-FIRST (raw_values): canonical keys with raw-URL VALUES leaked on GET /documents at
+    1c8e690. GREEN-at-head + kills MF1c (extra_key): a superset key set must not pass. Both serve
+    no raw fragment and a valid redacted object."""
+    client = env(shape)
+    r = client.get("/documents", params={"ids": [FILE_A]}, headers=_tok([ENT_A]))
+    assert r.status_code == 200, r.text
+    for marker in RAW_LEAK_MARKERS:
+        assert marker not in r.text, r.text
+    ql = r.json()[0]["metadata"]["quarantined_link"]
+    assert isinstance(ql, dict) and set(ql) == CANONICAL_KEYS, ql
+
+
+@pytest.mark.parametrize("shape", [CANON_KEYS_RAW_VALUES, CANON_KEYS_PLUS_EXTRA],
+                         ids=["raw_values", "extra_key"])
+def test_query_fails_closed_on_canonical_keys_with_bad_values(monkeypatch, shape):
+    """The value-shape fail-closed rule holds on /query too (all 4 metadata routes share the seam)."""
+    _query_shape_no_leak(monkeypatch, shape)
+
+
+def test_is_canonical_marker_validates_value_shapes():
+    """Unit contract for N1/N7: only a canonical key set whose values match their shapes passes; a
+    raw value in any field, an extra key, or a malformed sha256 is rejected (caller then redacts)."""
+    from app.routes import document_routes as dr
+
+    good = {"scheme": "http", "host": "h.example", "refusal_reason": "link_scheme_not_allowed",
+            "sha256": "0" * 64}
+    assert dr._is_canonical_redacted_marker(dict(good)) is True
+    assert dr._is_canonical_redacted_marker({**good, "scheme": None, "host": None}) is True
+    for field in ("scheme", "host", "refusal_reason", "sha256"):
+        assert dr._is_canonical_redacted_marker({**good, field: RAW_URL}) is False, field
+    assert dr._is_canonical_redacted_marker({**good, "raw": RAW_URL}) is False   # extra key
+    assert dr._is_canonical_redacted_marker({**good, "sha256": "0" * 63}) is False
+    assert dr._is_canonical_redacted_marker({**good, "sha256": "A" * 64}) is False
