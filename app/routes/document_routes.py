@@ -2620,6 +2620,54 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
 _ALLOWED_LINK_SCHEMES = ("https",)
 
 
+def _governed_link_hosts() -> tuple:
+    """Operator-configured governed-HOST allowlist for citation links (CARD-P2-01 S4, G1-A).
+
+    The scheme guard (`_reject_ungoverned_link`) proves a link is https; it does NOT prove the
+    host is one the platform actually governs. `#556` shipped the scheme/storage/presign half in
+    Core, but the host-level rule (RV-145 N1) had no source of truth in rag_api. This is it: the
+    PRODUCER-SIDE allowlist, so a citation link is trusted by host, not merely by scheme.
+
+    Read ONCE from `RAG_GOVERNED_LINK_HOSTS` at import (comma- and/or whitespace-separated
+    hostnames), lower-cased. Two entry shapes, per the rule recorded at `_reject_ungoverned_link`:
+      * an exact host  -- "a.example.com" matches only "a.example.com"
+      * a dot-prefixed suffix -- ".example.com" matches "a.example.com" (any subdomain) but NOT
+        the bare "example.com", and NOT a look-alike like "evilexample.com"
+
+    CONSERVATIVE DEFAULT, deliberately: UNSET/empty => the host check is DISABLED and the current
+    https-only behaviour is preserved with ZERO new rejections. The allowlist VALUE is a Richard
+    policy/disclosure call (CARD-P2-01 §11, OPEN FOR RICHARD); shipping a half-guessed host rule
+    would be worse than shipping none, so nothing is invented here -- no default host, no list.
+    """
+    raw = os.getenv("RAG_GOVERNED_LINK_HOSTS", "") or ""
+    return tuple(h.strip().lower() for h in raw.replace(",", " ").split() if h.strip())
+
+
+#: Governed-host allowlist, resolved ONCE at import. Empty tuple == host check disabled.
+_GOVERNED_LINK_HOSTS = _governed_link_hosts()
+
+
+def _host_is_governed(hostname: str, allow: tuple) -> bool:
+    """True iff `hostname` is admitted by the allowlist `allow` (hostname-only, case-folded).
+
+    `hostname` is what `urlparse(...).hostname` returns: already lower-cased, with any userinfo
+    (credentials) and port dropped -- so the match is on the host and nothing else. An exact
+    entry matches only itself; a dot-prefixed entry matches its subdomains, never the bare parent
+    and never a suffix look-alike (`.example.com` does not match `evilexample.com`, because that
+    string does not end with the leading dot).
+    """
+    if not hostname:
+        return False
+    host = hostname.lower()
+    for entry in allow:
+        if entry.startswith("."):
+            if host.endswith(entry):
+                return True
+        elif host == entry:
+            return True
+    return False
+
+
 def _reject_ungoverned_link(link: Optional[str], file_id: str) -> None:
     """Refuse a caller-supplied `link` that is not an https URL (F-EMBED-LINK-VALIDATE).
 
@@ -2637,45 +2685,87 @@ def _reject_ungoverned_link(link: Optional[str], file_id: str) -> None:
     ABSENT IS NOT A REFUSAL. Organic uploads omit `link`, and that path must stay exactly as
     it was -- this returns immediately for None/"".
 
-    The HOST allowlist is deliberately NOT here. It needs a deployment config
-    (`RAG_GOVERNED_LINK_HOSTS`, proposed: hostname-only match, exact host or dot-prefixed
-    suffix, unset = scheme-only) whose VALUE is the operator's, and the connector hosts it
-    must admit are per-tenant for Box. Scheme-only is what is provably safe today; shipping
-    a half-guessed host rule would be worse than shipping none.
+    HOST allowlist (CARD-P2-01 S4, G1-A): AFTER the scheme guard passes, an https link is ALSO
+    checked against the operator-configured governed-host allowlist (`_GOVERNED_LINK_HOSTS`, from
+    `RAG_GOVERNED_LINK_HOSTS`; hostname-only match, exact host or dot-prefixed suffix). CONSERVATIVE
+    DEFAULT: when the allowlist is UNSET/empty the host check is DISABLED and scheme-only behaviour
+    is preserved with zero new rejections -- the allowlist VALUE is a Richard policy call (§11), so
+    nothing is invented here. When it IS configured, a scheme-valid link on a non-allowlisted host
+    is refused with the typed reason `link_host_not_allowed` (same 422 envelope as the scheme case).
 
     TYPED REFUSAL, never a silent drop (Rule 28): a caller that sends a bad link learns why,
     so Core's callers can surface it under the D1/D7 STATUS-field rule rather than discover a
     missing citation link much later. The shape mirrors this module's existing refusal
     (`_assert_extractable_content`): a human `message` plus a machine-readable key.
 
-    The rejected value is NOT echoed back -- only its scheme. A `javascript:` payload
-    reflected into an error body is just the same problem wearing a different hat.
+    The rejected value is NOT echoed back -- only its scheme (scheme case) or its redacted
+    hostname (host case). A `javascript:` payload or a token-bearing query reflected into an error
+    body is just the same problem wearing a different hat.
     """
     if not link:
         return
-    scheme = (urlparse(link).scheme or "").lower()
-    if scheme in _ALLOWED_LINK_SCHEMES:
+    parsed = urlparse(link)
+    scheme = (parsed.scheme or "").lower()
+    # SCHEME GUARD FIRST: a non-https link is refused as before, regardless of the host rule.
+    if scheme not in _ALLOWED_LINK_SCHEMES:
+        # RV-130 N4: `scheme` is reflected in the response and the log. urlparse already
+        # constrains it to URL-scheme characters (letter then letters/digits/+.-), so it cannot
+        # carry markup -- but its LENGTH is caller-chosen, so cap what we echo. A real scheme is a
+        # handful of chars; anything past 32 is not a scheme we need to name back verbatim.
+        reported_scheme = scheme[:32] if scheme else None
+        logger.warning(
+            "[embed_file] refused a link whose scheme is not allowed [file_id=%s][scheme=%r]",
+            file_id, reported_scheme,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": (
+                    "The 'link' supplied for this file is not an https URL, so nothing was "
+                    "stored. Send the source document's https URL, or omit 'link'."
+                ),
+                "link": {
+                    "reason": "link_scheme_not_allowed",
+                    "scheme": reported_scheme,
+                    "allowed_schemes": list(_ALLOWED_LINK_SCHEMES),
+                },
+            },
+        )
+
+    # HOST GUARD (CARD-P2-01 S4, G1-A): only when the allowlist is CONFIGURED. Unset/empty means
+    # the host check is disabled -- the conservative default -- so a scheme-valid link ingests
+    # exactly as it did before, with zero new rejections. Never invent a host value here.
+    allow = _GOVERNED_LINK_HOSTS
+    if not allow:
         return
-    # RV-130 N4: `scheme` is reflected in the response and the log. urlparse already
-    # constrains it to URL-scheme characters (letter then letters/digits/+.-), so it cannot
-    # carry markup -- but its LENGTH is caller-chosen, so cap what we echo. A real scheme is a
-    # handful of chars; anything past 32 is not a scheme we need to name back verbatim.
-    reported_scheme = scheme[:32] if scheme else None
+    # `parsed.hostname` is lower-cased with userinfo (credentials) and port already dropped, so
+    # the allowlist is matched on the host alone -- the same extraction `_redact_quarantined_link`
+    # uses. A https URL with no host (rare, but urlparse can return None) is not governed.
+    hostname = parsed.hostname or ""
+    if _host_is_governed(hostname, allow):
+        return
+    # The raw link is NEVER echoed back (it can carry a token in the query, credentials in the
+    # userinfo, or a payload) -- only the redacted hostname, the reason, and the allowed hosts, so
+    # the caller can correct the source without the untrusted value being reflected. The hostname
+    # is host-character-constrained by urlparse; its length is caller-chosen, so cap it (a real
+    # FQDN is <= 253 chars).
+    reported_host = hostname[:253] if hostname else None
     logger.warning(
-        "[embed_file] refused a link whose scheme is not allowed [file_id=%s][scheme=%r]",
-        file_id, reported_scheme,
+        "[embed_file] refused a link whose host is not allowed [file_id=%s][host=%r]",
+        file_id, reported_host,
     )
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail={
             "message": (
-                "The 'link' supplied for this file is not an https URL, so nothing was "
-                "stored. Send the source document's https URL, or omit 'link'."
+                "The 'link' supplied for this file is https but its host is not on the "
+                "platform's governed-host allowlist, so nothing was stored. Send the source "
+                "document's URL on an approved host, or omit 'link'."
             ),
             "link": {
-                "reason": "link_scheme_not_allowed",
-                "scheme": reported_scheme,
-                "allowed_schemes": list(_ALLOWED_LINK_SCHEMES),
+                "reason": "link_host_not_allowed",
+                "host": reported_host,
+                "allowed_hosts": list(allow),
             },
         },
     )
