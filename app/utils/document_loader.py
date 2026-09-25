@@ -1097,6 +1097,37 @@ class SafePyPDFLoader:
         return list(self.lazy_load())
 
 
+# --- Degraded-extraction signal (CARD-DEGRADED-EXTRACTION-SIGNAL; CARD-P2-01 S1) ----------
+#
+# `locator_kind: "none"` used to mean TWO things on the receipt: (a) the document legitimately
+# has no addressable units (a header/footer-only DOCX, a TXT file), and (b) a structured walk
+# FAILED and the loader degraded to a flat read that kept the text but lost every per-unit
+# locator. A reader could not tell "I had nothing to address" from "I failed to address it".
+#
+# The loader now stamps THIS key on every Document of a degraded read, naming WHY. It is
+# stamped ONLY on the degraded path, never on the legitimate no-structure path -- an alarm that
+# fires on the normal case teaches readers to ignore it. ABSENT means "nothing degraded", never
+# "unknown". The receipt rolls it up into `extraction.degraded`; `_prepare_documents_sync`
+# preserves loader metadata, so it also rides every stored chunk's cmetadata (a CONTRACT
+# SURFACE -- P06-5 contract addendum 3). Renaming the key or a reason silently breaks Core.
+DEGRADED_KEY = "extraction_degraded"
+
+#: The DOCX structured walk met a body child carrying authored text that it cannot faithfully
+#: place as a unit (`_UnrepresentableBody`), so it abandoned to the flat read. Text is KEPT;
+#: per-block locators are LOST. This is the fail-safe firing.
+DEGRADED_DOCX_BLOCK_UNREPRESENTABLE = "docx_block_unrepresentable"
+#: The DOCX structured walk could not read the package at all (a parse problem, a missing part,
+#: an unexpected error) and fell back to the flat read. If the flat read then succeeds, its text
+#: carries no per-block locators for a reason that is ours to state, not the document's nature.
+DEGRADED_DOCX_STRUCTURE_UNREADABLE = "docx_structure_unreadable"
+
+#: The closed vocabulary, for tests and for the contract addendum. A new reason APPENDS here.
+DEGRADED_REASONS = (
+    DEGRADED_DOCX_BLOCK_UNREPRESENTABLE,
+    DEGRADED_DOCX_STRUCTURE_UNREADABLE,
+)
+
+
 class _UnrepresentableBody(Exception):
     """Private sentinel: the structured DOCX walk found a body (or w:sdtContent)
     child carrying non-whitespace ``w:t`` text that it cannot faithfully place as
@@ -1165,6 +1196,12 @@ class SafeDocxLoader:
     def __init__(self, filepath: str):
         self.filepath = filepath
         self._temp_filepath = None  # For compatibility with cleanup function
+        #: WHY the last `_structured_units` call returned None, when that None was a
+        #: DEGRADATION (a `DEGRADED_*` reason); None when the walk succeeded OR when the
+        #: document legitimately has no body block to cite. `load()` stamps it onto the
+        #: flat Documents as `DEGRADED_KEY`. Kept as state rather than a changed return
+        #: value because `_structured_units() is None` is itself a pinned contract.
+        self._degraded_reason: Optional[str] = None
 
     @classmethod
     def _has_text(cls, element) -> bool:
@@ -1466,21 +1503,33 @@ class SafeDocxLoader:
         (`_UnrepresentableBody`), OR when there is NO body-level block to cite (an
         empty body, or a document whose only text is in header/footer parts). In
         that last case the flat path keeps the header/footer text honestly at
-        `locator_kind=none`. NOTE (measured limitation, receipt contract): a
-        no-body document and a fail-safe degradation BOTH report `locator_kind=none`
-        and are not distinguished at the document level on the current wire."""
+        `locator_kind=none`.
+
+        WHICH None IS A DEGRADATION (CARD-DEGRADED-EXTRACTION-SIGNAL). Both kinds of
+        None report `locator_kind=none`, so on its own the receipt could not tell them
+        apart (the #90 limitation). `self._degraded_reason` now carries the difference:
+        it is set to a `DEGRADED_*` reason on every failure None, and deliberately LEFT
+        None on the no-body-block None -- a document with nothing to address has not
+        degraded, and signalling it would put the alarm on the normal case. `load()`
+        stamps the reason onto the flat Documents; the receipt reports it as
+        `extraction.degraded`. (A failure None whose flat read then raises never
+        reaches a receipt: the flat read's own verdict is the answer.)"""
+        self._degraded_reason = None
         try:
             with zipfile.ZipFile(self.filepath) as zin:
                 names = zin.namelist()
                 if self._DOC_PART not in names:
+                    self._degraded_reason = DEGRADED_DOCX_STRUCTURE_UNREADABLE
                     return None
                 doc_root = self._deduped_part(zin.read(self._DOC_PART))
                 if doc_root is None:
+                    self._degraded_reason = DEGRADED_DOCX_STRUCTURE_UNREADABLE
                     return None
                 body_units = list(self._body_units(doc_root))
                 # No citable body block: degrade to flat so header/footer text is
                 # still kept (locator_kind none), rather than emit only unnamed
                 # units. block_index exists to cite body position; there is none.
+                # NOT a degradation: `_degraded_reason` stays None on purpose.
                 if not body_units:
                     return None
                 # Headers then footers, each in stable filename order, so the same
@@ -1498,24 +1547,29 @@ class SafeDocxLoader:
                             # failure into a fake success. Degrade to the flat path
                             # (symmetric with the doc_root handling above) so the
                             # real verdict surfaces. Well-formed parts never hit this.
+                            self._degraded_reason = DEGRADED_DOCX_STRUCTURE_UNREADABLE
                             return None
                         text = self._text_of(part_root)
                         if text.strip():
                             aux_units.append(text)
                 return body_units, aux_units
         except zipfile.BadZipFile:
+            self._degraded_reason = DEGRADED_DOCX_STRUCTURE_UNREADABLE
             return None  # let the flat fallback raise docx2txt's honest verdict
         except _UnrepresentableBody as e:
             # Fail-safe: an unrepresentable text-bearing body child. Degrade to the
             # flat path so the text is kept (locator_kind none), never a lossy
-            # partial. This is expected for unusual documents, not an error.
+            # partial. This is expected for unusual documents, not an error -- but it
+            # IS a degradation of what the receipt can address, so it is named.
             logger.info(
                 "DOCX body child %s carries text the structured walk cannot place "
                 "for %s; degrading to flat extraction", e, self.filepath,
             )
+            self._degraded_reason = DEGRADED_DOCX_BLOCK_UNREPRESENTABLE
             return None
         except Exception as e:  # noqa: BLE001 - never fatal; degrade to flat text
             logger.warning("DOCX structured walk failed for %s: %s", self.filepath, e)
+            self._degraded_reason = DEGRADED_DOCX_STRUCTURE_UNREADABLE
             return None
 
     def _flat_load(self) -> List[Document]:
@@ -1548,12 +1602,18 @@ class SafeDocxLoader:
 
         A text box is read once (the #85 AlternateContent dedupe is preserved).
         `source` is always the uploaded file. No cmetadata key beyond the locator
-        family is stamped. Falls back to flat extraction (one `locator_kind=none`
-        Document) when the document cannot be structured OR has no body block to
-        cite."""
+        family is stamped on a structured read. Falls back to flat extraction (one
+        `locator_kind=none` Document) when the document cannot be structured OR has
+        no body block to cite -- and ONLY in the first case (a degradation) is each
+        flat Document stamped with `DEGRADED_KEY` naming the reason. The no-body
+        case carries no such key: it did not degrade, it had nothing to address."""
         structured = self._structured_units()
         if not structured:
-            return self._flat_load()
+            documents = self._flat_load()
+            if self._degraded_reason is not None:
+                for doc in documents:
+                    doc.metadata[DEGRADED_KEY] = self._degraded_reason
+            return documents
         body_units, aux_units = structured
         docs = [
             Document(
