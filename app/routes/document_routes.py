@@ -1349,16 +1349,68 @@ def _authorized_only(documents, entity_ids):
 
 
 #: The key the stored-link backfill MOVES a refused `link` into
-#: (C:/fswt/.coord/FILES-DEV/CARD-F-EMBED-LINK-BACKFILL-2026-09-24T113102Z.md, MUTATION:
-#: `(cmetadata - 'link') || jsonb_build_object('quarantined_link', ..., 'quarantined_reason', ...,
-#: 'quarantined_at', ...)`). Its PRESENCE is the quarantine marker -- the same predicate the card's
-#: own idempotency guard uses (`NOT (cmetadata ? 'quarantined_link')`). Read here, never written:
-#: rag_api invents no second marker.
+#: (C:/fswt/.coord/FILES-DEV/CARD-F-EMBED-LINK-BACKFILL-2026-09-24T113102Z.md, MUTATION). Its
+#: PRESENCE is the quarantine marker -- the same predicate the card's own idempotency guard uses
+#: (`NOT (cmetadata ? 'quarantined_link')`). Read here; rag_api ingestion never writes it (a bad
+#: `link` is refused at write time, 422, before any store), so the only writer is the backfill.
 QUARANTINED_LINK_KEY = "quarantined_link"
+#: The separate reason key the backfill also writes; folded into the redacted marker's
+#: `refusal_reason` on the wire.
+QUARANTINED_REASON_KEY = "quarantined_reason"
+_DEFAULT_QUARANTINE_REASON = "link_scheme_not_allowed"
 
 LINK_STATE_PRESENT = "present"
 LINK_STATE_QUARANTINED = "quarantined"
 LINK_STATE_NONE = "none"
+
+
+def _redact_quarantined_link(raw: str, reason: Optional[str] = None) -> dict:
+    """The REDACTED form of a quarantined citation link (CARD-P2-01 S1, INTEGRATION decision (2)).
+
+    A quarantined marker must NEVER carry the raw URL string -- at rest or on the wire. The raw
+    value can hold credentials, a token in the query, or a `javascript:`/`data:` payload; the
+    whole reason it was quarantined is that it is not to be trusted in front of a reader. So the
+    marker keeps only what a consumer legitimately needs to describe and correlate it:
+
+      scheme         the URL scheme, lower-cased (or None) -- WHY it was refused, at a glance
+      host           the hostname ONLY (urlparse.hostname drops any userinfo/credentials and the
+                     port), or None for a scheme with no host (javascript:, data:)
+      refusal_reason the reason the backfill recorded, or the default
+      sha256         hex digest of the raw value, so two rows carrying the same refused link can
+                     be correlated WITHOUT the link ever being reconstructable from it
+
+    Deterministic and total: any string in, a dict out, the raw never returned. `urlparse` on a
+    hostile value cannot itself execute anything -- it only splits the string.
+    """
+    parsed = urlparse(raw or "")
+    return {
+        "scheme": (parsed.scheme or "").lower() or None,
+        "host": parsed.hostname or None,
+        "refusal_reason": reason or _DEFAULT_QUARANTINE_REASON,
+        "sha256": hashlib.sha256((raw or "").encode("utf-8", "ignore")).hexdigest(),
+    }
+
+
+def _redacted_metadata(metadata: dict) -> dict:
+    """`metadata` with any RAW quarantined link replaced by its redacted marker, so the raw URL
+    never leaves the process (CARD-P2-01 S1, decision (2)).
+
+    New rows are already redacted AT REST (the backfill writes the object; see the card), so this
+    is a no-op for them -- `quarantined_link` is already a dict and passes through, and
+    `retrieved == stored`. This transform exists for LEGACY rows written by an earlier backfill
+    that moved the raw string verbatim: those are redacted ON EMIT here, so the raw never reaches
+    the wire even before the data is migrated. When there is nothing to redact the SAME dict is
+    returned (no churn), so the equality tests that assert metadata is untouched still hold.
+    """
+    raw = metadata.get(QUARANTINED_LINK_KEY)
+    if not isinstance(raw, str):
+        # Absent, or already the redacted object at rest: nothing to strip.
+        return metadata
+    shaped = dict(metadata)
+    shaped[QUARANTINED_LINK_KEY] = _redact_quarantined_link(
+        raw, metadata.get(QUARANTINED_REASON_KEY)
+    )
+    return shaped
 
 
 def _link_state(metadata: dict) -> str:
@@ -1385,27 +1437,31 @@ def _on_the_wire(documents) -> list:
 
     The ONE place every query route builds its response, so the three routes cannot disagree.
     The pair shape and the number are unchanged; the fields are additive and top-level on
-    the document, never inside `metadata` -- `metadata` goes out exactly as stored. An
-    undeclared list (built outside the pipeline) goes out as null/null: UNKNOWN, stated rather
-    than guessed.
+    the document. `metadata` goes out exactly as stored EXCEPT that a raw quarantined link is
+    redacted on emit (decision (2)) -- the raw URL never leaves the process, at rest or on the
+    wire. An undeclared list (built outside the pipeline) goes out as null/null: UNKNOWN, stated
+    rather than guessed.
     """
     kind = kind_of(documents)
     direction = DIRECTION.get(kind) if kind else None
-    return [
-        (
-            QueryDocument(
-                id=getattr(doc, "id", None),
-                metadata=getattr(doc, "metadata", None) or {},
-                page_content=doc.page_content,
-                type=getattr(doc, "type", None),
-                score_kind=kind,
-                score_direction=direction,
-                link_state=_link_state(getattr(doc, "metadata", None) or {}),
-            ),
-            score,
+    hits = []
+    for (doc, score) in documents:
+        stored = getattr(doc, "metadata", None) or {}
+        hits.append(
+            (
+                QueryDocument(
+                    id=getattr(doc, "id", None),
+                    metadata=_redacted_metadata(stored),
+                    page_content=doc.page_content,
+                    type=getattr(doc, "type", None),
+                    score_kind=kind,
+                    score_direction=direction,
+                    link_state=_link_state(stored),
+                ),
+                score,
+            )
         )
-        for (doc, score) in documents
-    ]
+    return hits
 
 
 @router.post("/query", response_model=List[QueryHit])

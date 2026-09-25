@@ -69,12 +69,13 @@ class QueryDocument(BaseModel):
 
     #: Whether this chunk carries a stored citation link, a QUARANTINED one, or none (CARD-P2-01 S1 C):
     #: 'present' | 'quarantined' | 'none'. Top-level for the same reason as `score_kind`: it
-    #: DESCRIBES the stored metadata, it is not stored data, so `metadata` stays exactly what was
-    #: stored. Derived from the marker the stored-link backfill writes
-    #: (CARD-F-EMBED-LINK-BACKFILL, MUTATION: `link` MOVED to `quarantined_link`); see
-    #: `document_routes._link_state`. `None` (sent as null) only on a document built outside the
-    #: shaping seam -- UNKNOWN, never "no link". 'present' says a link is STORED, not that it is
-    #: governed: Core's consumer-side governed-URL gate stays load-bearing.
+    #: DESCRIBES the stored metadata, it is not stored data. Derived from the marker the stored-link
+    #: backfill writes (CARD-F-EMBED-LINK-BACKFILL); see `document_routes._link_state`. `None` (sent
+    #: as null) only on a document built outside the shaping seam -- UNKNOWN, never "no link".
+    #: 'present' says a link is STORED, not that it is governed: Core's consumer-side governed-URL
+    #: gate stays load-bearing. When 'quarantined', `metadata.quarantined_link` is the REDACTED
+    #: object {scheme, host, refusal_reason, sha256} -- never the raw refused URL (decision (2));
+    #: `_redacted_metadata` strips a raw string on emit, so the raw never leaves the process.
     link_state: Optional[str] = None
 
 
