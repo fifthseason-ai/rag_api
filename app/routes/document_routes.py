@@ -933,7 +933,18 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
                 status_code=404, detail="No documents found for the given IDs"
             )
 
-        return documents
+        # R2 redaction (RV-197 F1(a)): every exit that serves metadata must strip a raw quarantined
+        # link, exactly as the query seam (`_on_the_wire`) does -- previously only /query* did, so a
+        # LEGACY raw-string row was served verbatim here. Applied AFTER the entitlement filter and
+        # WITHOUT mutating the stored ORM metadata (`_redacted_metadata` copies only when it redacts),
+        # so a same-tenant read is never turned into a 404 and the raw URL never leaves the process.
+        return [
+            DocumentResponse(
+                page_content=d.page_content,
+                metadata=_redacted_metadata(getattr(d, "metadata", None) or {}),
+            )
+            for d in documents
+        ]
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in get_documents_by_ids | Status: %d | Detail: %s",
@@ -1391,24 +1402,59 @@ def _redact_quarantined_link(raw: str, reason: Optional[str] = None) -> dict:
     }
 
 
-def _redacted_metadata(metadata: dict) -> dict:
-    """`metadata` with any RAW quarantined link replaced by its redacted marker, so the raw URL
-    never leaves the process (CARD-P2-01 S1, decision (2)).
+#: The EXACT key set of the canonical redacted marker. Only this shape is trusted to be safe at
+#: rest; every other `quarantined_link` value is redacted (fail-CLOSED).
+_REDACTED_MARKER_KEYS = frozenset({"scheme", "host", "refusal_reason", "sha256"})
 
-    New rows are already redacted AT REST (the backfill writes the object; see the card), so this
-    is a no-op for them -- `quarantined_link` is already a dict and passes through, and
-    `retrieved == stored`. This transform exists for LEGACY rows written by an earlier backfill
-    that moved the raw string verbatim: those are redacted ON EMIT here, so the raw never reaches
-    the wire even before the data is migrated. When there is nothing to redact the SAME dict is
+
+def _is_canonical_redacted_marker(value) -> bool:
+    """True iff `value` is EXACTLY the redacted object shape the redaction-aware backfill writes at
+    rest -- a dict whose keys are precisely {scheme, host, refusal_reason, sha256}. Anything else,
+    including a raw string or a near-miss dict, is treated as un-redacted and stripped."""
+    return isinstance(value, dict) and frozenset(value.keys()) == _REDACTED_MARKER_KEYS
+
+
+def _redact_any_quarantined_link(raw, reason: Optional[str] = None) -> dict:
+    """The redacted marker for ANY non-canonical `quarantined_link` value (RV-197 F1(b)).
+
+    A `str` is parsed for its scheme/host exactly as before (`_redact_quarantined_link`; the raw
+    never survives). Any OTHER shape ({"url": raw}, [raw], ...) cannot be parsed as a URL, so
+    scheme/host are None and only a one-way digest of a stable serialization is kept -- the raw
+    value, wherever it is nested, never leaves the process. Total: always returns the canonical
+    {scheme, host, refusal_reason, sha256} object.
+    """
+    if isinstance(raw, str):
+        return _redact_quarantined_link(raw, reason)
+    return {
+        "scheme": None,
+        "host": None,
+        "refusal_reason": reason or _DEFAULT_QUARANTINE_REASON,
+        "sha256": hashlib.sha256(repr(raw).encode("utf-8", "ignore")).hexdigest(),
+    }
+
+
+def _redacted_metadata(metadata: dict) -> dict:
+    """`metadata` with any quarantined link replaced by its redacted marker UNLESS it is ALREADY the
+    canonical redacted object, so the raw URL never leaves the process (CARD-P2-01 S1, decision (2);
+    RV-197 F1(b) hardened it to fail CLOSED).
+
+    New rows are redacted AT REST (the backfill writes the {scheme,host,refusal_reason,sha256}
+    object; see the card), so this is a no-op for them -- the canonical object passes through and
+    `retrieved == stored`. FAIL-CLOSED: the earlier version redacted only a `str`, so a non-string
+    non-canonical marker ({"url": raw}, [raw], a near-miss dict) rode the wire UNCHANGED. Now
+    anything that is not EXACTLY the canonical object is redacted -- a legacy raw string AND any
+    unexpected shape are both replaced. When there is nothing under quarantine the SAME dict is
     returned (no churn), so the equality tests that assert metadata is untouched still hold.
     """
-    raw = metadata.get(QUARANTINED_LINK_KEY)
-    if not isinstance(raw, str):
-        # Absent, or already the redacted object at rest: nothing to strip.
+    if QUARANTINED_LINK_KEY not in metadata:
+        return metadata
+    value = metadata.get(QUARANTINED_LINK_KEY)
+    if _is_canonical_redacted_marker(value):
+        # Already the redacted object at rest: nothing to strip, no churn.
         return metadata
     shaped = dict(metadata)
-    shaped[QUARANTINED_LINK_KEY] = _redact_quarantined_link(
-        raw, metadata.get(QUARANTINED_REASON_KEY)
+    shaped[QUARANTINED_LINK_KEY] = _redact_any_quarantined_link(
+        value, metadata.get(QUARANTINED_REASON_KEY)
     )
     return shaped
 
@@ -2668,6 +2714,79 @@ def _host_is_governed(hostname: str, allow: tuple) -> bool:
     return False
 
 
+def _raw_authority(link: str) -> str:
+    """The authority substring of `link` AS WRITTEN, before urlparse can sanitize it (RV-197 F2).
+
+    Everything after the first `://` up to the first `/`, `?` or `#`. A backslash is DELIBERATELY
+    not treated as a terminator here -- Python's urlparse does not treat it as one either, which is
+    exactly the WHATWG differential -- so a `\\` inside the authority stays inside and is caught.
+    Reading the RAW string (not `urlparse().netloc`) also catches whitespace/control chars that
+    Python's urlsplit strips out of the URL before parsing.
+    """
+    marker = link.find("://")
+    if marker == -1:
+        return ""
+    rest = link[marker + 3:]
+    for i, ch in enumerate(rest):
+        if ch in "/?#":
+            return rest[:i]
+    return rest
+
+
+def _reject_malformed_authority(link: str, file_id: str) -> None:
+    """Refuse a link whose AUTHORITY a WHATWG parser reads differently than urlparse, or that
+    carries userinfo (RV-197 F2 SECURITY; parser parity with Core's `isGovernedUrl` / ADV-2 rule).
+
+    Core's exit guard `isGovernedUrl` parses with `new URL` (WHATWG), as do browsers. Python's
+    urlparse disagrees with WHATWG on `\\` (a path separator there, not here) and strips embedded
+    whitespace/control chars, so a link can resolve to a GOVERNED host under urlparse yet open on an
+    ATTACKER host in the browser -- e.g. `https://evil.com\\@contoso.sharepoint.com/x` is host
+    contoso.sharepoint.com to Python but evil.com to WHATWG. Userinfo (`user[:pass]@host`)
+    additionally carries a secret that would be STORED verbatim. Rather than reimplement WHATWG,
+    refuse any authority that is not unambiguous: a backslash, ASCII control char, whitespace,
+    `%`-encoded delimiter, or a userinfo `@`.
+
+    Only reached when the host allowlist is CONFIGURED (the caller returns early when it is unset),
+    so the conservative default adds ZERO new rejections. Typed 422, same envelope as the scheme/
+    host cases; the raw link is NEVER echoed -- only a fixed `kind` naming which element was bad.
+    """
+    authority = _raw_authority(link)
+    kind = None
+    for ch in authority:
+        o = ord(ch)
+        if ch == "\\":
+            kind = "backslash"
+        elif ch == "@":
+            kind = "userinfo"
+        elif ch == "%":
+            kind = "percent_encoded_delimiter"
+        elif ch.isspace() or o < 0x20 or o == 0x7F:
+            kind = "control_or_whitespace"
+        if kind:
+            break
+    if not kind:
+        return
+    logger.warning(
+        "[embed_file] refused a link whose authority is malformed [file_id=%s][kind=%s]",
+        file_id, kind,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={
+            "message": (
+                "The 'link' supplied for this file has an authority a browser would parse "
+                "differently (a backslash, control/whitespace, %-encoding, or embedded "
+                "credentials), so nothing was stored. Send the source document's plain https "
+                "URL, or omit 'link'."
+            ),
+            "link": {
+                "reason": "link_malformed_authority",
+                "kind": kind,
+            },
+        },
+    )
+
+
 def _reject_ungoverned_link(link: Optional[str], file_id: str) -> None:
     """Refuse a caller-supplied `link` that is not an https URL (F-EMBED-LINK-VALIDATE).
 
@@ -2738,6 +2857,11 @@ def _reject_ungoverned_link(link: Optional[str], file_id: str) -> None:
     allow = _GOVERNED_LINK_HOSTS
     if not allow:
         return
+    # AUTHORITY PARITY GUARD (RV-197 F2): BEFORE matching the host, refuse a link whose authority a
+    # WHATWG parser (browsers, Core's isGovernedUrl) would read differently than urlparse, or that
+    # carries userinfo -- so the host we match is the host that will actually open, and no secret is
+    # stored. Only reached here, once the allowlist is configured, so UNSET stays scheme-only.
+    _reject_malformed_authority(link, file_id)
     # `parsed.hostname` is lower-cased with userinfo (credentials) and port already dropped, so
     # the allowlist is matched on the host alone -- the same extraction `_redact_quarantined_link`
     # uses. A https URL with no host (rare, but urlparse can return None) is not governed.
