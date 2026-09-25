@@ -6,9 +6,10 @@ os.environ["TESTING"] = "1"
 # Set DB_HOST (and DSN) to dummy values to avoid real connection attempts.
 os.environ["DB_HOST"] = "localhost"  # or any dummy value
 os.environ["DSN"] = "dummy://"
-# EMBEDDINGS_PROVIDER has no default anymore (D-KSPT-2, fail-closed). Tests must
-# select one explicitly before app.config is imported; embeddings are mocked so
-# the concrete provider is irrelevant to the assertions.
+# EMBEDDINGS_PROVIDER has no default anymore (D-KSPT-2, fail-closed). It must be selected
+# before app.config is imported; embeddings are mocked so the concrete provider is irrelevant to
+# the assertions. setdefault (N5 N3): this DEFAULTS to openai only when the var is unset -- CI
+# supplies bedrock and that wins, so this line does not "set EMBEDDINGS_PROVIDER=openai" in CI.
 os.environ.setdefault("EMBEDDINGS_PROVIDER", "openai")
 # openai is not in the default approved set (bedrock). Approve it for the in-process
 # test session so app.config imports under the mocked openai provider; the
@@ -18,6 +19,19 @@ os.environ.setdefault("RAG_APPROVED_EMBEDDINGS_PROVIDERS", "openai,bedrock")
 # dummy so app.config imports under the openai provider; embeddings are mocked in
 # every test, so this key is never used to make a request.
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-not-used")
+
+# -- IMDS / PAID-CALL HAZARD at IMPORT time (N5, 2026-09-24) -------------------------------------
+# app.config defaults LLM_PROVIDER=bedrock, so importing app.config below builds a LIVE
+# ChatBedrockConverse whose boto3 bedrock-runtime client PROBES the EC2 metadata service
+# (169.254.169.254) for credentials/region at CONSTRUCTION -- a network attempt at IMPORT time,
+# before any test body runs (RV-150 N1 measurement). Disabling IMDS AND supplying explicit dummy
+# creds+region means botocore never consults the metadata service, so the import is hermetic
+# (proven with a socket spy in tests/test_llm_provider_is_blocked_in_tests.py). setdefault: CI
+# supplies its own creds/region and they win; this only fills the gap when they are unset.
+os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing-not-used")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing-not-used")
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
 from app.services.vector_store.async_pg_vector import AsyncPgVector
 
@@ -188,3 +202,76 @@ def _guard_every_live_embeddings_provider(monkeypatch):
 @pytest.fixture(autouse=True)
 def _block_the_real_embeddings_provider(monkeypatch):
     _guard_every_live_embeddings_provider(monkeypatch)
+
+
+# -- PAID-CALL HAZARD, the LLM twin of the rerank + embeddings guards above (N5, 2026-09-24) ------
+# MEASURED (RV-150 N1): app.config defaults LLM_PROVIDER=bedrock, so app.config.llm is a LIVE
+# ChatBedrockConverse whose `.client` is a boto3 bedrock-runtime client. Paid INFERENCE is reachable
+# two ways: the summarizer (SUM_UP_KNOWLEDGE_FILES, OFF by DEFAULT and checked at
+# document_routes.py) and a direct `llm.invoke`. A default is not a guard -- the RV-128/N1 standard
+# is "unable to reach", not "unreachable by default": one env var or one test that flips the gate is
+# all that stands between the suite and an inference call. So block the step that OPENS A SOCKET --
+# the client's converse / converse_stream / invoke_model -- NOT the high-level `llm` object a test
+# may legitimately stub.
+#
+# Placement mirrors the embeddings guard: replace the INNER boto3 client, so a test that stubs `llm`
+# (or app.services.summarization.summarize_files) never reaches it and is untouched; only the path
+# that would open a socket is closed. EVERY LIVE HOLDER, resolved at SETUP time -- app.config.llm
+# AND document_routes.llm, which bound `llm` with `from app.config import llm` at import, so after a
+# reload of app.config the routes' copy still points at the OLD object while app.config.llm is a NEW
+# one (the N1 test-6 reload lesson). raising=True on the `.client` attribute keeps a rename LOUD: if
+# ChatBedrockConverse ever renames `client`, setup ERRORS instead of leaving a real client reachable.
+# A holder that is None, or a foreign stub with no `.client` (e.g. ChatOllama, or a test's own stub),
+# has no boto3 socket to block and is skipped.
+_LLM_CLIENT_INVOKE_METHODS = ("converse", "converse_stream", "invoke_model")
+
+
+class _BlockedBedrockRuntimeClient:
+    """Stands in for a live boto3 bedrock-runtime client. EVERY attribute resolves to a raising
+    callable, so no invoke path (converse / converse_stream / invoke_model) can open a socket and
+    any incidental access surfaces the guard's own message rather than reaching the network."""
+
+    _MSG = (
+        "hermetic tests: the real Bedrock LLM client is blocked. Stub app.config.llm "
+        "(or app.services.summarization.summarize_files) if this test needs LLM output."
+    )
+
+    def __getattr__(self, _name):
+        def _blocked(*_args, **_kwargs):
+            raise RuntimeError(self._MSG)
+
+        return _blocked
+
+
+def _live_bedrock_llms():
+    """Every live LLM holder carrying a `.client` (the bedrock path), deduplicated by identity.
+
+    Identification is by the `.client` ATTRIBUTE, exactly as `_live_caching_embeddings` identifies
+    the CachingEmbeddings WRAPPER -- so a holder whose client this fixture has ALREADY replaced with
+    the blocked stub is still recognised as a live holder (a caller that enumerates holders AFTER the
+    autouse guard has run must still find them; re-blocking is idempotent and harmless). A holder
+    that is None, or a foreign stub with no `.client` (ChatOllama, or a test's own stub), has no
+    boto3 client to block and is skipped."""
+    candidates = [
+        getattr(_app_config, "llm", None),
+        getattr(_document_routes, "llm", None),
+    ]
+    seen, out = set(), []
+    for c in candidates:
+        if c is None or id(c) in seen:
+            continue
+        if not hasattr(c, "client"):
+            continue
+        seen.add(id(c))
+        out.append(c)
+    return out
+
+
+def _guard_every_live_llm_client(monkeypatch):
+    for holder in _live_bedrock_llms():
+        monkeypatch.setattr(holder, "client", _BlockedBedrockRuntimeClient(), raising=True)
+
+
+@pytest.fixture(autouse=True)
+def _block_the_real_llm_provider(monkeypatch):
+    _guard_every_live_llm_client(monkeypatch)
