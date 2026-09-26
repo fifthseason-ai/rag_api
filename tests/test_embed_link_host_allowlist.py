@@ -638,3 +638,84 @@ def test_legitimate_links_still_pass_after_the_hardening(monkeypatch, good_link)
     _set_allowlist(monkeypatch, F2_ALLOW)
     r = _embed(link=good_link)
     assert r.status_code == 200, r.text
+
+
+# ===========================================================================
+# RV-197D N10: authority shapes Python STORES but WHATWG cannot parse.
+#
+# Python's urlparse admits, and rag_api would STORE, shapes a WHATWG parser (browser, Core's
+# `new URL`) rejects, and `parsed.hostname` drops the port so the host still matches the allowlist:
+#   * an out-of-range / non-numeric port -- `parsed.port` raises ValueError only on ACCESS, so
+#     nothing looked at it and the link was admitted (and `.port` elsewhere would be an untyped 500)
+#   * `<` `^` `|` (and other non-host chars) inside the hostname -- ASCII, so the existing per-char
+#     scan (backslash/@/%/non-ASCII/whitespace) does not catch them; `con<toso.sharepoint.com`
+#     matches the .sharepoint.com suffix and is ADMITTED
+#   * an IPvFuture literal `[v1...]` -- `[v1.contoso.sharepoint.com]` -> host
+#     v1.contoso.sharepoint.com, which ends in .sharepoint.com and is ADMITTED
+# FIX (in _reject_malformed_authority, after the control-char / raw==netloc / userinfo checks):
+# access parsed.port in a try (bad port -> typed 422, never a 500) and require the host to be a
+# valid IP (bracketed authority) or match a strict host-character allow-list. Typed
+# link_malformed_authority, same envelope. UNSET stays scheme-only (the guard is not reached).
+# ===========================================================================
+
+@pytest.mark.parametrize("bad_link,label", [
+    ("https://contoso.sharepoint.com:99999/x", "port_out_of_range"),
+    ("https://contoso.sharepoint.com:70000/x", "port_over_max"),
+    ("https://contoso.sharepoint.com:abc/x", "port_non_numeric"),
+])
+def test_a_bad_port_is_refused_as_malformed_and_not_stored(monkeypatch, bad_link, label):
+    """N10(a). `parsed.hostname` drops the port, so a host with an out-of-range / non-numeric port
+    MATCHES the allowlist and is ADMITTED at b7b2784 (the loader runs -> the _no_work_spy trips).
+    `parsed.port` raises ValueError; the guard now accesses it in a try and refuses a typed 422 with
+    nothing stored -- never the untyped 500 an unguarded `.port` would give."""
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    calls = _no_work_spy(monkeypatch)
+    r = _embed(link=bad_link)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["link"]["reason"] == MALFORMED, r.text
+    assert calls == [], "a bad-port link did work before refusing (would have been stored): %r" % calls
+
+
+@pytest.mark.parametrize("bad_link,label", [
+    ("https://con<toso.sharepoint.com/x", "lt_in_host"),
+    ("https://con^toso.sharepoint.com/x", "caret_in_host"),
+    ("https://con|toso.sharepoint.com/x", "pipe_in_host"),
+    ("https://[v1.contoso.sharepoint.com]/x", "ipvfuture_matches_suffix"),
+    ("https://[v1.fe80::1]/x", "ipvfuture_ipish"),
+])
+def test_a_non_host_char_or_ipvfuture_authority_is_refused_as_malformed(monkeypatch, bad_link, label):
+    """N10(b). `<` `^` `|` in the host and an IPvFuture `[v1...]` literal are shapes Python stores
+    and WHATWG rejects. The `<^|` cases and `[v1.contoso.sharepoint.com]` MATCH the .sharepoint.com
+    suffix and are ADMITTED (200) at b7b2784; `[v1.fe80::1]` is refused there but as
+    link_host_not_allowed. All must be refused as link_malformed_authority."""
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    r = _embed(link=bad_link)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["link"]["reason"] == MALFORMED, r.text
+
+
+@pytest.mark.parametrize("good_link", [
+    "https://contoso.sharepoint.com:8443/sites/x/Deck.pptx",   # a bare in-range port is fine
+    "https://contoso.sharepoint.com:65535/x",                  # the max valid port
+    "https://a.contoso.sharepoint.com/docs/Report.pdf",        # a plain host
+])
+def test_n10_does_not_regress_legitimate_hosts_and_ports(monkeypatch, good_link):
+    """NON-VACUITY / no-regression: the port and host-character checks must not refuse a clean
+    allowed link with an in-range port or a plain hostname (green at b7b2784 AND after the fix)."""
+    _set_allowlist(monkeypatch, F2_ALLOW)
+    r = _embed(link=good_link)
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize("link", [
+    "https://contoso.sharepoint.com:99999/x",
+    "https://con<toso.sharepoint.com/x",
+    "https://[v1.fe80::1]/x",
+])
+def test_n10_shapes_are_not_refused_when_the_allowlist_is_unset(monkeypatch, link):
+    """The conservative default holds for N10 too: UNSET/empty allowlist disables the whole authority
+    guard, so these shapes ingest exactly as before (200), adding zero new rejections. Kills a
+    'always enforce the port/host-char check' mutation, which would red this."""
+    monkeypatch.setattr(dr, "_GOVERNED_LINK_HOSTS", (), raising=False)
+    r = _embed(link=link)
+    assert r.status_code == 200, r.text
