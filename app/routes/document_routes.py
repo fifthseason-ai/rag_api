@@ -2,6 +2,7 @@
 import os
 import re
 import errno
+import ipaddress
 import uuid
 from pathlib import Path
 import hashlib
@@ -1407,13 +1408,24 @@ def _redact_quarantined_link(raw: str, reason: Optional[str] = None) -> dict:
 #: rest; every other `quarantined_link` value is redacted (fail-CLOSED).
 _REDACTED_MARKER_KEYS = frozenset({"scheme", "host", "refusal_reason", "sha256"})
 
-#: VALUE-shape validators for the canonical marker (RV-197 re-review N1/N7). A dict can carry the
-#: canonical KEYS while its VALUES hold the raw URL; checking the key set alone let that ride the
-#: wire. Every field must match its shape or the whole object is treated as un-redacted and stripped.
-_MARKER_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*$")       # a URL scheme, lower-cased
-_MARKER_HOST_RE = re.compile(r"^[a-z0-9._:\-]+$")             # ASCII host chars (`:` for IPv6); no /@?#
-_MARKER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")             # a hex digest, exactly 64 chars
-_MARKER_REASON_RE = re.compile(r"^[a-z][a-z0-9_.\-]{0,63}$")  # a reason TOKEN, never a raw URL
+#: VALUE-shape validators for the canonical marker (RV-197 re-review N1/N7; RV-197D N11 tightened
+#: each field -- SHAPE alone is not enough). A dict can carry the canonical KEYS while its VALUES
+#: hold content; checking the key set (or a loose shape) alone let that ride the wire. Every field
+#: must match its shape or the whole object is treated as un-redacted and stripped (fail-CLOSED).
+#: `\Z` (not `$`) anchors the END of the string: Python's `$` also matches just before a trailing
+#: '\n', so `$` let "h.example\n" / "<64 hex>\n" / "http\n" pass as canonical -- `\Z` closes that.
+_MARKER_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*\Z")   # a URL scheme, lower-cased
+_MARKER_HOST_RE = re.compile(r"^[a-z0-9.\-]+\Z")           # a strict hostname: letters/digits/hyphen/dot -- no ':' (userinfo/IPv6), no whitespace/newline
+_MARKER_SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")         # a hex digest, exactly 64 chars
+#: N11: the refusal_reason of a canonical marker is EXACTLY one of the typed refusal reasons this
+#: module emits (exact case) -- never a free TOKEN and never a raw value. A lowercase-but-unknown
+#: token (the old regex accepted any token) fails, and the marker is redacted. `_DEFAULT_QUARANTINE_REASON`
+#: is one of these, so a freshly-redacted marker is itself canonical.
+_KNOWN_REFUSAL_REASONS = frozenset({
+    "link_scheme_not_allowed",
+    "link_host_not_allowed",
+    "link_malformed_authority",
+})
 
 
 def _is_canonical_redacted_marker(value) -> bool:
@@ -1432,7 +1444,7 @@ def _is_canonical_redacted_marker(value) -> bool:
         return False
     if not (isinstance(sha256, str) and _MARKER_SHA256_RE.match(sha256)):
         return False
-    if not (isinstance(reason, str) and _MARKER_REASON_RE.match(reason)):
+    if reason not in _KNOWN_REFUSAL_REASONS:  # N11: exact typed reason, never a free token/raw value
         return False
     return True
 
@@ -2688,6 +2700,12 @@ def _extraction_receipt(data: Iterable[Document]) -> dict:
 #: Schemes a caller-supplied `link` may use. HTTPS only, deliberately.
 _ALLOWED_LINK_SCHEMES = ("https",)
 
+#: A strict authority host allow-list (RV-197D N10): letters, digits, hyphen, dot. `parsed.hostname`
+#: is already lower-cased with userinfo and port dropped, so a WHATWG-valid unbracketed host matches
+#: this, while the parser-differential chars `<` `^` `|` (Python stores them in the host, WHATWG
+#: rejects them) do not. `\Z` anchors the end so a trailing newline cannot slip through.
+_HOST_CHAR_RE = re.compile(r"^[a-z0-9.\-]+\Z")
+
 
 def _governed_link_hosts() -> tuple:
     """Operator-configured governed-HOST allowlist for citation links (CARD-P2-01 S4, G1-A).
@@ -2830,6 +2848,30 @@ def _reject_malformed_authority(link: str, parsed, file_id: str) -> None:
     for label in hostname.split("."):
         if label.startswith("xn--"):
             _raise_malformed_authority(file_id, "idna_punycode")
+    # (e) PORT (RV-197D N10). Python STORES an out-of-range or non-numeric port that WHATWG rejects:
+    #     `parsed.hostname` drops the port, so the host still matches the allowlist and the link is
+    #     admitted. The `.port` PROPERTY validates it (0-65535, numeric) and raises ValueError only on
+    #     ACCESS -- so nothing looked at it. Access it inside a try: a bad port is this same typed 422,
+    #     never the untyped 500 an unguarded `.port` would produce.
+    try:
+        parsed.port
+    except ValueError:
+        _raise_malformed_authority(file_id, "bad_port")
+    # (f) HOST CHARACTERS (RV-197D N10). A WHATWG authority host is either a plain ASCII hostname or a
+    #     bracketed IP literal. Python admits `<` `^` `|` (and other non-host chars) in a hostname, and
+    #     an IPvFuture literal `[v1...]` WHATWG rejects; both STORE and, on a suffix allowlist, even
+    #     MATCH (`[v1.contoso.sharepoint.com]` -> host v1.contoso.sharepoint.com, ends in
+    #     .sharepoint.com). Require a bracketed authority to be a VALID IP address (rejecting IPvFuture
+    #     and any non-IP), and an unbracketed host to match the strict host-character allow-list.
+    if hostname:
+        netloc = parsed.netloc or ""
+        if "[" in netloc or "]" in netloc:
+            try:
+                ipaddress.ip_address(hostname)
+            except ValueError:
+                _raise_malformed_authority(file_id, "bad_host_char")
+        elif not _HOST_CHAR_RE.match(hostname):
+            _raise_malformed_authority(file_id, "bad_host_char")
 
 
 def _reject_ungoverned_link(link: Optional[str], file_id: str) -> None:

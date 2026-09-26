@@ -287,3 +287,58 @@ def test_is_canonical_marker_validates_value_shapes():
     assert dr._is_canonical_redacted_marker({**good, "raw": RAW_URL}) is False   # extra key
     assert dr._is_canonical_redacted_marker({**good, "sha256": "0" * 63}) is False
     assert dr._is_canonical_redacted_marker({**good, "sha256": "A" * 64}) is False
+
+
+# ---------------------------------------------------------------------------
+# RV-197D N11: the canonical-VALUE checks must be TIGHT (shape alone is not enough).
+# ---------------------------------------------------------------------------
+
+#: A genuine canonical marker (host from urlparse.hostname; reason a typed refusal string).
+GOOD_MARKER = {"scheme": "http", "host": "raw-bucket.example",
+               "refusal_reason": "link_scheme_not_allowed", "sha256": "0" * 64}
+
+
+@pytest.mark.parametrize("bad_marker,label", [
+    ({**GOOD_MARKER, "host": "user:secret"}, "host_userinfo_colon"),
+    ({**GOOD_MARKER, "refusal_reason": "link_scheme_not_allowe"}, "lowercase_unknown_reason"),
+    ({**GOOD_MARKER, "refusal_reason": "made_up_reason"}, "lowercase_arbitrary_reason"),
+    ({**GOOD_MARKER, "host": "raw-bucket.example\n"}, "host_trailing_newline"),
+    ({**GOOD_MARKER, "scheme": "http\n"}, "scheme_trailing_newline"),
+    ({**GOOD_MARKER, "sha256": "0" * 64 + "\n"}, "sha256_trailing_newline"),
+])
+def test_is_canonical_marker_rejects_tightened_value_shapes(bad_marker, label):
+    """RED-FIRST at b7b2784. The loose value checks accepted a marker whose VALUES carry content: a
+    `:` (userinfo) host, a lowercase-but-unknown reason TOKEN (the old regex allowed any token), and
+    a trailing newline in host/scheme/sha256 (the old `$` anchor matches before a final '\\n'). Each
+    must now be non-canonical, so `_redacted_metadata` fails closed and strips it."""
+    from app.routes import document_routes as dr
+    assert dr._is_canonical_redacted_marker(bad_marker) is False, label
+
+
+def test_is_canonical_marker_still_accepts_the_genuine_object_and_every_typed_reason():
+    """No-regression: the genuine canonical object, with scheme/host None, and with each of the
+    known typed refusal reasons (exact case), still passes untouched (retrieved == stored)."""
+    from app.routes import document_routes as dr
+    assert dr._is_canonical_redacted_marker(dict(GOOD_MARKER)) is True
+    assert dr._is_canonical_redacted_marker({**GOOD_MARKER, "scheme": None, "host": None}) is True
+    for reason in ("link_scheme_not_allowed", "link_host_not_allowed", "link_malformed_authority"):
+        assert dr._is_canonical_redacted_marker({**GOOD_MARKER, "refusal_reason": reason}) is True, reason
+
+
+def test_redacted_metadata_fails_closed_on_tightened_value_shapes(monkeypatch):
+    """RED-FIRST at b7b2784. `_redacted_metadata` must REPLACE a marker that fails the tightened value
+    checks (the raw could hide in a value), and must pass the genuine canonical object as the SAME
+    object (no churn -> the equality tests hold)."""
+    from app.routes import document_routes as dr
+
+    for bad in ({**GOOD_MARKER, "host": "user:secret"},
+                {**GOOD_MARKER, "refusal_reason": "made_up_reason"},
+                {**GOOD_MARKER, "host": "raw-bucket.example\n"},
+                {**GOOD_MARKER, "sha256": "0" * 64 + "\n"}):
+        out = dr._redacted_metadata({"quarantined_link": dict(bad)})
+        ql = out["quarantined_link"]
+        assert isinstance(ql, dict) and set(ql) == CANONICAL_KEYS, (bad, ql)
+        assert ql != bad, "a value-carrying marker must be REBUILT, not passed through: %r" % (bad,)
+
+    md = {"quarantined_link": dict(GOOD_MARKER), "file_id": "f"}
+    assert dr._redacted_metadata(md) is md, "the genuine canonical object must pass untouched"
