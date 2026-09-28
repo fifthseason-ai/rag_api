@@ -2,6 +2,7 @@
 import json
 from fastapi import APIRouter, HTTPException, Request
 from app.services.database import PSQLDatabase
+from app.routes.document_routes import _redacted_metadata
 
 router = APIRouter()
 
@@ -37,6 +38,43 @@ def filter_rows_by_entitlement(rows: list, ent: dict) -> list:
         if tid is not None and str(tid) != ent["tenant_id"]:
             continue
         out.append(row)
+    return out
+
+
+def _redact_row_cmetadata(rows: list) -> list:
+    """Apply the #116 fail-closed redactor (`document_routes._redacted_metadata`) to each row's
+    `cmetadata` (RV-197D item 5). These debug dumps do a raw ``SELECT *`` including `cmetadata`; a
+    legacy row whose `quarantined_link` is still a raw string (or any non-canonical shape) would
+    otherwise leak the raw URL/credentials/path/token here exactly as GET /documents did before F1.
+
+    The redactor is REUSED, never re-implemented. `cmetadata` arrives as a dict or a JSON string
+    (asyncpg JSONB), matching `filter_rows_by_entitlement`. A clean or already-canonical row is
+    returned UNCHANGED (the redactor returns the same object, so no churn and the container type is
+    preserved -- ``retrieved == stored``); only a row that actually carried a raw marker is rewritten,
+    with the redacted `cmetadata` re-serialized to a string iff it arrived as one. A `cmetadata` that
+    is neither a dict nor a parseable JSON object has no structured marker to strip and is left as-is.
+    """
+    out = []
+    for row in rows:
+        meta = row.get("cmetadata")
+        was_str = isinstance(meta, str)
+        parsed = meta
+        if was_str:
+            try:
+                parsed = json.loads(meta)
+            except (ValueError, TypeError):
+                out.append(row)
+                continue
+        if not isinstance(parsed, dict):
+            out.append(row)
+            continue
+        redacted = _redacted_metadata(parsed)
+        if redacted is parsed:
+            out.append(row)  # nothing under quarantine / already canonical -> untouched, no churn
+            continue
+        new_row = dict(row)
+        new_row["cmetadata"] = json.dumps(redacted) if was_str else redacted
+        out.append(new_row)
     return out
 
 
@@ -115,8 +153,10 @@ async def get_all_records(request: Request, table_name: str):
     # Convert records to JSON serializable format, assuming records can be directly serialized
     records_json = [dict(record) for record in records]
 
-    # Never disclose vectors across entities/tenants (D-KSPT-1).
-    return filter_rows_by_entitlement(records_json, ent)
+    # Never disclose vectors across entities/tenants (D-KSPT-1); never leak a raw quarantined
+    # link (RV-197D item 5) -- redact AFTER the entitlement filter so a dropped row is never
+    # merely redacted.
+    return _redact_row_cmetadata(filter_rows_by_entitlement(records_json, ent))
 
 
 @router.get("/records")
@@ -135,5 +175,7 @@ async def get_records_filtered_by_custom_id(request: Request, custom_id: str, ta
     # Convert records to JSON serializable format, assuming the Record class has a dict method.
     records_json = [dict(record) for record in records]
 
-    # Never disclose vectors across entities/tenants (D-KSPT-1).
-    return filter_rows_by_entitlement(records_json, ent)
+    # Never disclose vectors across entities/tenants (D-KSPT-1); never leak a raw quarantined
+    # link (RV-197D item 5) -- redact AFTER the entitlement filter so a dropped row is never
+    # merely redacted.
+    return _redact_row_cmetadata(filter_rows_by_entitlement(records_json, ent))
