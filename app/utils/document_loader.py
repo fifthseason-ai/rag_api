@@ -2245,6 +2245,19 @@ class SheetExcelLoader:
         yield from self.load()
 
 
+#: Deterministic per-series bound on the number of data points emitted into a chart's
+#: extracted text (KNOWLEDGE-COMPLETION slice 6, G7). A large chart is TRUNCATED, never
+#: silently dropped: the first `_CHART_MAX_POINTS` points are emitted and an explicit,
+#: honest "... N more points" marker names how many were left out. The bound keeps a
+#: pathological chart from bloating a slide chunk while staying truthful about the loss.
+_CHART_MAX_POINTS = 50
+
+#: The DrawingML chart namespace, for reading numeric point caches (xVal/yVal/bubbleSize)
+#: that python-pptx does not surface through a stable public reader (XY and bubble charts
+#: have no categories, so their x values are only reachable through the element XML).
+_CHART_NS = "{http://schemas.openxmlformats.org/drawingml/2006/chart}"
+
+
 class SlidePowerPointLoader:
     """
     Load a .pptx deck as one Document per slide, preserving slide context.
@@ -2282,29 +2295,153 @@ class SlidePowerPointLoader:
         return "\n".join(rows)
 
     @staticmethod
-    def _chart_text(chart) -> str:
-        """Best-effort chart labels: title, category labels and series names.
+    def _fmt_num(v) -> str:
+        """Deterministically format a chart number for text extraction.
 
-        Evidence can sit in a chart label (KI-02 WP-C goal). Chart XML is
-        variable, so every access is guarded — a chart we cannot read must be
-        skipped, never crash the whole deck.
+        Integer-valued floats lose the trailing `.0` ("3.0" -> "3"); other values
+        use Python's shortest round-trip repr, which is identical on py3.10 and
+        py3.12 (the two shipped runtimes), so extracted text is byte-stable across
+        them. A value that is missing in the file is `None` and is rendered as the
+        literal "null" rather than silently dropped. A value that cannot be parsed
+        as a number is passed through as its string.
+        """
+        if v is None:
+            return "null"
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return str(v).strip()
+        if f == int(f) and abs(f) < 1e16:
+            return str(int(f))
+        return repr(f)
+
+    @classmethod
+    def _xy_point_values(cls, series):
+        """x/y (and bubble-size) point values for an XY/scatter or bubble series.
+
+        XY and bubble charts have NO categories, so their x values are not reachable
+        through python-pptx's category/value readers; without this the x axis of
+        every scatter would be lost silently. The numeric caches live in the series
+        element XML (`c:xVal` / `c:yVal` / `c:bubbleSize`). Returns:
+          * None  -> this is NOT an xy/bubble series (no `c:xVal`); the caller uses
+                     the category-paired value path instead;
+          * a list of (x, y) or (x, y, size) string tuples, index-ordered.
+        Every access is guarded; a series whose element cannot be read returns None.
+        """
+        try:
+            el = series._element
+        except Exception:  # noqa: BLE001 - chart XML is untrusted/variable
+            return None
+
+        def _read(tag):
+            node = el.find(_CHART_NS + tag)
+            if node is None:
+                return None
+            vals = {}
+            pts = node.findall(
+                _CHART_NS + "numRef/" + _CHART_NS + "numCache/" + _CHART_NS + "pt"
+            ) or node.findall(".//" + _CHART_NS + "pt")
+            for pt in pts:
+                idx = pt.get("idx")
+                v = pt.find(_CHART_NS + "v")
+                if idx is None or v is None or v.text is None:
+                    continue
+                try:
+                    vals[int(idx)] = v.text
+                except (TypeError, ValueError):
+                    continue
+            return vals
+
+        try:
+            xs = _read("xVal")
+        except Exception:  # noqa: BLE001
+            return None
+        if xs is None:
+            return None  # a category chart: let the caller pair values with categories
+        ys = _read("yVal") or {}
+        sizes = _read("bubbleSize")
+        out = []
+        for i in sorted(xs):
+            if sizes is not None:
+                out.append((xs.get(i), ys.get(i), sizes.get(i)))
+            else:
+                out.append((xs.get(i), ys.get(i)))
+        return out
+
+    @staticmethod
+    def _custom_data_labels(series) -> List[str]:
+        """Custom per-point data-label TEXT for a series (the author typed a label
+        onto a point). Each access is guarded; one bad point never aborts the series.
+        """
+        out: List[str] = []
+        try:
+            points = list(series.points)
+        except Exception:  # noqa: BLE001 - chart XML is untrusted/variable
+            return out
+        for pt in points:
+            try:
+                dl = pt.data_label
+                if dl.has_text_frame:
+                    text = dl.text_frame.text.strip()
+                    if text:
+                        out.append(text)
+            except Exception:  # noqa: BLE001 - never let one point abort the series
+                continue
+        return out
+
+    @classmethod
+    def _chart_text(cls, chart) -> str:
+        """Best-effort chart labels, extracted as completely as python-pptx allows
+        (KI-02 WP-C goal; KNOWLEDGE-COMPLETION slice 6 FIDELITY, G7).
+
+        Evidence sits in chart labels AND in the numbers a chart plots. Chart XML
+        is variable, so every access is guarded — a chart we cannot read must be
+        skipped, never crash the whole deck. The parts are emitted in this order,
+        and the FIRST THREE are byte-stable with the pre-slice-6 output so existing
+        locator/receipt tests stay green (new parts only APPEND after them):
+          1. chart title                              (existing)
+          2. category labels, per plot                (existing)
+          3. series names                             (existing)
+          4. (a) category + value AXIS TITLES
+          5. (b)/(d) per-series numeric VALUES — paired with the category where a
+             chart has categories ("<series>: <cat> <value>; ..."), or x/y(/size)
+             pairs for XY/bubble charts which have none; bounded by
+             `_CHART_MAX_POINTS` with an honest "... N more points" marker
+          6. (c) per-series custom DATA LABEL text
+
+        (e) HONEST UNREADABLE CHART: if a chart yields NO text because its accesses
+        raised, a named warning is logged rather than returning "" silently (the
+        receipt-contract limitation that prevents a per-chart `partial` signal is
+        recorded in the slice-6 PR body). The deck always keeps extracting.
         """
         parts: List[str] = []
+        read_error = False
+
+        # 1. chart title (EXISTING — byte-stable)
         try:
             if chart.has_title and chart.chart_title.text_frame.text.strip():
                 parts.append(chart.chart_title.text_frame.text.strip())
         except Exception:  # noqa: BLE001 - chart metadata is untrusted/variable
-            pass
+            read_error = True
+
+        # 2. category labels, per plot (EXISTING — byte-stable). The first plot's raw
+        #    categories are captured (index-aligned, empties kept) to pair with values.
+        pair_cats: List[str] = []
         try:
             for plot in chart.plots:
                 try:
-                    cats = [str(c).strip() for c in plot.categories if str(c).strip()]
+                    raw = [("" if c is None else str(c).strip()) for c in plot.categories]
+                    cats = [c for c in raw if c]
                     if cats:
                         parts.append(" ".join(cats))
+                    if not pair_cats and raw:
+                        pair_cats = raw
                 except Exception:  # noqa: BLE001
-                    pass
+                    read_error = True
         except Exception:  # noqa: BLE001
-            pass
+            read_error = True
+
+        # 3. series names (EXISTING — byte-stable)
         try:
             for series in chart.series:
                 try:
@@ -2312,9 +2449,92 @@ class SlidePowerPointLoader:
                     if name:
                         parts.append(name)
                 except Exception:  # noqa: BLE001
-                    pass
+                    read_error = True
         except Exception:  # noqa: BLE001
-            pass
+            read_error = True
+
+        # 4. (a) axis titles — category then value. Guarded: pie/XY may raise or have none.
+        for ax_attr in ("category_axis", "value_axis"):
+            try:
+                ax = getattr(chart, ax_attr)
+                if ax.has_title:
+                    title = ax.axis_title.text_frame.text.strip()
+                    if title:
+                        parts.append(title)
+            except Exception:  # noqa: BLE001 - some chart types have no such axis
+                read_error = True
+
+        # 5 + 6. per-series numeric values and custom data labels
+        try:
+            series_list = list(chart.series)
+        except Exception:  # noqa: BLE001
+            series_list = []
+            read_error = True
+        for series in series_list:
+            try:
+                name = (series.name or "").strip()
+            except Exception:  # noqa: BLE001
+                name = ""
+                read_error = True
+
+            # 5. (b)/(d) values
+            try:
+                xy = cls._xy_point_values(series)
+            except Exception:  # noqa: BLE001
+                xy = None
+                read_error = True
+            value_part = None
+            if xy:
+                pairs = []
+                for tup in xy[:_CHART_MAX_POINTS]:
+                    if len(tup) == 3:
+                        pairs.append(
+                            "(%s, %s, r=%s)"
+                            % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1]), cls._fmt_num(tup[2]))
+                        )
+                    else:
+                        pairs.append("(%s, %s)" % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1])))
+                if len(xy) > _CHART_MAX_POINTS:
+                    pairs.append("... %d more points" % (len(xy) - _CHART_MAX_POINTS))
+                if pairs:
+                    value_part = ("%s: " % name if name else "") + "; ".join(pairs)
+            elif xy is None:
+                try:
+                    values = list(series.values)
+                except Exception:  # noqa: BLE001
+                    values = []
+                    read_error = True
+                real = [v for v in values if v is not None]
+                if real:
+                    pairs = []
+                    for i, v in enumerate(values[:_CHART_MAX_POINTS]):
+                        cat = pair_cats[i] if i < len(pair_cats) else ""
+                        pairs.append(("%s %s" % (cat, cls._fmt_num(v))) if cat else cls._fmt_num(v))
+                    if len(values) > _CHART_MAX_POINTS:
+                        pairs.append("... %d more points" % (len(values) - _CHART_MAX_POINTS))
+                    value_part = ("%s: " % name if name else "") + "; ".join(pairs)
+            if value_part:
+                parts.append(value_part)
+
+            # 6. (c) custom data labels
+            labels = cls._custom_data_labels(series)
+            if labels:
+                bounded = labels[:_CHART_MAX_POINTS]
+                if len(labels) > _CHART_MAX_POINTS:
+                    bounded = bounded + ["... %d more points" % (len(labels) - _CHART_MAX_POINTS)]
+                prefix = ("%s data labels: " % name) if name else "data labels: "
+                parts.append(prefix + "; ".join(bounded))
+
+        if read_error and not parts:
+            # (e) A chart that was present but unreadable must leave a trace instead of
+            # vanishing silently. The receipt contract (extraction.degraded) cannot
+            # honestly describe a single sub-slide chart failure — its shape asserts
+            # lost='unit_locators'/scope='document'/units_affected=units_total, none of
+            # which is true when one chart on an otherwise-fine slide fails — so the
+            # per-chart signal stays a logged warning + a named PR follow-up.
+            logger.warning(
+                "Skipped a PPTX chart that was present but unreadable (yielded no text)"
+            )
         return "\n".join(parts)
 
     @classmethod
