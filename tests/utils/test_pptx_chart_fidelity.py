@@ -300,3 +300,75 @@ def test_existing_title_categories_series_name_still_lead(tmp_path):
     i_name = content.index("Series ONE")
     i_quarter = content.index("Quarter")
     assert i_name < i_quarter, content
+
+
+# ---------------------------------------------------------------------------
+# Robustness: a blank or NON-FINITE data value must never cost the chart its
+# byte-stable parts (title / categories / series names). (Fix-forward on review.)
+# ---------------------------------------------------------------------------
+
+_CHART_C = "{http://schemas.openxmlformats.org/drawingml/2006/chart}"
+
+
+def make_none_value_chart(path):
+    """A COLUMN chart whose middle data point is BLANK (None): proves the None
+    value renders as the honest literal "null" and the chart still extracts."""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "SYN-KNOWLEDGE-01 Blank Deck"
+    cd = CategoryChartData()
+    cd.categories = ["Jan", "Feb", "Mar"]
+    cd.add_series("Metric", (1.0, None, 3.0))
+    slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(1), Inches(4), Inches(3), cd
+    )
+    return _save(prs, path)
+
+
+def make_nonfinite_value_chart(path, bad_text):
+    """A COLUMN chart whose last cached value is corrupted to a NON-FINITE literal
+    (NaN / inf). Injected into the numCache XML because python-pptx will not author
+    a non-finite value, but a hand-edited or corrupt deck can carry one."""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "SYN-KNOWLEDGE-01 NonFinite Deck"
+    cd = CategoryChartData()
+    cd.categories = ["Jan", "Feb"]
+    cd.add_series("Metric", (1.0, 2.0))
+    gf = slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(1), Inches(4), Inches(3), cd
+    )
+    vs = gf.chart.series[0]._element.findall(
+        ".//" + _CHART_C + "val//" + _CHART_C + "numCache//" + _CHART_C + "pt/" + _CHART_C + "v"
+    )
+    assert vs, "no numeric value cache to corrupt"
+    vs[-1].text = bad_text
+    return _save(prs, path)
+
+
+def test_blank_data_point_renders_null_and_chart_survives(tmp_path):
+    """Coverage of the None value path: a blank data point is the honest literal
+    "null" (never silently dropped) and the chart's other parts are intact."""
+    content = _chart_content(make_none_value_chart(tmp_path / "blank.pptx"))
+    assert "Metric" in content and "Jan" in content and "Mar" in content, content
+    assert "Feb null" in content, content  # blank middle point, paired with its category
+    assert "Jan 1" in content and "Mar 3" in content, content
+
+
+@pytest.mark.parametrize(
+    "bad_text,expected",
+    [("NaN", "NaN"), ("1e400", "inf"), ("-1e400", "-inf")],
+)
+def test_nonfinite_value_never_loses_the_whole_chart(tmp_path, bad_text, expected):
+    """REGRESSION: a non-finite cached value must NOT cost the chart its title /
+    categories / series names. On the pre-fix loader `_fmt_num` raised (int(nan)
+    -> ValueError, int(inf) -> OverflowError), the exception propagated out of
+    `_chart_text`, and `_collect_shape_texts` dropped the ENTIRE chart. After the
+    fix the value renders as a deterministic literal and every other part survives."""
+    path = make_nonfinite_value_chart(tmp_path / ("nf_%s.pptx" % expected), bad_text)
+    content = _chart_content(path)
+    # the byte-stable parts must survive the bad value (red on 4dc84bc)
+    assert "Metric" in content, content
+    assert "Jan" in content and "Feb" in content, content
+    # and the non-finite value is rendered deterministically, not crashed on
+    assert expected in content, content

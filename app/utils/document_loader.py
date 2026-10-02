@@ -3,6 +3,7 @@
 import os
 import codecs
 import csv
+import math
 import re
 import tempfile
 import zipfile
@@ -2304,13 +2305,24 @@ class SlidePowerPointLoader:
         them. A value that is missing in the file is `None` and is rendered as the
         literal "null" rather than silently dropped. A value that cannot be parsed
         as a number is passed through as its string.
+
+        NON-FINITE values (NaN / +-inf, which a corrupt or hand-authored numCache can
+        carry) are rendered as deterministic literals BEFORE any `int()` conversion:
+        `int(float('nan'))` raises ValueError and `int(float('inf'))` raises
+        OverflowError, so without this guard one bad cached value would propagate out
+        of `_chart_text` and cost the whole chart its text. This is total over any
+        float input.
         """
         if v is None:
             return "null"
         try:
             f = float(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return str(v).strip()
+        if not math.isfinite(f):
+            if math.isnan(f):
+                return "NaN"
+            return "inf" if f > 0 else "-inf"
         if f == int(f) and abs(f) < 1e16:
             return str(int(f))
         return repr(f)
@@ -2477,53 +2489,55 @@ class SlidePowerPointLoader:
                 name = ""
                 read_error = True
 
-            # 5. (b)/(d) values
+            # 5. (b)/(d) values. The WHOLE value-part build is guarded so one bad data
+            # point (e.g. a non-finite cached value) drops ONLY this series' value part
+            # and never propagates out of _chart_text to cost the chart its title /
+            # categories / series names (the byte-stable parts already appended above).
+            value_part = None
             try:
                 xy = cls._xy_point_values(series)
-            except Exception:  # noqa: BLE001
-                xy = None
-                read_error = True
-            value_part = None
-            if xy:
-                pairs = []
-                for tup in xy[:_CHART_MAX_POINTS]:
-                    if len(tup) == 3:
-                        pairs.append(
-                            "(%s, %s, r=%s)"
-                            % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1]), cls._fmt_num(tup[2]))
-                        )
-                    else:
-                        pairs.append("(%s, %s)" % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1])))
-                if len(xy) > _CHART_MAX_POINTS:
-                    pairs.append("... %d more points" % (len(xy) - _CHART_MAX_POINTS))
-                if pairs:
-                    value_part = ("%s: " % name if name else "") + "; ".join(pairs)
-            elif xy is None:
-                try:
-                    values = list(series.values)
-                except Exception:  # noqa: BLE001
-                    values = []
-                    read_error = True
-                real = [v for v in values if v is not None]
-                if real:
+                if xy:
                     pairs = []
-                    for i, v in enumerate(values[:_CHART_MAX_POINTS]):
-                        cat = pair_cats[i] if i < len(pair_cats) else ""
-                        pairs.append(("%s %s" % (cat, cls._fmt_num(v))) if cat else cls._fmt_num(v))
-                    if len(values) > _CHART_MAX_POINTS:
-                        pairs.append("... %d more points" % (len(values) - _CHART_MAX_POINTS))
-                    value_part = ("%s: " % name if name else "") + "; ".join(pairs)
+                    for tup in xy[:_CHART_MAX_POINTS]:
+                        if len(tup) == 3:
+                            pairs.append(
+                                "(%s, %s, r=%s)"
+                                % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1]), cls._fmt_num(tup[2]))
+                            )
+                        else:
+                            pairs.append("(%s, %s)" % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1])))
+                    if len(xy) > _CHART_MAX_POINTS:
+                        pairs.append("... %d more points" % (len(xy) - _CHART_MAX_POINTS))
+                    if pairs:
+                        value_part = ("%s: " % name if name else "") + "; ".join(pairs)
+                elif xy is None:
+                    values = list(series.values)
+                    real = [v for v in values if v is not None]
+                    if real:
+                        pairs = []
+                        for i, v in enumerate(values[:_CHART_MAX_POINTS]):
+                            cat = pair_cats[i] if i < len(pair_cats) else ""
+                            pairs.append(("%s %s" % (cat, cls._fmt_num(v))) if cat else cls._fmt_num(v))
+                        if len(values) > _CHART_MAX_POINTS:
+                            pairs.append("... %d more points" % (len(values) - _CHART_MAX_POINTS))
+                        value_part = ("%s: " % name if name else "") + "; ".join(pairs)
+            except Exception:  # noqa: BLE001 - one bad series never drops the rest
+                value_part = None
+                read_error = True
             if value_part:
                 parts.append(value_part)
 
-            # 6. (c) custom data labels
-            labels = cls._custom_data_labels(series)
-            if labels:
-                bounded = labels[:_CHART_MAX_POINTS]
-                if len(labels) > _CHART_MAX_POINTS:
-                    bounded = bounded + ["... %d more points" % (len(labels) - _CHART_MAX_POINTS)]
-                prefix = ("%s data labels: " % name) if name else "data labels: "
-                parts.append(prefix + "; ".join(bounded))
+            # 6. (c) custom data labels — guarded for the same reason.
+            try:
+                labels = cls._custom_data_labels(series)
+                if labels:
+                    bounded = labels[:_CHART_MAX_POINTS]
+                    if len(labels) > _CHART_MAX_POINTS:
+                        bounded = bounded + ["... %d more points" % (len(labels) - _CHART_MAX_POINTS)]
+                    prefix = ("%s data labels: " % name) if name else "data labels: "
+                    parts.append(prefix + "; ".join(bounded))
+            except Exception:  # noqa: BLE001 - one bad series never drops the rest
+                read_error = True
 
         if read_error and not parts:
             # (e) A chart that was present but unreadable must leave a trace instead of
