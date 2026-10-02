@@ -26,6 +26,7 @@ labels/values only, like test_parser_fitness.py). No client content.
 
 import io
 import logging
+import re
 
 import pytest
 from pptx import Presentation
@@ -372,3 +373,171 @@ def test_nonfinite_value_never_loses_the_whole_chart(tmp_path, bad_text, expecte
     assert "Jan" in content and "Feb" in content, content
     # and the non-finite value is rendered deterministically, not crashed on
     assert expected in content, content
+
+
+# ---------------------------------------------------------------------------
+# Performance: chart extraction TIME must be bounded like its OUTPUT (RV-363).
+# A hostile/corrupt huge chart must not stall an ingestion worker. We assert the
+# number of points/values PULLED is bounded, not wall-clock, so the test is
+# deterministic. (Fix-forward on RV-363.)
+# ---------------------------------------------------------------------------
+
+import pptx.chart.series as _ps  # noqa: E402
+
+_HUGE = 10000
+_CAP = dl._CHART_MAX_POINTS
+
+
+def make_huge_category_chart(path, n=_HUGE):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "SYN-KNOWLEDGE-01 Huge Cat Deck"
+    cd = CategoryChartData()
+    cd.categories = [f"C{i}" for i in range(n)]
+    cd.add_series("Big", tuple(float(i) for i in range(n)))
+    slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(1), Inches(4), Inches(3), cd
+    )
+    return _save(prs, path)
+
+
+def make_huge_xy_chart(path, n=_HUGE):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "SYN-KNOWLEDGE-01 Huge XY Deck"
+    cd = XyChartData()
+    srs = cd.add_series("BigXY")
+    for i in range(n):
+        srs.add_data_point(float(i), float(i))
+    slide.shapes.add_chart(
+        XL_CHART_TYPE.XY_SCATTER, Inches(1), Inches(1), Inches(4), Inches(3), cd
+    )
+    return _save(prs, path)
+
+
+def make_no_ptcount_chart(path, n):
+    """A category chart with `n` points whose `c:ptCount` is removed from the value
+    numCache, so the total is UNKNOWABLE in O(1): the marker must then omit the number."""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "SYN-KNOWLEDGE-01 NoPtCount Deck"
+    cd = CategoryChartData()
+    cd.categories = [f"C{i}" for i in range(n)]
+    cd.add_series("Big", tuple(float(i) for i in range(n)))
+    gf = slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(1), Inches(4), Inches(3), cd
+    )
+    val = gf.chart.series[0]._element.find(_CHART_C + "val")
+    cache = val.find(".//" + _CHART_C + "numCache")
+    ptc = cache.find(_CHART_C + "ptCount")
+    if ptc is not None:
+        cache.remove(ptc)
+    return _save(prs, path)
+
+
+class _CountingPts:
+    """Wraps a python-pptx points collection, counting every point iterated. Works
+    for BOTH the pre-fix `list(series.points)` (pulls all) and the post-fix
+    `islice(iter(series.points), cap+1)` (pulls cap+1)."""
+
+    def __init__(self, inner, counter):
+        self._inner = inner
+        self._counter = counter
+
+    def __iter__(self):
+        for x in self._inner:
+            self._counter["points"] += 1
+            yield x
+
+    def __len__(self):
+        return len(self._inner)
+
+
+def _install_value_point_spies(monkeypatch, counter):
+    """Count how many VALUES (via series.values) and POINTS (via series.points) the
+    loader pulls for a category series. Pre-fix uses both APIs over ALL points; the
+    fix reads values from the XML cache (never series.values) and islices points."""
+    cls = _ps._BaseCategorySeries
+    val_desc = cls.__dict__["values"]
+
+    def counting_values(self):
+        t = val_desc.fget(self)
+        try:
+            counter["values"] += len(t)
+        except TypeError:
+            pass
+        return t
+
+    monkeypatch.setattr(cls, "values", property(counting_values))
+
+    pts_desc = cls.__dict__["points"]
+
+    def counting_points(self):
+        inner = pts_desc.__get__(self, type(self))
+        return _CountingPts(inner, counter)
+
+    monkeypatch.setattr(cls, "points", property(counting_points))
+
+
+def _install_xy_counter(monkeypatch, counter):
+    """Count how many XY points the loader's `_xy_point_values` actually PRODUCES.
+    The pre-fix reader `findall`s every <c:pt> and returns the whole list (10000);
+    the fix islices to cap+1 and returns at most that. The numCache elements are
+    plain immutable lxml `_Element`, so we cannot patch them per-class -- but the
+    loader's own classmethod is the single choke point, and the points it returns ARE
+    the points it pulled. Handles both arities: pre-fix `(series)` returning a list,
+    post-fix `(series, limit)` returning `(list, total)`."""
+    orig = SlidePowerPointLoader.__dict__["_xy_point_values"].__func__
+
+    def counting_xy(cls, series, *args, **kwargs):
+        res = orig(cls, series, *args, **kwargs)
+        pts = res[0] if isinstance(res, tuple) else res
+        if pts:
+            counter["xy"] += len(pts)
+        return res
+
+    monkeypatch.setattr(SlidePowerPointLoader, "_xy_point_values", classmethod(counting_xy))
+
+
+def test_category_values_and_labels_are_time_bounded(tmp_path, monkeypatch):
+    """RED on d2d18fb: list(series.values) and list(series.points) pull all 10000.
+    GREEN after: values never go through series.values (0), points are islice'd to
+    cap+1. Proves extraction TIME is O(cap), not O(points)."""
+    counter = {"values": 0, "points": 0}
+    _install_value_point_spies(monkeypatch, counter)
+    path = make_huge_category_chart(tmp_path / "huge_cat.pptx")
+    content = _chart_content(path)
+    # output is still correct & bounded
+    assert "Big" in content and "C0 0" in content
+    assert f"... {_HUGE - _CAP} more points" in content, content
+    # the point is TIME: neither accessor pulled more than cap+1 points
+    assert counter["values"] <= _CAP + 1, counter
+    assert 0 < counter["points"] <= _CAP + 1, counter
+
+
+def test_xy_points_are_time_bounded(tmp_path, monkeypatch):
+    """RED on d2d18fb: the XY reader returns ALL 10000 points (it findall'd them).
+    GREEN after: it islices to cap+1, so it produces (and pulled) at most cap+1."""
+    counter = {"xy": 0}
+    _install_xy_counter(monkeypatch, counter)
+    path = make_huge_xy_chart(tmp_path / "huge_xy.pptx")
+    content = _chart_content(path)
+    assert "BigXY" in content and "(0, 0)" in content
+    assert f"... {_HUGE - _CAP} more points" in content, content
+    # the >0 guard proves the counter actually fired; the bound proves O(cap) not O(n).
+    assert 0 < counter["xy"] <= _CAP + 1, counter
+
+
+def test_truncation_marker_shows_exact_remainder_when_ptcount_exists(tmp_path):
+    """The marker's number comes from c:ptCount in O(1); for a 10k chart it is the
+    exact remainder, never a fabricated or iterated count."""
+    content = _chart_content(make_huge_category_chart(tmp_path / "exact.pptx"))
+    assert f"... {_HUGE - _CAP} more points" in content, content
+
+
+def test_truncation_marker_omits_number_when_ptcount_absent(tmp_path):
+    """When c:ptCount is unreadable the marker must NOT fabricate a number: it is the
+    bare '... more points' form, never '... N more points'."""
+    content = _chart_content(make_no_ptcount_chart(tmp_path / "noptc.pptx", _CAP + 5))
+    assert "... more points" in content, content
+    assert not re.search(r"\.\.\. \d+ more points", content), content

@@ -3,6 +3,7 @@
 import os
 import codecs
 import csv
+import itertools
 import math
 import re
 import tempfile
@@ -2327,70 +2328,136 @@ class SlidePowerPointLoader:
             return str(int(f))
         return repr(f)
 
+    @staticmethod
+    def _num_cache(el, tag, limit):
+        """Read the numeric cache of the first `<c:{tag}>` child of a series element,
+        BOUNDED in TIME as well as output. Returns (values, total):
+          * values: dict {idx:int -> text:str} for AT MOST `limit` cached points,
+                    pulled lazily with `itertools.islice` so the cost is O(limit) and
+                    never O(points) -- a 10k-point chart reads only `limit` `<c:pt>`;
+          * total:  the authoritative point count from `<c:ptCount val=...>` (read in
+                    O(1)), or None when it is absent/unreadable (never counted by
+                    iterating -- a fabricated N is worse than an honest unnumbered
+                    marker).
+        Returns (None, None) when the `<c:{tag}>` element itself is absent.
+        """
+        node = el.find(_CHART_NS + tag)
+        if node is None:
+            return None, None
+        cache = node.find(".//" + _CHART_NS + "numCache")
+        total = None
+        if cache is not None:
+            ptc = cache.find(_CHART_NS + "ptCount")
+            if ptc is not None:
+                try:
+                    total = int(ptc.get("val"))
+                except (TypeError, ValueError):
+                    total = None
+            pts_iter = cache.iterfind(_CHART_NS + "pt")
+        else:
+            # No cache element: fall back to any <c:pt> under the node, still bounded.
+            pts_iter = node.iterfind(".//" + _CHART_NS + "pt")
+        vals = {}
+        for pt in itertools.islice(pts_iter, limit):
+            idx = pt.get("idx")
+            v = pt.find(_CHART_NS + "v")
+            if idx is None or v is None or v.text is None:
+                continue
+            try:
+                vals[int(idx)] = v.text
+            except (TypeError, ValueError):
+                continue
+        return vals, total
+
     @classmethod
-    def _xy_point_values(cls, series):
+    def _xy_point_values(cls, series, limit):
         """x/y (and bubble-size) point values for an XY/scatter or bubble series.
 
         XY and bubble charts have NO categories, so their x values are not reachable
         through python-pptx's category/value readers; without this the x axis of
         every scatter would be lost silently. The numeric caches live in the series
-        element XML (`c:xVal` / `c:yVal` / `c:bubbleSize`). Returns:
-          * None  -> this is NOT an xy/bubble series (no `c:xVal`); the caller uses
-                     the category-paired value path instead;
-          * a list of (x, y) or (x, y, size) string tuples, index-ordered.
-        Every access is guarded; a series whose element cannot be read returns None.
+        element XML (`c:xVal` / `c:yVal` / `c:bubbleSize`) and are read BOUNDED to
+        `limit` points, so a huge scatter costs O(limit), not O(points). Returns:
+          * (None, None) -> this is NOT an xy/bubble series (no `c:xVal`); the caller
+                     uses the category-paired value path instead;
+          * (points, total) where points is a list of (x, y) / (x, y, size) string
+                     tuples (at most `limit`, index-ordered) and total is the point
+                     count from `c:ptCount` (O(1)) or None.
+        Every access is guarded; a series whose element cannot be read -> (None, None).
         """
         try:
             el = series._element
         except Exception:  # noqa: BLE001 - chart XML is untrusted/variable
-            return None
-
-        def _read(tag):
-            node = el.find(_CHART_NS + tag)
-            if node is None:
-                return None
-            vals = {}
-            pts = node.findall(
-                _CHART_NS + "numRef/" + _CHART_NS + "numCache/" + _CHART_NS + "pt"
-            ) or node.findall(".//" + _CHART_NS + "pt")
-            for pt in pts:
-                idx = pt.get("idx")
-                v = pt.find(_CHART_NS + "v")
-                if idx is None or v is None or v.text is None:
-                    continue
-                try:
-                    vals[int(idx)] = v.text
-                except (TypeError, ValueError):
-                    continue
-            return vals
-
+            return None, None
         try:
-            xs = _read("xVal")
+            xs, x_total = cls._num_cache(el, "xVal", limit)
         except Exception:  # noqa: BLE001
-            return None
+            return None, None
         if xs is None:
-            return None  # a category chart: let the caller pair values with categories
-        ys = _read("yVal") or {}
-        sizes = _read("bubbleSize")
+            return None, None  # a category chart: pair values with categories instead
+        ys, _ = cls._num_cache(el, "yVal", limit)
+        ys = ys or {}
+        sizes, _ = cls._num_cache(el, "bubbleSize", limit)
         out = []
         for i in sorted(xs):
             if sizes is not None:
                 out.append((xs.get(i), ys.get(i), sizes.get(i)))
             else:
                 out.append((xs.get(i), ys.get(i)))
-        return out
+        return out, x_total
+
+    @classmethod
+    def _category_values(cls, series, limit):
+        """Numeric values of a CATEGORY-chart series, read BOUNDED to `limit` points
+        from the `c:val` numCache (NOT via `series.values`, which materializes the whole
+        tuple and so is O(points)). Returns (values_by_idx, total) -- a dict keyed by
+        the point index so a BLANK middle point stays aligned with its category -- or
+        (None, total) when there is no value cache.
+        """
+        try:
+            el = series._element
+        except Exception:  # noqa: BLE001 - chart XML is untrusted/variable
+            return None, None
+        try:
+            vals, total = cls._num_cache(el, "val", limit)
+        except Exception:  # noqa: BLE001
+            return None, None
+        if not vals:
+            return None, total
+        return vals, total
 
     @staticmethod
-    def _custom_data_labels(series) -> List[str]:
-        """Custom per-point data-label TEXT for a series (the author typed a label
-        onto a point). Each access is guarded; one bad point never aborts the series.
+    def _truncation_marker(total, pulled, cap):
+        """The honest "... N more points" marker, or None when nothing was dropped.
+
+        `pulled` is how many points were actually read (<= cap + 1, because callers
+        read cap + 1 to detect "there is at least one more"). When `pulled` <= cap
+        nothing was dropped. Otherwise the exact remainder is `total - cap` when the
+        O(1) `c:ptCount` was readable; when it was not, the marker carries NO number
+        rather than a fabricated one (the total is never computed by iterating).
         """
+        if pulled <= cap:
+            return None
+        if total is not None and total > cap:
+            return "... %d more points" % (total - cap)
+        return "... more points"
+
+    @staticmethod
+    def _custom_data_labels(series, limit):
+        """Custom per-point data-label TEXT for a series (the author typed a label
+        onto a point). BOUNDED: at most `limit` points are examined via `islice` over
+        the lazy points iterator, so cost is O(limit) not O(points). Returns
+        (labels, examined) where `examined` is how many points were looked at (<=
+        limit) so the caller can mark truncation honestly. Each access is guarded; one
+        bad point never aborts the series."""
         out: List[str] = []
+        examined = 0
         try:
-            points = list(series.points)
+            point_iter = iter(series.points)
         except Exception:  # noqa: BLE001 - chart XML is untrusted/variable
-            return out
-        for pt in points:
+            return out, examined
+        for pt in itertools.islice(point_iter, limit):
+            examined += 1
             try:
                 dl = pt.data_label
                 if dl.has_text_frame:
@@ -2399,7 +2466,7 @@ class SlidePowerPointLoader:
                         out.append(text)
             except Exception:  # noqa: BLE001 - never let one point abort the series
                 continue
-        return out
+        return out, examined
 
     @classmethod
     def _chart_text(cls, chart) -> str:
@@ -2482,6 +2549,11 @@ class SlidePowerPointLoader:
         except Exception:  # noqa: BLE001
             series_list = []
             read_error = True
+        #: Read cap + 1 points per per-point walk: enough to KNOW there is at least one
+        #: more (so the truncation marker fires) while the cost stays O(_CHART_MAX_POINTS),
+        #: never O(points). A hostile 10k-point chart no longer stalls the ingestion worker.
+        cap = _CHART_MAX_POINTS
+        limit = cap + 1
         for series in series_list:
             try:
                 name = (series.name or "").strip()
@@ -2489,16 +2561,19 @@ class SlidePowerPointLoader:
                 name = ""
                 read_error = True
 
-            # 5. (b)/(d) values. The WHOLE value-part build is guarded so one bad data
-            # point (e.g. a non-finite cached value) drops ONLY this series' value part
-            # and never propagates out of _chart_text to cost the chart its title /
-            # categories / series names (the byte-stable parts already appended above).
+            # 5. (b)/(d) values. Reads are BOUNDED (islice to cap+1) BEFORE materializing,
+            # so time is bounded like output. The whole build is guarded so one bad data
+            # point (e.g. a non-finite cached value) drops ONLY this series' value part and
+            # never propagates out of _chart_text to cost the chart its title / categories /
+            # series names (the byte-stable parts already appended above).
             value_part = None
+            series_total = None
             try:
-                xy = cls._xy_point_values(series)
-                if xy:
+                xy, total = cls._xy_point_values(series, limit)
+                if xy is not None:
+                    series_total = total
                     pairs = []
-                    for tup in xy[:_CHART_MAX_POINTS]:
+                    for tup in xy[:cap]:
                         if len(tup) == 3:
                             pairs.append(
                                 "(%s, %s, r=%s)"
@@ -2506,20 +2581,30 @@ class SlidePowerPointLoader:
                             )
                         else:
                             pairs.append("(%s, %s)" % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1])))
-                    if len(xy) > _CHART_MAX_POINTS:
-                        pairs.append("... %d more points" % (len(xy) - _CHART_MAX_POINTS))
+                    marker = cls._truncation_marker(total, len(xy), cap)
+                    if marker:
+                        pairs.append(marker)
                     if pairs:
                         value_part = ("%s: " % name if name else "") + "; ".join(pairs)
-                elif xy is None:
-                    values = list(series.values)
-                    real = [v for v in values if v is not None]
-                    if real:
+                else:
+                    values_by_idx, total = cls._category_values(series, limit)
+                    if values_by_idx:
+                        series_total = total
+                        pulled = len(values_by_idx)
+                        # How many positions to emit (<= cap), keyed by index so a blank
+                        # middle point renders as "null" in the right slot, not shifted.
+                        if total is not None:
+                            n = min(cap, total)
+                        else:
+                            n = min(cap, max(values_by_idx) + 1)
                         pairs = []
-                        for i, v in enumerate(values[:_CHART_MAX_POINTS]):
+                        for i in range(n):
+                            v = values_by_idx.get(i)  # None -> _fmt_num -> "null"
                             cat = pair_cats[i] if i < len(pair_cats) else ""
                             pairs.append(("%s %s" % (cat, cls._fmt_num(v))) if cat else cls._fmt_num(v))
-                        if len(values) > _CHART_MAX_POINTS:
-                            pairs.append("... %d more points" % (len(values) - _CHART_MAX_POINTS))
+                        marker = cls._truncation_marker(total, pulled, cap)
+                        if marker:
+                            pairs.append(marker)
                         value_part = ("%s: " % name if name else "") + "; ".join(pairs)
             except Exception:  # noqa: BLE001 - one bad series never drops the rest
                 value_part = None
@@ -2527,13 +2612,16 @@ class SlidePowerPointLoader:
             if value_part:
                 parts.append(value_part)
 
-            # 6. (c) custom data labels — guarded for the same reason.
+            # 6. (c) custom data labels — BOUNDED (islice to cap+1 points) and guarded for
+            # the same reason. `examined` lets the marker stay honest when more points than
+            # the cap carry labels, reusing the same O(1) `series_total`.
             try:
-                labels = cls._custom_data_labels(series)
+                labels, examined = cls._custom_data_labels(series, limit)
                 if labels:
-                    bounded = labels[:_CHART_MAX_POINTS]
-                    if len(labels) > _CHART_MAX_POINTS:
-                        bounded = bounded + ["... %d more points" % (len(labels) - _CHART_MAX_POINTS)]
+                    bounded = labels[:cap]
+                    marker = cls._truncation_marker(series_total, examined, cap)
+                    if marker:
+                        bounded = bounded + [marker]
                     prefix = ("%s data labels: " % name) if name else "data labels: "
                     parts.append(prefix + "; ".join(bounded))
             except Exception:  # noqa: BLE001 - one bad series never drops the rest
