@@ -3,6 +3,8 @@
 import os
 import codecs
 import csv
+import itertools
+import math
 import re
 import tempfile
 import zipfile
@@ -2245,6 +2247,19 @@ class SheetExcelLoader:
         yield from self.load()
 
 
+#: Deterministic per-series bound on the number of data points emitted into a chart's
+#: extracted text (KNOWLEDGE-COMPLETION slice 6, G7). A large chart is TRUNCATED, never
+#: silently dropped: the first `_CHART_MAX_POINTS` points are emitted and an explicit,
+#: honest "... N more points" marker names how many were left out. The bound keeps a
+#: pathological chart from bloating a slide chunk while staying truthful about the loss.
+_CHART_MAX_POINTS = 50
+
+#: The DrawingML chart namespace, for reading numeric point caches (xVal/yVal/bubbleSize)
+#: that python-pptx does not surface through a stable public reader (XY and bubble charts
+#: have no categories, so their x values are only reachable through the element XML).
+_CHART_NS = "{http://schemas.openxmlformats.org/drawingml/2006/chart}"
+
+
 class SlidePowerPointLoader:
     """
     Load a .pptx deck as one Document per slide, preserving slide context.
@@ -2282,29 +2297,230 @@ class SlidePowerPointLoader:
         return "\n".join(rows)
 
     @staticmethod
-    def _chart_text(chart) -> str:
-        """Best-effort chart labels: title, category labels and series names.
+    def _fmt_num(v) -> str:
+        """Deterministically format a chart number for text extraction.
 
-        Evidence can sit in a chart label (KI-02 WP-C goal). Chart XML is
-        variable, so every access is guarded — a chart we cannot read must be
-        skipped, never crash the whole deck.
+        Integer-valued floats lose the trailing `.0` ("3.0" -> "3"); other values
+        use Python's shortest round-trip repr, which is identical on py3.10 and
+        py3.12 (the two shipped runtimes), so extracted text is byte-stable across
+        them. A value that is missing in the file is `None` and is rendered as the
+        literal "null" rather than silently dropped. A value that cannot be parsed
+        as a number is passed through as its string.
+
+        NON-FINITE values (NaN / +-inf, which a corrupt or hand-authored numCache can
+        carry) are rendered as deterministic literals BEFORE any `int()` conversion:
+        `int(float('nan'))` raises ValueError and `int(float('inf'))` raises
+        OverflowError, so without this guard one bad cached value would propagate out
+        of `_chart_text` and cost the whole chart its text. This is total over any
+        float input.
+        """
+        if v is None:
+            return "null"
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return str(v).strip()
+        if not math.isfinite(f):
+            if math.isnan(f):
+                return "NaN"
+            return "inf" if f > 0 else "-inf"
+        if f == int(f) and abs(f) < 1e16:
+            return str(int(f))
+        return repr(f)
+
+    @staticmethod
+    def _num_cache(el, tag, limit):
+        """Read the numeric cache of the first `<c:{tag}>` child of a series element,
+        BOUNDED in TIME as well as output. Returns (values, total):
+          * values: dict {idx:int -> text:str} for AT MOST `limit` cached points,
+                    pulled lazily with `itertools.islice` so the cost is O(limit) and
+                    never O(points) -- a 10k-point chart reads only `limit` `<c:pt>`;
+          * total:  the authoritative point count from `<c:ptCount val=...>` (read in
+                    O(1)), or None when it is absent/unreadable (never counted by
+                    iterating -- a fabricated N is worse than an honest unnumbered
+                    marker).
+        Returns (None, None) when the `<c:{tag}>` element itself is absent.
+        """
+        node = el.find(_CHART_NS + tag)
+        if node is None:
+            return None, None
+        cache = node.find(".//" + _CHART_NS + "numCache")
+        total = None
+        if cache is not None:
+            ptc = cache.find(_CHART_NS + "ptCount")
+            if ptc is not None:
+                try:
+                    total = int(ptc.get("val"))
+                except (TypeError, ValueError):
+                    total = None
+            pts_iter = cache.iterfind(_CHART_NS + "pt")
+        else:
+            # No cache element: fall back to any <c:pt> under the node, still bounded.
+            pts_iter = node.iterfind(".//" + _CHART_NS + "pt")
+        vals = {}
+        for pt in itertools.islice(pts_iter, limit):
+            idx = pt.get("idx")
+            v = pt.find(_CHART_NS + "v")
+            if idx is None or v is None or v.text is None:
+                continue
+            try:
+                vals[int(idx)] = v.text
+            except (TypeError, ValueError):
+                continue
+        return vals, total
+
+    @classmethod
+    def _xy_point_values(cls, series, limit):
+        """x/y (and bubble-size) point values for an XY/scatter or bubble series.
+
+        XY and bubble charts have NO categories, so their x values are not reachable
+        through python-pptx's category/value readers; without this the x axis of
+        every scatter would be lost silently. The numeric caches live in the series
+        element XML (`c:xVal` / `c:yVal` / `c:bubbleSize`) and are read BOUNDED to
+        `limit` points, so a huge scatter costs O(limit), not O(points). Returns:
+          * (None, None) -> this is NOT an xy/bubble series (no `c:xVal`); the caller
+                     uses the category-paired value path instead;
+          * (points, total) where points is a list of (x, y) / (x, y, size) string
+                     tuples (at most `limit`, index-ordered) and total is the point
+                     count from `c:ptCount` (O(1)) or None.
+        Every access is guarded; a series whose element cannot be read -> (None, None).
+        """
+        try:
+            el = series._element
+        except Exception:  # noqa: BLE001 - chart XML is untrusted/variable
+            return None, None
+        try:
+            xs, x_total = cls._num_cache(el, "xVal", limit)
+        except Exception:  # noqa: BLE001
+            return None, None
+        if xs is None:
+            return None, None  # a category chart: pair values with categories instead
+        ys, _ = cls._num_cache(el, "yVal", limit)
+        ys = ys or {}
+        sizes, _ = cls._num_cache(el, "bubbleSize", limit)
+        out = []
+        for i in sorted(xs):
+            if sizes is not None:
+                out.append((xs.get(i), ys.get(i), sizes.get(i)))
+            else:
+                out.append((xs.get(i), ys.get(i)))
+        return out, x_total
+
+    @classmethod
+    def _category_values(cls, series, limit):
+        """Numeric values of a CATEGORY-chart series, read BOUNDED to `limit` points
+        from the `c:val` numCache (NOT via `series.values`, which materializes the whole
+        tuple and so is O(points)). Returns (values_by_idx, total) -- a dict keyed by
+        the point index so a BLANK middle point stays aligned with its category -- or
+        (None, total) when there is no value cache.
+        """
+        try:
+            el = series._element
+        except Exception:  # noqa: BLE001 - chart XML is untrusted/variable
+            return None, None
+        try:
+            vals, total = cls._num_cache(el, "val", limit)
+        except Exception:  # noqa: BLE001
+            return None, None
+        if not vals:
+            return None, total
+        return vals, total
+
+    @staticmethod
+    def _truncation_marker(total, pulled, cap):
+        """The honest "... N more points" marker, or None when nothing was dropped.
+
+        `pulled` is how many points were actually read (<= cap + 1, because callers
+        read cap + 1 to detect "there is at least one more"). When `pulled` <= cap
+        nothing was dropped. Otherwise the exact remainder is `total - cap` when the
+        O(1) `c:ptCount` was readable; when it was not, the marker carries NO number
+        rather than a fabricated one (the total is never computed by iterating).
+        """
+        if pulled <= cap:
+            return None
+        if total is not None and total > cap:
+            return "... %d more points" % (total - cap)
+        return "... more points"
+
+    @staticmethod
+    def _custom_data_labels(series, limit):
+        """Custom per-point data-label TEXT for a series (the author typed a label
+        onto a point). BOUNDED: at most `limit` points are examined via `islice` over
+        the lazy points iterator, so cost is O(limit) not O(points). Returns
+        (labels, examined) where `examined` is how many points were looked at (<=
+        limit) so the caller can mark truncation honestly. Each access is guarded; one
+        bad point never aborts the series."""
+        out: List[str] = []
+        examined = 0
+        try:
+            point_iter = iter(series.points)
+        except Exception:  # noqa: BLE001 - chart XML is untrusted/variable
+            return out, examined
+        for pt in itertools.islice(point_iter, limit):
+            examined += 1
+            try:
+                dl = pt.data_label
+                if dl.has_text_frame:
+                    text = dl.text_frame.text.strip()
+                    if text:
+                        out.append(text)
+            except Exception:  # noqa: BLE001 - never let one point abort the series
+                continue
+        return out, examined
+
+    @classmethod
+    def _chart_text(cls, chart) -> str:
+        """Best-effort chart labels, extracted as completely as python-pptx allows
+        (KI-02 WP-C goal; KNOWLEDGE-COMPLETION slice 6 FIDELITY, G7).
+
+        Evidence sits in chart labels AND in the numbers a chart plots. Chart XML
+        is variable, so every access is guarded — a chart we cannot read must be
+        skipped, never crash the whole deck. The parts are emitted in this order,
+        and the FIRST THREE are byte-stable with the pre-slice-6 output so existing
+        locator/receipt tests stay green (new parts only APPEND after them):
+          1. chart title                              (existing)
+          2. category labels, per plot                (existing)
+          3. series names                             (existing)
+          4. (a) category + value AXIS TITLES
+          5. (b)/(d) per-series numeric VALUES — paired with the category where a
+             chart has categories ("<series>: <cat> <value>; ..."), or x/y(/size)
+             pairs for XY/bubble charts which have none; bounded by
+             `_CHART_MAX_POINTS` with an honest "... N more points" marker
+          6. (c) per-series custom DATA LABEL text
+
+        (e) HONEST UNREADABLE CHART: if a chart yields NO text because its accesses
+        raised, a named warning is logged rather than returning "" silently (the
+        receipt-contract limitation that prevents a per-chart `partial` signal is
+        recorded in the slice-6 PR body). The deck always keeps extracting.
         """
         parts: List[str] = []
+        read_error = False
+
+        # 1. chart title (EXISTING — byte-stable)
         try:
             if chart.has_title and chart.chart_title.text_frame.text.strip():
                 parts.append(chart.chart_title.text_frame.text.strip())
         except Exception:  # noqa: BLE001 - chart metadata is untrusted/variable
-            pass
+            read_error = True
+
+        # 2. category labels, per plot (EXISTING — byte-stable). The first plot's raw
+        #    categories are captured (index-aligned, empties kept) to pair with values.
+        pair_cats: List[str] = []
         try:
             for plot in chart.plots:
                 try:
-                    cats = [str(c).strip() for c in plot.categories if str(c).strip()]
+                    raw = [("" if c is None else str(c).strip()) for c in plot.categories]
+                    cats = [c for c in raw if c]
                     if cats:
                         parts.append(" ".join(cats))
+                    if not pair_cats and raw:
+                        pair_cats = raw
                 except Exception:  # noqa: BLE001
-                    pass
+                    read_error = True
         except Exception:  # noqa: BLE001
-            pass
+            read_error = True
+
+        # 3. series names (EXISTING — byte-stable)
         try:
             for series in chart.series:
                 try:
@@ -2312,9 +2528,115 @@ class SlidePowerPointLoader:
                     if name:
                         parts.append(name)
                 except Exception:  # noqa: BLE001
-                    pass
+                    read_error = True
         except Exception:  # noqa: BLE001
-            pass
+            read_error = True
+
+        # 4. (a) axis titles — category then value. Guarded: pie/XY may raise or have none.
+        for ax_attr in ("category_axis", "value_axis"):
+            try:
+                ax = getattr(chart, ax_attr)
+                if ax.has_title:
+                    title = ax.axis_title.text_frame.text.strip()
+                    if title:
+                        parts.append(title)
+            except Exception:  # noqa: BLE001 - some chart types have no such axis
+                read_error = True
+
+        # 5 + 6. per-series numeric values and custom data labels
+        try:
+            series_list = list(chart.series)
+        except Exception:  # noqa: BLE001
+            series_list = []
+            read_error = True
+        #: Read cap + 1 points per per-point walk: enough to KNOW there is at least one
+        #: more (so the truncation marker fires) while the cost stays O(_CHART_MAX_POINTS),
+        #: never O(points). A hostile 10k-point chart no longer stalls the ingestion worker.
+        cap = _CHART_MAX_POINTS
+        limit = cap + 1
+        for series in series_list:
+            try:
+                name = (series.name or "").strip()
+            except Exception:  # noqa: BLE001
+                name = ""
+                read_error = True
+
+            # 5. (b)/(d) values. Reads are BOUNDED (islice to cap+1) BEFORE materializing,
+            # so time is bounded like output. The whole build is guarded so one bad data
+            # point (e.g. a non-finite cached value) drops ONLY this series' value part and
+            # never propagates out of _chart_text to cost the chart its title / categories /
+            # series names (the byte-stable parts already appended above).
+            value_part = None
+            series_total = None
+            try:
+                xy, total = cls._xy_point_values(series, limit)
+                if xy is not None:
+                    series_total = total
+                    pairs = []
+                    for tup in xy[:cap]:
+                        if len(tup) == 3:
+                            pairs.append(
+                                "(%s, %s, r=%s)"
+                                % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1]), cls._fmt_num(tup[2]))
+                            )
+                        else:
+                            pairs.append("(%s, %s)" % (cls._fmt_num(tup[0]), cls._fmt_num(tup[1])))
+                    marker = cls._truncation_marker(total, len(xy), cap)
+                    if marker:
+                        pairs.append(marker)
+                    if pairs:
+                        value_part = ("%s: " % name if name else "") + "; ".join(pairs)
+                else:
+                    values_by_idx, total = cls._category_values(series, limit)
+                    if values_by_idx:
+                        series_total = total
+                        pulled = len(values_by_idx)
+                        # How many positions to emit (<= cap), keyed by index so a blank
+                        # middle point renders as "null" in the right slot, not shifted.
+                        if total is not None:
+                            n = min(cap, total)
+                        else:
+                            n = min(cap, max(values_by_idx) + 1)
+                        pairs = []
+                        for i in range(n):
+                            v = values_by_idx.get(i)  # None -> _fmt_num -> "null"
+                            cat = pair_cats[i] if i < len(pair_cats) else ""
+                            pairs.append(("%s %s" % (cat, cls._fmt_num(v))) if cat else cls._fmt_num(v))
+                        marker = cls._truncation_marker(total, pulled, cap)
+                        if marker:
+                            pairs.append(marker)
+                        value_part = ("%s: " % name if name else "") + "; ".join(pairs)
+            except Exception:  # noqa: BLE001 - one bad series never drops the rest
+                value_part = None
+                read_error = True
+            if value_part:
+                parts.append(value_part)
+
+            # 6. (c) custom data labels — BOUNDED (islice to cap+1 points) and guarded for
+            # the same reason. `examined` lets the marker stay honest when more points than
+            # the cap carry labels, reusing the same O(1) `series_total`.
+            try:
+                labels, examined = cls._custom_data_labels(series, limit)
+                if labels:
+                    bounded = labels[:cap]
+                    marker = cls._truncation_marker(series_total, examined, cap)
+                    if marker:
+                        bounded = bounded + [marker]
+                    prefix = ("%s data labels: " % name) if name else "data labels: "
+                    parts.append(prefix + "; ".join(bounded))
+            except Exception:  # noqa: BLE001 - one bad series never drops the rest
+                read_error = True
+
+        if read_error and not parts:
+            # (e) A chart that was present but unreadable must leave a trace instead of
+            # vanishing silently. The receipt contract (extraction.degraded) cannot
+            # honestly describe a single sub-slide chart failure — its shape asserts
+            # lost='unit_locators'/scope='document'/units_affected=units_total, none of
+            # which is true when one chart on an otherwise-fine slide fails — so the
+            # per-chart signal stays a logged warning + a named PR follow-up.
+            logger.warning(
+                "Skipped a PPTX chart that was present but unreadable (yielded no text)"
+            )
         return "\n".join(parts)
 
     @classmethod

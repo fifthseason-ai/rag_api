@@ -305,6 +305,7 @@ jobs:
             python -m pytest tests/utils/test_xlsx_capability.py \
                              tests/utils/test_unsupported_formats.py \
                              tests/utils/test_parser_fitness.py \
+                             tests/utils/test_pptx_chart_fidelity.py \
                              -p no:cacheprovider --disable-warnings -q
 
       # User-visible exception BEHAVIOUR on the shipped runtime -- the status code and
